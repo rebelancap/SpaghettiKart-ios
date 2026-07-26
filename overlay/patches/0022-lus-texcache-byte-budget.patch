@@ -1,0 +1,248 @@
+Overlay patch 0022 (rev10):
+rev9: eviction runs on ALL ImportTexture exits — PNG pack textures take the
+LOAD_AS_IMG early return, so the tail block NEVER ran for exactly the
+textures the budget exists to bound. Tail is now a lambda called on all
+three exits. (Every prior forced-pressure sim test was a no-op; device
+budget behavior was actually the upstream count cap.)
+rev8: eviction floor (128 entries) is now cvar gSohIos.TexCacheMinEntries —
+sim tracks sit under 128 entries so every forced-pressure sim test was a
+silent no-op. byte-budget texture cache (reference 0020 rev2).
+rev7: budget back to 1280 — 1024 thrashes the 4K working set (sprite/tree
+blink, user-observed on device); the rev6 valve owns burst safety now.
+rev6: footprint panic valve — phys_footprint > gSohIos.MemPanicMB (default
+2900) during an import storm cuts the ledger to half budget. The ledger
+model under-counts bursts (un-imported resources, decode buffers,
+allocator lag): 3.2 GB observed live at ledger budget 1024.
+rev5: 1280 -> 1024 (bursts overshoot ~+600MB over steady; device-measured).
+rev4: iPhone default budget 1536 -> 1280 (rev3-semantics memory math; see inline).
+rev3: budget eviction also unloads the CPU-side resource (coupled with
+0030, which adds TextureCacheValue::resource_path — compile-coupled pair).
+rev2: DeleteTexture subtract is mip-aware (+1/3 for 0021 rev3+ chains).
+Original (reference 0020 = SYNC
+WAVE 1 mandatory fix 5; anchors byte-identical at our pin). Fast3D's cache
+is COUNT-based and Metal's DeleteTexture was EMPTY — eviction never freed
+GPU memory, so big packs pin gigabytes and jetsam at menu upload bursts.
+1. gfx_rendering_api.h: virtual GetTextureBytes() (default 0 disables the
+   budget on other backends).
+2. Metal: DeleteTexture actually releases + exact ledger (mTextureBytes,
+   fed by 0021's UploadTexture accounting).
+3. interpreter.cpp ImportTexture tail (__IOS__): LRU-evict to
+   gSohIos.TexCacheBudgetMB (default 1536), floor 128 entries.
+Sole pin delta vs the Ship of Harkinian port patch: Context::GetInstance (pre-rename).
+
+--- a/libultraship/include/fast/backends/gfx_rendering_api.h
++++ b/libultraship/include/fast/backends/gfx_rendering_api.h
+@@ -74,6 +74,12 @@
+     virtual void* GetFramebufferTextureId(int fbId) = 0;
+     virtual void SelectTextureFb(int fbId) = 0;
+     virtual void DeleteTexture(uint32_t texId) = 0;
++    // SOH_IOS (overlay 0022): total bytes of live GPU textures created via
++    // UploadTexture. Backends without accounting report 0, which disables the
++    // interpreter's byte-budget eviction.
++    virtual size_t GetTextureBytes() {
++        return 0;
++    }
+     virtual void SetTextureFilter(FilteringMode mode) = 0;
+     virtual FilteringMode GetTextureFilter() = 0;
+     virtual void SetSrgbMode() = 0;
+--- a/libultraship/include/fast/backends/gfx_metal.h
++++ b/libultraship/include/fast/backends/gfx_metal.h
+@@ -169,6 +169,7 @@
+     void* GetFramebufferTextureId(int fbId) override;
+     void SelectTextureFb(int fbId) override;
+     void DeleteTexture(uint32_t texId) override;
++    size_t GetTextureBytes() override;
+     void SetTextureFilter(FilteringMode mode) override;
+     FilteringMode GetTextureFilter() override;
+     void SetSrgbMode() override;
+@@ -195,6 +196,9 @@
+         mShaderProgramPool;
+ 
+     std::vector<struct TextureDataMetal> mTextures;
++    // SOH_IOS (overlay 0022): exact resident bytes of the textures above
++    // (maintained by UploadTexture/DeleteTexture).
++    size_t mTextureBytes = 0;
+     std::vector<FramebufferMetal> mFramebuffers;
+     FrameUniforms mFrameUniforms;
+     CoordUniforms mCoordUniforms;
+--- a/libultraship/src/fast/backends/gfx_metal.cpp
++++ b/libultraship/src/fast/backends/gfx_metal.cpp
+@@ -351,8 +351,34 @@
+ }
+ 
+ void GfxRenderingAPIMetal::DeleteTexture(uint32_t texID) {
++    // SOH_IOS (overlay 0022): this was a no-op, so cache eviction never freed
++    // GPU memory (the MTLTexture lived until its id was reused with different
++    // dims). Command buffers retain in-flight resources, so releasing here is
++    // safe even if the GPU is still reading the texture this frame.
++    if (texID >= mTextures.size()) {
++        return;
++    }
++    TextureDataMetal* t = &mTextures[texID];
++    if (t->texture != nullptr) {
++        // rev2: a mip chain (0021 rev3+) adds one third over the base level.
++        size_t sohIosBytes = (size_t)t->texture->width() * t->texture->height() * 4;
++        if (t->texture->mipmapLevelCount() > 1) {
++            sohIosBytes += sohIosBytes / 3;
++        }
++        mTextureBytes -= sohIosBytes;
++        t->texture->release();
++        t->texture = nullptr;
++    }
++    if (t->msaaTexture != nullptr) {
++        t->msaaTexture->release();
++        t->msaaTexture = nullptr;
++    }
+ }
+ 
++size_t GfxRenderingAPIMetal::GetTextureBytes() {
++    return mTextureBytes;
++}
++
+ void GfxRenderingAPIMetal::SelectTexture(int tile, uint32_t texture_id) {
+     mCurrentTile = tile;
+     mCurrentTextureIds[tile] = texture_id;
+--- a/libultraship/src/fast/interpreter.cpp
++++ b/libultraship/src/fast/interpreter.cpp
+@@ -26,6 +26,12 @@
+ 
+ #include "fast/interpreter.h"
+ #include "fast/lus_gbi.h"
++
++#ifdef __IOS__
++// SOH_IOS (overlay 0022 rev6): shell-provided phys_footprint (task_vm_info),
++// the same number jetsam judges. Linked from the app shell on iOS/sim.
++extern "C" int SohIos_MemFootprintMB(void);
++#endif
+ #include "fast/backends/gfx_window_manager_api.h"
+ #include "fast/backends/gfx_rendering_api.h"
+ 
+@@ -1223,14 +1229,117 @@
+         return;
+     }
+ 
++#ifdef __IOS__
++    // SOH_IOS (overlay 0022 rev9): eviction must cover ALL import exits.
++    // PNG pack textures take the LOAD_AS_IMG early return below, so the
++    // old tail-of-function block NEVER ran for exactly the textures the
++    // byte budget exists to bound (discovered when forced-pressure sim
++    // tests no-op'd; every 4K device import bypassed eviction). The tail
++    // is now this lambda, invoked on all three exits.
++    auto sohIosEvictTail = [&]() {
++        // The count cap alone lets 4K texture packs pin gigabytes (entries
++        // are up to 16-256 MB each) -> jetsam. Evict LRU entries until under
++        // the byte budget. Both currently-bound tiles were just touched
++        // (splice/insert to LRU back), and pending draws are flushed before
++        // imports, so the front is never referenced by unencoded work.
++        size_t sohIosBudget = (size_t)Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(
++                                  "gSohIos.TexCacheBudgetMB", 1280) *
++                              1024 * 1024;
++        size_t sohIosMinEntries = (size_t)Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(
++            "gSohIos.TexCacheMinEntries", 128);
++        bool sohIosEvicted = false;
++        while (mRapi->GetTextureBytes() > sohIosBudget && mTextureCache.map.size() > sohIosMinEntries) {
++            TextureCacheMap::iterator evictIt = mTextureCache.lru.front().it;
++            // rev3 (0030): drop the CPU-side decompressed copy too — the
++            // unbounded resource cache was the 4K jetsam (device-measured).
++            if (!evictIt->second.resource_path.empty()) {
++                Ship::Context::GetInstance()->GetResourceManager()->UnloadResource(evictIt->second.resource_path);
++            }
++            mRapi->DeleteTexture(evictIt->second.texture_id);
++            mTextureCache.free_texture_ids.push_back(evictIt->second.texture_id);
++            for (int j = 0; j < SHADER_MAX_TEXTURES; j++) {
++                if (mRenderingState.mTextures[j] == &*evictIt) {
++                    mRenderingState.mTextures[j] = nullptr;
++                }
++            }
++            mTextureCache.map.erase(evictIt);
++            mTextureCache.lru.pop_front();
++            sohIosEvicted = true;
++        }
++        if (sohIosEvicted) {
++            // Rate-limited so heavy streaming can't spam the log.
++            static uint32_t sohIosEvictLogCounter = 0;
++            if ((sohIosEvictLogCounter++ % 200) == 0) {
++                // rev10 census: sprite-vs-other split is the decisive number
++                // for the cache-composition model (review P2-6). O(n) only
++                // here, behind the rate limit.
++                size_t sohIosSpriteEntries = 0;
++                for (TextureCacheMap::iterator cIt = mTextureCache.map.begin(); cIt != mTextureCache.map.end();
++                     ++cIt) {
++                    if (cIt->second.resource_path.compare(0, 15, "textures/karts/") == 0) {
++                        sohIosSpriteEntries++;
++                    }
++                }
++                SPDLOG_INFO("texcache: evicted to {} MB / {} entries ({} sprite) (budget {} MB)",
++                            mRapi->GetTextureBytes() / (1024 * 1024), mTextureCache.map.size(),
++                            sohIosSpriteEntries, sohIosBudget / (1024 * 1024));
++            }
++        }
++
++        // rev6 valve: the ledger under-counts bursts (loaded-but-un-imported
++        // resources, decode buffers, allocator lag) and jetsam kills at
++        // ~3.35 GB. React to the real footprint during import storms: over
++        // MemPanicMB, cut the ledger to half the budget to absorb the wave.
++        // Re-triggers are self-limiting (ledger at target -> loop no-ops).
++        static uint32_t sohIosPanicCheck = 0;
++        if ((sohIosPanicCheck++ & 7) == 0) {
++            int sohIosPanicMB = Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(
++                "gSohIos.MemPanicMB", 2900);
++            if (sohIosPanicMB > 0 && SohIos_MemFootprintMB() > sohIosPanicMB) {
++                size_t sohIosPanicTarget = sohIosBudget / 2;
++                bool sohIosPanicked = false;
++                while (mRapi->GetTextureBytes() > sohIosPanicTarget &&
++                       mTextureCache.map.size() > sohIosMinEntries) {
++                    TextureCacheMap::iterator evictIt = mTextureCache.lru.front().it;
++                    if (!evictIt->second.resource_path.empty()) {
++                        Ship::Context::GetInstance()->GetResourceManager()->UnloadResource(
++                            evictIt->second.resource_path);
++                    }
++                    mRapi->DeleteTexture(evictIt->second.texture_id);
++                    mTextureCache.free_texture_ids.push_back(evictIt->second.texture_id);
++                    for (int j = 0; j < SHADER_MAX_TEXTURES; j++) {
++                        if (mRenderingState.mTextures[j] == &*evictIt) {
++                            mRenderingState.mTextures[j] = nullptr;
++                        }
++                    }
++                    mTextureCache.map.erase(evictIt);
++                    mTextureCache.lru.pop_front();
++                    sohIosPanicked = true;
++                }
++                if (sohIosPanicked) {
++                    SPDLOG_WARN("texcache PANIC: footprint > {} MB — ledger cut to {} MB / {} entries",
++                                sohIosPanicMB, mRapi->GetTextureBytes() / (1024 * 1024),
++                                mTextureCache.map.size());
++                }
++            }
++        }
++    };
++#endif
++
+     if ((texFlags & TEX_FLAG_LOAD_AS_IMG) != 0) {
+         ImportTextureImg(tile, importReplacement);
++#ifdef __IOS__
++        sohIosEvictTail(); // rev9: the pack-texture exit — never covered before
++#endif
+         return;
+     }
+ 
+     // if load as raw is set then we load_raw();
+     if ((texFlags & TEX_FLAG_LOAD_AS_RAW) != 0) {
+         ImportTextureRaw(tile, importReplacement);
++#ifdef __IOS__
++        sohIosEvictTail();
++#endif
+         return;
+     }
+ 
+@@ -1289,6 +1398,10 @@
+             SPDLOG_ERROR("Invalid texture format. Fmt = {}", fmt);
+             break;
+     }
++
++#ifdef __IOS__
++    sohIosEvictTail();
++#endif
+ }
+ 
+ void Interpreter::ImportTextureMask(int i, int tile) {

@@ -1,0 +1,320 @@
+Overlay patch 0013: CMakeLists.txt iOS app target (Spaghettify analog of
+reference soh 0004 / 2ship mm 0004) + new ios/Info.plist.in.
+
+Upstream ALREADY carries an embryonic iOS branch, written against a
+different LUS fork: it includes a vendored cmake/ios.toolchain.cmake with
+PLATFORM hardcoded OS64 (clobbers simulator builds) and bundles
+libultraship/ios/{Launch.storyboard,plist.in,...} which DO NOT EXIST in the
+Kenix3 LUS at our pin. This patch repoints that skeleton at the proven
+reference shape:
+- top if(IOS): keep PLATFORM_IOS=1 (Game.cpp's extern-C main guard); drop
+  the vendored toolchain include (LUS's ios-toolchain-populate + our
+  overlay 0006 own platform selection; -DPLATFORM comes from the command
+  line) and the placeholder team/bundle ids.
+- app-target branch: our Info.plist.in (added by this patch), shell wiring
+  via -DSOH_IOS_SHELL_DIR (SOH_* names kept for harbour-shell uniformity),
+  __IOS__ PRIVATE on the game target (LUS's is PRIVATE to itself, reference
+  D4), main=SDL_main scoped to src/port/Game.cpp only (SDL2main's UIKit
+  shim provides main() -> SDL_main), spaghetti.o2r bundled via
+  -DSOH_O2R_PATH. torch's config.yml/yamls/meta self-bundle via upstream's
+  existing POST_BUILD copies to $<TARGET_FILE_DIR> (= the .app on iOS).
+- deps branch: static ogg/vorbis via -DSOH_IOS_DEPS_PREFIX (no opus — SoH
+  speech-synth only; no SDL2_net — USE_NETWORKING off), SDL2-static +
+  SDL2main from LUS's FetchContent, Threads.
+Deltas vs 2ship 0004: no PCH prelude (no target_precompile_headers here);
+no gamecontrollerdb.txt (upstream never bundles one; LUS warns and
+continues).
+
+rev2 (visionOS Phase 01, VISION-PRO-LUS-PLAYBOOK §1.1): SOH_VISIONOS=1
+(cache var from build-visionos.sh / build-vision-sim.sh) gates the vision
+deltas INSIDE the same three replacement blocks — zero new vendor anchors:
+- Swift @main entry (SohVisionApp.swift) in its OWN flag-clean static lib:
+  the Xcode generator ignores COMPILE_LANGUAGE genexes when composing
+  OTHER_SWIFT_FLAGS, so a .swift source on the game target would inherit
+  C warning flags and swiftc hard-errors (reference 0004 trap).
+  -Wl,-force_load extracts main from the archive; SDL2main is NOT linked
+  on visionOS (genex in the deps branch). ImGui's PUBLIC SDL2::SDL2main
+  link in LUS ios.cmake is benign: its main-defining archive member is
+  never extracted once @main resolves main (reference-shipped this way).
+  SohHostViewController.m + SohImmersive.m ride on the app target;
+  frameworks CompositorServices/ARKit/AVFAudio (3D needs all three;
+  harmless in Phase 01).
+- Info.plist gains @SOH_PLIST_EXTRA@: UIApplicationSceneManifest with
+  UIApplicationSupportsMultipleScenes=true, visionOS-only (the SwiftUI
+  ImmersiveSpace requires it; top-level placement is silently ignored —
+  it must live INSIDE the manifest dict; the key changes UIKit scene
+  behavior on iPhone so it stays vision-gated).
+Requires the 0038 dispatch analog (CMAKE_SYSTEM_NAME visionOS -> "iOS"
+re-flip) for any of these branches to fire on a visionOS configure.
+
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -105,13 +105,15 @@
+ endif()
+ 
+ if(IOS)
+-  set(PLATFORM "OS64")
+-  include(cmake/ios.toolchain.cmake)
++  # PLATFORM_IOS gates upstream's extern-C main() (src/port/Game.cpp) and
++  # mobile paths. Platform/toolchain selection is owned by libultraship's
++  # ios-toolchain-populate.cmake (overlay 0006 makes PLATFORM overridable:
++  # pass -DPLATFORM=SIMULATORARM64 for simulator builds) — upstream's
++  # vendored cmake/ios.toolchain.cmake hardcoded OS64 and its
++  # libultraship/ios resource dir does not exist in this LUS.
+   add_compile_definitions(
+     PLATFORM_IOS=1
+ )
+-  set(CMAKE_XCODE_ATTRIBUTE_DEVELOPMENT_TEAM "YOUR_TEAM_ID")
+-  set(PROJECT_ID "dev.net64.game")
+ endif()
+ 
+ ################################################################################
+@@ -320,23 +322,121 @@
+ list(FILTER ALL_FILES EXCLUDE REGEX "./src/debug/crash_screen_enhancement.c")
+ 
+ if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
+-  set(IOS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/libultraship/ios)
++  add_executable(${PROJECT_NAME} ${ALL_FILES})
+ 
+-  set(STORYBOARD_FILE ${IOS_DIR}/Launch.storyboard)
+-  set(IMAGE_FILES ${IOS_DIR}/PoweredBy.png)
+-  set(ICON_FILES ${IOS_DIR}/Icon.png)
++  # LUS defines __IOS__ only PRIVATE to itself; Spaghettify TUs (and the
++  # LUS headers they include, plus GameExtractor's mobile paths) need it.
++  # MA_NO_DEVICE_IO: HMAS runs miniaudio with noDevice=MA_TRUE (LUS's
++  # AudioPlayer owns output); without it miniaudio's iOS backend drags
++  # AVFoundation ObjC headers into plain C++ TUs and fails to compile.
++  target_compile_definitions(${PROJECT_NAME} PRIVATE __IOS__ MA_NO_DEVICE_IO)
+ 
+-  list(APPEND ALL_FILES ${STORYBOARD_FILE} ${IMAGE_FILES} ${ICON_FILES})
++  # SDL2main's UIKit shim provides the real main() -> UIApplicationMain ->
++  # SDL_main. Upstream's main() (src/port/Game.cpp, already extern "C"
++  # under PLATFORM_IOS) must therefore BE SDL_main. Scoped to the one file
++  # so no other identifier named `main` can be rewritten. On visionOS the
++  # Swift @main App is the entry instead (SDL2main is NOT linked, see deps
++  # branch); SohHostViewController calls SDL_main once the scene is live.
++  set_source_files_properties(src/port/Game.cpp PROPERTIES
++      COMPILE_DEFINITIONS main=SDL_main)
+ 
+-  add_executable(${PROJECT_NAME} ${ALL_FILES})
+-  set_xcode_property(${PROJECT_NAME} PRODUCT_BUNDLE_IDENTIFIER ${PROJECT_ID} All)
+-  set_target_properties(
+-        ${PROJECT_NAME}
+-        PROPERTIES
+-        MACOSX_BUNDLE TRUE
+-        MACOSX_BUNDLE_INFO_PLIST ${IOS_DIR}/plist.in
+-        RESOURCE "${IMAGE_FILES};${STORYBOARD_FILE};${ICON_FILES}"
+-    )
++  # iOS app shell (touch controls, scene graft, console bridge) lives in
++  # the SpaghettiKart-ios repo, passed as SOH_IOS_SHELL_DIR (reference
++  # variable names kept for harbour-shell/script uniformity).
++  if(NOT EXISTS "${SOH_IOS_SHELL_DIR}/SohIosShell.m")
++      message(FATAL_ERROR "iOS build requires -DSOH_IOS_SHELL_DIR=<dir with SohIosShell.m>")
++  endif()
++  target_sources(${PROJECT_NAME} PRIVATE "${SOH_IOS_SHELL_DIR}/SohIosShell.m")
++  target_include_directories(${PROJECT_NAME} PRIVATE "${SOH_IOS_SHELL_DIR}")
++  target_link_libraries(${PROJECT_NAME} PRIVATE "-framework UniformTypeIdentifiers"
++                                                "-framework GameController")
++
++  # Remote console bridge — dev/OTA builds only. SohIosShell.m's #ifndef
++  # fallback pins SOH_REMOTE_CONSOLE to 0, and 0023 gates the "Remote Console"
++  # menu widget on the SAME macro, so when no define reaches this target both
++  # the TCP listener and its toggle compile out. That is exactly what a public
++  # GitHub build wants; dev/OTA builds pass -DSOH_REMOTE_CONSOLE=ON
++  # (build-ios.sh / build-visionos.sh default it ON, public releases run them
++  # with OFF). This MUST sit on ${PROJECT_NAME}: that single target compiles
++  # both SohIosShell.m (the bridge) and src/port/ui/PortMenu.cpp (the toggle),
++  # so one definition brings the pair back together. If a dev build shows no
++  # toggle, the define is not reaching PortMenu.cpp's target.
++  option(SOH_REMOTE_CONSOLE "Compile in the remote console bridge (dev/OTA builds only)" OFF)
++  if(SOH_REMOTE_CONSOLE)
++      target_compile_definitions(${PROJECT_NAME} PRIVATE SOH_REMOTE_CONSOLE=1)
++      message(STATUS "REMOTE CONSOLE COMPILED IN — do not publish this build")
++  else()
++      message(STATUS "remote console compiled out (public-safe)")
++  endif()
++
++  # App icon: ONE asset catalog holds both the iOS AppIcon.appiconset and the
++  # visionOS AppIcon.solidimagestack (layered) — actool compiles whichever
++  # matches the target platform. Registered unconditionally: this branch runs
++  # for visionOS too (0039 flips CMAKE_SYSTEM_NAME to "iOS"), and the
++  # ASSETCATALOG_COMPILER_APPICON_NAME + plist CFBundleIconName below point
++  # both platforms' home-screen/App-Library icon at "AppIcon".
++  target_sources(${PROJECT_NAME} PRIVATE "${SOH_IOS_SHELL_DIR}/Assets.xcassets")
++  set_source_files_properties("${SOH_IOS_SHELL_DIR}/Assets.xcassets"
++      PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
++
++  if(SOH_VISIONOS)
++    # SwiftUI app entry in its OWN static lib: the Xcode generator ignores
++    # COMPILE_LANGUAGE genexes when composing OTHER_SWIFT_FLAGS, so any
++    # .swift source on the game target inherits its C warning flags and
++    # swiftc hard-errors. Swift's @main emits main; -force_load extracts it
++    # from the archive exactly like SDL2main's shim would have (SDL2main is
++    # NOT linked on visionOS — see the deps branch genex). The SDK swift
++    # -L is needed because the app target has no Swift sources, so Xcode
++    # won't add runtime search paths itself.
++    enable_language(Swift)
++    add_library(sohvisionswift STATIC "${SOH_IOS_SHELL_DIR}/SohVisionApp.swift")
++    set_target_properties(sohvisionswift PROPERTIES
++        XCODE_ATTRIBUTE_SWIFT_VERSION "5.0"
++        XCODE_ATTRIBUTE_SWIFT_OBJC_BRIDGING_HEADER "${SOH_IOS_SHELL_DIR}/SohVision-Bridging-Header.h")
++    target_sources(${PROJECT_NAME} PRIVATE
++        "${SOH_IOS_SHELL_DIR}/SohHostViewController.m"
++        "${SOH_IOS_SHELL_DIR}/SohImmersive.m")
++    target_link_libraries(${PROJECT_NAME} PRIVATE
++        "-Wl,-force_load,$<TARGET_FILE:sohvisionswift>"
++        "-L$(SDKROOT)/usr/lib/swift"
++        "-framework CompositorServices" "-framework ARKit" "-framework AVFAudio")
++    add_dependencies(${PROJECT_NAME} sohvisionswift)
++  endif()
++
++  # spaghetti.o2r is ROM-independent, produced by the host build
++  # (scripts/extract-mk64-o2r.sh) and bundled as a resource. mk64.o2r is
++  # generated ON DEVICE from the user's ROM by the in-app extractor.
++  set(SOH_O2R_PATH "" CACHE FILEPATH "Path to a host-built spaghetti.o2r to bundle")
++  if(NOT EXISTS "${SOH_O2R_PATH}")
++      message(FATAL_ERROR "iOS build requires -DSOH_O2R_PATH=<host-built spaghetti.o2r>")
++  endif()
++  target_sources(${PROJECT_NAME} PRIVATE "${SOH_O2R_PATH}")
++  set_source_files_properties("${SOH_O2R_PATH}"
++      PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
++
++  set(SOH_IOS_BUNDLE_IDENTIFIER "com.harbourmasters.spaghettikart" CACHE STRING "iOS bundle identifier")
++  set(SOH_IOS_DEVELOPMENT_TEAM "" CACHE STRING "Development team for iOS code signing")
++  # visionOS: the SwiftUI entry's ImmersiveSpace (stereo 3D) requires
++  # multiple scenes. The key must sit INSIDE UIApplicationSceneManifest
++  # (top-level placement is silently ignored) and stays visionOS-only
++  # (it changes UIKit scene behavior on iPhone).
++  set(SOH_PLIST_EXTRA "")
++  if(SOH_VISIONOS)
++    set(SOH_PLIST_EXTRA "\n\t<key>UIApplicationSceneManifest</key>\n\t<dict>\n\t\t<key>UIApplicationSupportsMultipleScenes</key>\n\t\t<true/>\n\t</dict>")
++  endif()
++  configure_file(${CMAKE_CURRENT_SOURCE_DIR}/ios/Info.plist.in ${CMAKE_BINARY_DIR}/ios/Info.plist @ONLY)
++  set_target_properties(${PROJECT_NAME} PROPERTIES
++      XCODE_ATTRIBUTE_CLANG_ENABLE_OBJC_ARC YES
++      MACOSX_BUNDLE TRUE
++      MACOSX_BUNDLE_INFO_PLIST "${CMAKE_BINARY_DIR}/ios/Info.plist"
++      XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "${SOH_IOS_BUNDLE_IDENTIFIER}"
++      XCODE_ATTRIBUTE_DEVELOPMENT_TEAM "${SOH_IOS_DEVELOPMENT_TEAM}"
++      XCODE_ATTRIBUTE_CODE_SIGN_STYLE "Automatic"
++      XCODE_ATTRIBUTE_TARGETED_DEVICE_FAMILY "1,2"
++      XCODE_ATTRIBUTE_ASSETCATALOG_COMPILER_APPICON_NAME "AppIcon"
++      XCODE_ATTRIBUTE_INSTALL_PATH "$(LOCAL_APPS_DIR)"
++      XCODE_ATTRIBUTE_SKIP_INSTALL "NO"
++  )
+ else()
+   add_executable(${PROJECT_NAME} ${ALL_FILES})
+ endif()
+@@ -520,6 +620,45 @@
+   target_include_directories(${PROJECT_NAME} PRIVATE
+         ${DEVKITPRO}/portlibs/wiiu/include/
+     )
++elseif(CMAKE_SYSTEM_NAME STREQUAL "iOS")
++  # SDL2 comes statically from libultraship's FetchContent (SDL2::SDL2-static
++  # + SDL2::SDL2main, linked PUBLIC via ImGui; SDL2main repeated here so the
++  # UIKit main shim is always pulled in — except on visionOS, where the Swift
++  # @main is the entry: the genex drops the explicit link, and ImGui's PUBLIC
++  # SDL2::SDL2main is benign because its main-defining archive member is
++  # never extracted once @main resolves main). Static ogg/vorbis are prebuilt
++  # for iOS and injected by prefix (scripts/build-audio-deps-ios.sh). No opus
++  # (SoH speech-synth only) and no SDL2_net (USE_NETWORKING off).
++  set(THREADS_PREFER_PTHREAD_FLAG ON)
++  find_package(Threads REQUIRED)
++  set(SOH_IOS_DEPS_PREFIX "" CACHE PATH "Prefix containing static ogg/vorbis for iOS")
++  foreach(_l ogg vorbis vorbisenc vorbisfile)
++    if(NOT EXISTS "${SOH_IOS_DEPS_PREFIX}/lib/lib${_l}.a")
++      message(FATAL_ERROR "iOS build requires -DSOH_IOS_DEPS_PREFIX with lib/lib${_l}.a (got '${SOH_IOS_DEPS_PREFIX}')")
++    endif()
++  endforeach()
++  add_library(Ogg::ogg STATIC IMPORTED)
++  set_target_properties(Ogg::ogg PROPERTIES IMPORTED_LOCATION "${SOH_IOS_DEPS_PREFIX}/lib/libogg.a"
++      INTERFACE_INCLUDE_DIRECTORIES "${SOH_IOS_DEPS_PREFIX}/include")
++  add_library(Vorbis::vorbis STATIC IMPORTED)
++  set_target_properties(Vorbis::vorbis PROPERTIES IMPORTED_LOCATION "${SOH_IOS_DEPS_PREFIX}/lib/libvorbis.a"
++      INTERFACE_INCLUDE_DIRECTORIES "${SOH_IOS_DEPS_PREFIX}/include")
++  add_library(Vorbis::vorbisenc STATIC IMPORTED)
++  set_target_properties(Vorbis::vorbisenc PROPERTIES IMPORTED_LOCATION "${SOH_IOS_DEPS_PREFIX}/lib/libvorbisenc.a"
++      INTERFACE_INCLUDE_DIRECTORIES "${SOH_IOS_DEPS_PREFIX}/include")
++  add_library(Vorbis::vorbisfile STATIC IMPORTED)
++  set_target_properties(Vorbis::vorbisfile PROPERTIES IMPORTED_LOCATION "${SOH_IOS_DEPS_PREFIX}/lib/libvorbisfile.a"
++      INTERFACE_INCLUDE_DIRECTORIES "${SOH_IOS_DEPS_PREFIX}/include")
++  set(ADDITIONAL_LIBRARY_DEPENDENCIES
++        SDL2::SDL2-static
++        "$<$<NOT:$<BOOL:${SOH_VISIONOS}>>:SDL2::SDL2main>"
++        "Ogg::ogg"
++        "Vorbis::vorbis"
++        "Vorbis::vorbisenc"
++        "Vorbis::vorbisfile"
++        ${CMAKE_DL_LIBS}
++        Threads::Threads
++    )
+ else()
+   find_package(Ogg REQUIRED)
+   find_package(Vorbis REQUIRED)
+--- a/ios/Info.plist.in
++++ b/ios/Info.plist.in
+@@ -0,0 +1,64 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++	<key>CFBundleDevelopmentRegion</key>
++	<string>en</string>
++	<key>CFBundleDisplayName</key>
++	<string>Spaghetti Kart</string>
++	<key>CFBundleExecutable</key>
++	<string>Spaghettify</string>
++	<key>CFBundleIconName</key>
++	<string>AppIcon</string>
++	<key>CFBundleIdentifier</key>
++	<string>@SOH_IOS_BUNDLE_IDENTIFIER@</string>
++	<key>CFBundleInfoDictionaryVersion</key>
++	<string>6.0</string>
++	<key>CFBundleName</key>
++	<string>SpaghettiKart</string>
++	<key>CFBundlePackageType</key>
++	<string>APPL</string>
++	<key>CFBundleShortVersionString</key>
++	<string>1.0.0</string>
++	<key>CFBundleVersion</key>
++	<string>1</string>
++	<key>LSRequiresIPhoneOS</key>
++	<true/>
++	<key>UIFileSharingEnabled</key>
++	<true/>
++	<key>LSSupportsOpeningDocumentsInPlace</key>
++	<true/>
++	<key>UIStatusBarHidden</key>
++	<true/>
++	<key>UIRequiresFullScreen</key>
++	<true/>
++	<key>UILaunchScreen</key>
++	<dict/>
++	<key>UIRequiredDeviceCapabilities</key>
++	<array>
++		<string>arm64</string>
++	</array>
++	<key>UISupportedInterfaceOrientations</key>
++	<array>
++		<string>UIInterfaceOrientationLandscapeRight</string>
++		<string>UIInterfaceOrientationLandscapeLeft</string>
++	</array>
++	<key>CADisableMinimumFrameDurationOnPhone</key>
++	<true/>
++	<key>UIApplicationSupportsIndirectInputEvents</key>
++	<true/>
++	<key>ITSAppUsesNonExemptEncryption</key>
++	<false/>
++	<key>CFBundleURLTypes</key>
++	<array>
++		<dict>
++			<key>CFBundleURLName</key>
++			<string>@SOH_IOS_BUNDLE_IDENTIFIER@</string>
++			<key>CFBundleURLSchemes</key>
++			<array>
++				<string>spaghetti</string>
++			</array>
++		</dict>
++	</array>@SOH_PLIST_EXTRA@
++</dict>
++</plist>

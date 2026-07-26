@@ -1,0 +1,93 @@
+Overlay patch 0015: game-state exports for the iOS shell (port of
+reference 0013). Appended at Engine.cpp EOF so it shares no hunks with 0014
+(reference D6 rule). Symbols keep the Ship of Harkinian port SohIos_ names — the shell
+is a verbatim copy (SHELL-DIVERGENCES.md logs the policy).
+- SohIos_IsMenuOpen: LUS Gui::GetMenuOrMenubarVisible (present at this pin,
+  Gui.h:261) — touch overlay auto-hides while the port menu is open.
+- SohIos_IsGamePaused: MK64's `u16 gIsGamePaused` (code_800029B0.c:65).
+- SohIos_ActiveSeqIds: stub 0 for now — SoH used it for a music-diagnostic
+  bridge command; MK64's music diag equivalent is TBD (shell tolerates 0).
+- SohIos_IsPopupOpen: any ImGui popup (extractor prompts!) -> the touch
+  overlay yields ALL input (reference trap: stick zones ate popup taps).
+__IOS__-only; desktop build unaffected.
+
+--- a/src/port/Engine.cpp
++++ b/src/port/Engine.cpp
+@@ -837,4 +837,77 @@
+ 
+ extern "C" uint32_t OTRGetGameViewportHeight() {
+     return GetInterpreter()->mGameWindowViewport.height;
++}
++
++#ifdef __IOS__
++// SOH_IOS (overlay 0015): game-state exports for the shell's touch overlay.
++// Polled from the UIKit main thread, which on iOS interleaves with (never
++// runs beside) the SDL game loop.
++extern "C" int SohIos_IsMenuOpen(void) {
++    auto ctx = Ship::Context::GetInstance();
++    if (ctx == nullptr) {
++        return 0;
++    }
++    auto wnd = ctx->GetWindow();
++    if (wnd == nullptr) {
++        return 0;
++    }
++    auto gui = wnd->GetGui();
++    if (gui == nullptr) {
++        return 0;
++    }
++    return gui->GetMenuOrMenubarVisible() ? 1 : 0;
+ }
++
++// MK64 pause state: drives the controller-mode policy where the shell's
++// menu button appears only while the game is paused.
++extern "C" {
++extern uint16_t gIsGamePaused;
++}
++extern "C" int SohIos_IsGamePaused(void) {
++    return gIsGamePaused != 0 ? 1 : 0;
++}
++
++// SoH used this for a music-diagnostic bridge command; MK64 equivalent is
++// TBD. Keep the symbol so the shell stays a verbatim copy.
++extern "C" uint32_t SohIos_ActiveSeqIds(void) {
++    return 0;
++}
++
++// Any ImGui popup open (extractor prompts, quit confirm, ...): the touch
++// overlay must yield ALL input so popup buttons are tappable — reference
++// trap: the stick zones ate the extractor's Yes on device.
++extern "C" int SohIos_IsPopupOpen(void) {
++    return ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel) ? 1 : 0;
++}
++
++// Menu-button visibility outside pause: MK64's title/menus/attract demo
++// (SoH keyed on "no play state or file-select"; here: any non-racing
++// state, or the attract demo itself).
++extern "C" {
++extern int32_t gGamestate;  // main.h:203 (RACING = the in-race state)
++extern uint16_t gDemoMode;  // main.h:208
++}
++extern "C" int SohIos_IsTitleOrDemo(void) {
++    return (gGamestate != 4 /* RACING, defines.h:227 */ || gDemoMode != 0) ? 1 : 0;
++}
++
++// Touch scrolling for the port menu (overlay 0024 consumes): the shell
++// queues finger scroll deltas here; Menu.cpp's scrollable children take
++// them if the finger is horizontally inside the child. Everything runs on
++// the main thread (the game loop IS the main thread on iOS) — no locking.
++static float sSohIosMenuScrollDy = 0.0f;
++static float sSohIosMenuScrollX = -1.0f;
++extern "C" void SohIos_QueueMenuScroll(float x, float dy) {
++    sSohIosMenuScrollX = x;
++    sSohIosMenuScrollDy += dy;
++}
++extern "C" float SohIos_TakeMenuScrollFor(float winX, float winW) {
++    if (sSohIosMenuScrollDy == 0.0f || sSohIosMenuScrollX < winX || sSohIosMenuScrollX >= winX + winW) {
++        return 0.0f;
++    }
++    float dy = sSohIosMenuScrollDy;
++    sSohIosMenuScrollDy = 0.0f;
++    return dy;
++}
++#endif

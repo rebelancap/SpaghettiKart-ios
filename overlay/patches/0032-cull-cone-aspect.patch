@@ -1,0 +1,42 @@
+Overlay patch 0032: aspect-aware object cull cone (the blinking fix).
+
+is_within_render_distance culls actors/billboards by yaw angle around the
+camera: extended_fov = fov * 0xB6 * scaleFov, scaleFov hardcoded 1.25 —
+tuned for a narrow aspect. The iPhone renders 2736x1260 (2.17:1): the
+screen's horizontal FOV exceeds the cull cone, so edge-visible billboards
+(trees, palms) are culled WHILE ON SCREEN and pop back next tick as the
+camera yaw wobbles — the user-visible "trees blinking when turning",
+video-reproduced on sim (artifacts/blink-video/race-real.mp4 frames
+83-85: tree present/absent/present; 145 flicker events in 30 s).
+
+Fix: widen the cone, live-tunable via gSohIos.CullFovScalePct (default 300,
+the A/B-tested value: 88 flicker events at upstream 1.25 vs 36 at 3.00,
+matched parked-camera segments, 2026-07-21). Cost of over-wide: a few extra
+off-screen objects drawn — noise on Metal. 0 disables the override
+(upstream 1.25). Verification: same video harness; pass = flicker events
+collapse to ~0.
+
+
+--- a/src/racing/math_util.c
++++ b/src/racing/math_util.c
+@@ -1113,6 +1113,20 @@
+     maxDistance *= 6.5f;
+     maxDistance2 = 1.0f;
+     scaleFov = 1.25;
++#ifdef __IOS__
++    // SOH_IOS (overlay 0032): 1.25 is tuned for a narrow aspect; at the
++    // phone's 2.17:1 the screen's horizontal FOV exceeds the cull cone, so
++    // edge-visible billboards are culled while on screen — the "blinking
++    // trees" (video-reproduced: artifacts/blink-video frames 83-85).
++    // Live-tunable for A/B; 0 restores upstream.
++    {
++        extern s32 CVarGetInteger(const char* name, s32 defaultValue);
++        s32 sohIosCullPct = CVarGetInteger("gSohIos.CullFovScalePct", 300);
++        if (sohIosCullPct > 0) {
++            scaleFov = sohIosCullPct / 100.0f;
++        }
++    }
++#endif
+ 
+     f32 extended_fov = ((f32) fov * 0xB6 * scaleFov); // Sets the Culling for objects on the left and right
+ 

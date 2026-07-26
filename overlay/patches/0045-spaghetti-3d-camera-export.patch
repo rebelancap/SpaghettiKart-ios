@@ -1,0 +1,184 @@
+Overlay patch 0045: game-side camera export for stereoscopic 3D
+(= reference 0032 concept, MK64 sites; VISION-PRO-LUS-PLAYBOOK §2.5).
+MK64 composes guPerspective x guLookAt COMBINED in the projection slot
+(GameCamera::SetViewProjection — same shape as OoT's z_view), so 0044's
+injector needs the camera basis exported from the game:
+- gSoh3DCamRight/Fwd/Eye: basis+position from the player-1 camera's
+  pos/lookAt/up at the exact values guLookAt consumed (fwd = normalized
+  lookAt-pos; right = fwd x up, normalized).
+- gSoh3DCamP00 = 1/(tan(fovy/2)*aspect) — matches guPerspective's [0][0]
+  for the same fieldOfView (fovy degrees) and gScreenAspect.
+- gSoh3DCamDist = |lookAt-pos|: adaptive-convergence anchor — the kart
+  sits on the panel plane. NOTE MK64 world scale is smaller than OoT's;
+  0044 keeps reference clamps until live camDist is measured (bridge 3d).
+- Export sites: GameCamera::SetViewProjection (kart follow + look-behind,
+  which subclasses without overriding) AND TourCamera::SetViewProjection
+  (pre-race fly-by — virtual-dispatched INSTEAD of GameCamera, and its
+  shot CUTS are the convergence-snap case). FreeCamera (debug) skipped —
+  stale basis there is acceptable.
+- Player-1 only (_camera->playerId == 0): split-screen render order is
+  winner-dependent, and VP is single-player; belt-and-braces with the
+  g3DInPlay gate below.
+- Comfort flags from game_state_handler (runs every frame, every state):
+  gSoh3DPaused = gIsGamePaused != 0 (holds pausing-player-index+1);
+  gSoh3DInPlay = RACING && SCREEN_MODE_1P && !quit-transition. The
+  ENDING podium and CREDITS stay flat (v1; perspective sites exist for
+  later). No aiming export — MK64 has no first-person mode; look-behind
+  is an instant cut handled as a convergence snap, not a profile.
+All exports write shell-owned globals (SohIosShell.m); extern "C" decls
+at FILE scope in the C++ TUs (block-scope externs namespace-mangle — the
+project's recurring linkage trap). __IOS__-guarded: the macOS build
+builds this vendor and links no shell.
+
+--- a/src/engine/cameras/GameCamera.cpp
++++ b/src/engine/cameras/GameCamera.cpp
+@@ -80,6 +80,48 @@
+     return &LookAtMatrix;
+ }
+ 
++#ifdef __IOS__
++#include <math.h>
++// SOH_IOS (overlay 0045): live camera basis for stereoscopic 3D (0044).
++// FILE-scope extern "C" — block-scope externs namespace-mangle in C++.
++extern "C" {
++extern volatile float gSoh3DCamDist, gSoh3DCamP00;
++extern volatile float gSoh3DCamRight[3], gSoh3DCamFwd[3], gSoh3DCamEye[3];
++}
++static void Soh3DExportCameraBasis(Camera* sohCam, float sohAspect) {
++    if (sohCam == NULL || sohCam->playerId != 0) {
++        return; // player 1 only — split-screen order is winner-dependent
++    }
++    float sohDx = sohCam->lookAt[0] - sohCam->pos[0];
++    float sohDy = sohCam->lookAt[1] - sohCam->pos[1];
++    float sohDz = sohCam->lookAt[2] - sohCam->pos[2];
++    float sohDist = sqrtf(sohDx * sohDx + sohDy * sohDy + sohDz * sohDz);
++    if (sohDist <= 0.0f) {
++        return;
++    }
++    float sohFx = sohDx / sohDist, sohFy = sohDy / sohDist, sohFz = sohDz / sohDist;
++    float sohRx = sohFy * sohCam->up[2] - sohFz * sohCam->up[1];
++    float sohRy = sohFz * sohCam->up[0] - sohFx * sohCam->up[2];
++    float sohRz = sohFx * sohCam->up[1] - sohFy * sohCam->up[0];
++    float sohRl = sqrtf(sohRx * sohRx + sohRy * sohRy + sohRz * sohRz);
++    if (sohRl <= 1e-4f) {
++        return; // camera looking straight along up — keep last basis
++    }
++    gSoh3DCamRight[0] = sohRx / sohRl;
++    gSoh3DCamRight[1] = sohRy / sohRl;
++    gSoh3DCamRight[2] = sohRz / sohRl;
++    gSoh3DCamFwd[0] = sohFx;
++    gSoh3DCamFwd[1] = sohFy;
++    gSoh3DCamFwd[2] = sohFz;
++    gSoh3DCamEye[0] = sohCam->pos[0];
++    gSoh3DCamEye[1] = sohCam->pos[1];
++    gSoh3DCamEye[2] = sohCam->pos[2];
++    float sohHalfFovX = tanf(sohCam->fieldOfView * 0.5f * (3.14159265f / 180.0f)) * sohAspect;
++    gSoh3DCamP00 = (sohHalfFovX > 1e-4f) ? (1.0f / sohHalfFovX) : 1.0f;
++    gSoh3DCamDist = sohDist;
++}
++#endif
++
+ void GameCamera::SetViewProjection() {
+     u16 perspNorm;
+ 
+@@ -100,5 +142,9 @@
+     gSPMatrix(gDisplayListHead++, &LookAtMatrix,
+               G_MTX_NOPUSH | G_MTX_MUL | G_MTX_PROJECTION);
+ 
++#ifdef __IOS__
++    // SOH_IOS (overlay 0045): export at the exact values guLookAt consumed.
++    Soh3DExportCameraBasis(_camera, gScreenAspect);
++#endif
+     FrameInterpolation_RecordCloseChild();
+ }
+--- a/src/engine/cameras/TourCamera.cpp
++++ b/src/engine/cameras/TourCamera.cpp
+@@ -184,6 +184,48 @@
+     return bTourComplete;
+ }
+ 
++#ifdef __IOS__
++#include <math.h>
++// SOH_IOS (overlay 0045): live camera basis for stereoscopic 3D (0044).
++// FILE-scope extern "C" — block-scope externs namespace-mangle in C++.
++extern "C" {
++extern volatile float gSoh3DCamDist, gSoh3DCamP00;
++extern volatile float gSoh3DCamRight[3], gSoh3DCamFwd[3], gSoh3DCamEye[3];
++}
++static void Soh3DExportCameraBasis(Camera* sohCam, float sohAspect) {
++    if (sohCam == NULL || sohCam->playerId != 0) {
++        return; // player 1 only — split-screen order is winner-dependent
++    }
++    float sohDx = sohCam->lookAt[0] - sohCam->pos[0];
++    float sohDy = sohCam->lookAt[1] - sohCam->pos[1];
++    float sohDz = sohCam->lookAt[2] - sohCam->pos[2];
++    float sohDist = sqrtf(sohDx * sohDx + sohDy * sohDy + sohDz * sohDz);
++    if (sohDist <= 0.0f) {
++        return;
++    }
++    float sohFx = sohDx / sohDist, sohFy = sohDy / sohDist, sohFz = sohDz / sohDist;
++    float sohRx = sohFy * sohCam->up[2] - sohFz * sohCam->up[1];
++    float sohRy = sohFz * sohCam->up[0] - sohFx * sohCam->up[2];
++    float sohRz = sohFx * sohCam->up[1] - sohFy * sohCam->up[0];
++    float sohRl = sqrtf(sohRx * sohRx + sohRy * sohRy + sohRz * sohRz);
++    if (sohRl <= 1e-4f) {
++        return; // camera looking straight along up — keep last basis
++    }
++    gSoh3DCamRight[0] = sohRx / sohRl;
++    gSoh3DCamRight[1] = sohRy / sohRl;
++    gSoh3DCamRight[2] = sohRz / sohRl;
++    gSoh3DCamFwd[0] = sohFx;
++    gSoh3DCamFwd[1] = sohFy;
++    gSoh3DCamFwd[2] = sohFz;
++    gSoh3DCamEye[0] = sohCam->pos[0];
++    gSoh3DCamEye[1] = sohCam->pos[1];
++    gSoh3DCamEye[2] = sohCam->pos[2];
++    float sohHalfFovX = tanf(sohCam->fieldOfView * 0.5f * (3.14159265f / 180.0f)) * sohAspect;
++    gSoh3DCamP00 = (sohHalfFovX > 1e-4f) ? (1.0f / sohHalfFovX) : 1.0f;
++    gSoh3DCamDist = sohDist;
++}
++#endif
++
+ void TourCamera::SetViewProjection() {
+     u16 perspNorm;
+     Mat4 matrix;
+@@ -209,6 +251,13 @@
+     gSPMatrix(gDisplayListHead++, &LookAtMatrix, G_MTX_NOPUSH | G_MTX_MUL | G_MTX_PROJECTION);
+     FrameInterpolation_RecordCloseChild();
+ 
++#ifdef __IOS__
++    // SOH_IOS (overlay 0045): the fly-by camera replaces GameCamera's
++    // dispatch — without this the basis goes stale exactly when a
++    // perspective scene is on screen. Shot cuts snap camDist; 0044's
++    // smoothing absorbs them (tune there, not here).
++    Soh3DExportCameraBasis(_camera, gScreenAspect);
++#endif
+     gDPPipeSync(gDisplayListHead++);
+ }
+ 
+--- a/src/main.c
++++ b/src/main.c
+@@ -826,8 +826,23 @@
+  * until the state changes (ie. Exit menus and start a race).
+  */
+ 
++#ifdef __IOS__
++/* SOH_IOS (overlay 0045): stereo comfort flags for 0044 (shell-owned
++ * globals). C TU — plain extern, no mangling concerns. */
++extern volatile int gSoh3DPaused, gSoh3DInPlay;
++#endif
++
+ void game_state_handler(void) {
+     FrameInterpolation_StartRecord();
++#ifdef __IOS__
++    /* SOH_IOS (overlay 0045): refreshed every frame in every state (this
++     * dispatcher always runs). Paused holds pausing-player-index+1.
++     * InPlay: 1P racing only — menus/podium/credits/split-screen flatten
++     * wholesale (their perspective content fights the panel plane). */
++    gSoh3DPaused = (gIsGamePaused != 0);
++    gSoh3DInPlay = (gGamestate == RACING) && (gActiveScreenMode == SCREEN_MODE_1P) &&
++                   (gIsInQuitToMenuTransition == 0);
++#endif
+ 
+ #if DVDL
+     if ((gControllerOne->button & L_TRIG) && (gControllerOne->button & R_TRIG) && (gControllerOne->button & Z_TRIG) &&

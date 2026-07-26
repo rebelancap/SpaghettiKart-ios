@@ -1,0 +1,50 @@
+Overlay patch 0046: sky stereo sentinels (= reference 0033 concept, MK64
+chokepoint; VISION-PRO-LUS-PLAYBOOK §2.6).
+MK64's sky is STRUCTURALLY unlike OoT's: Sky::Draw renders ortho gradient
+quads (guOrtho loaded G_MTX_PROJECTION), DrawSkyActors renders yaw-mapped
+screen-space cloud/star/snow sprites under the shared HUD ortho, and
+Sky::DrawFloor the below-horizon gradient. Zero-disparity ortho puts the
+sky ON the panel — stereoscopically in FRONT of distant terrain. 0044's
+injector applies a constant per-eye horizontal NDC shift to ortho passes
+BETWEEN these sentinels (the background-disparity term, sky-at-infinity);
+all other ortho (HUD/menus, which share the same ortho machinery — the
+sentinels are the ONLY way to tell them apart) stays on the panel plane.
+Single chokepoint: CM_RaceDrawSky covers Draw + DrawSkyActors + DrawFloor
+for every caller (race screens + ending sites). The thunderbolt fill-box
+is drawn by the callers AFTER this function — correctly outside.
+Microcode note: this port compiles F3DEX_GBI=1, so game-side G_NOOP is
+0xc0 (not F3DEX2's 0x00); the interpreter routes it to the same noop
+handler whose p-byte convention 0044 hooks (0x5A begin / 0x5B end).
+Emitted via gDisplayListHead (this game's DL cursor). __IOS__-guarded.
+
+--- a/src/port/Game.cpp
++++ b/src/port/Game.cpp
+@@ -563,11 +563,28 @@
+ void CM_RaceDrawSky(ScreenContext* screen, s32 someId) {
+     // if (bDrawSkybox) {
+     if (CVarGetInteger("gDrawSky", true) == true) {
++#ifdef __IOS__
++        // SOH_IOS (overlay 0046): stereo sky sentinel BEGIN — 0044 shifts
++        // ortho passes between these to place the sky at infinity.
++        {
++            Gfx* sohTag = gDisplayListHead++;
++            sohTag->words.w0 = (uintptr_t)((G_NOOP << 24) | (0x5A << 16));
++            sohTag->words.w1 = 0;
++        }
++#endif
+         Sky::Instance->Draw(screen);
+         if (gGamestate != CREDITS_SEQUENCE) {
+             func_80057FC4(screen, someId); // DrawSkyActors
+         }
+         Sky::Instance->DrawFloor(screen);
++#ifdef __IOS__
++        // SOH_IOS (overlay 0046): stereo sky sentinel END.
++        {
++            Gfx* sohTag = gDisplayListHead++;
++            sohTag->words.w0 = (uintptr_t)((G_NOOP << 24) | (0x5B << 16));
++            sohTag->words.w1 = 0;
++        }
++#endif
+     }
+ }
+ 

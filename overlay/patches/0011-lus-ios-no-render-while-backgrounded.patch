@@ -1,0 +1,64 @@
+Overlay patch 0011: never render while backgrounded (iOS) — rebase of
+reference 0016 onto this LUS pin (f5c3843f). Identical logic; the only
+difference is the trailing context (our pin predates the
+Context::GetInstance -> GetRawInstance rename, which is why the Ship of Harkinian port
+patch file misses here). Device symptom on the Ship of Harkinian port: game unplayable/
+slow after minimize+reopen — Metal's nextDrawable must not run while
+backgrounded (stalls/times out, watchdog risk, degraded drawable pool).
+Game thread parks on the shell's SohIos_IsBackgrounded() flag and resumes
+with a fresh drawable; null drawables are retried briefly then the frame is
+skipped. __IOS__-only; single hunk, disjoint from 0007's NewFrame hunk.
+
+--- a/libultraship/src/fast/backends/gfx_metal.cpp
++++ b/libultraship/src/fast/backends/gfx_metal.cpp
+@@ -1226,10 +1226,50 @@
+ 
+     return (int)index;
+ }
++
++#ifdef __IOS__
++// SOH_IOS (overlay 0011 rev2 = reference 0016 rev): shell-provided background
++// flag + run-loop tick (linkage specs must live at file scope).
++extern "C" int SohIos_IsBackgrounded(void);
++extern "C" void SohIos_ParkTick(void);
++// rev3 (VP device feedback: black window after live resize, audio alive):
++// consecutive-failure streak of the drawable acquire below, read by the
++// shell self-heal -- a wedged CAMetalLayer returns nil forever until its
++// drawableSize is rewritten; the streak lets the shell detect and hard-
++// reset it instead of waiting for the user to nudge the window.
++extern "C" volatile int gSohIosDrawableFailStreak;
++#endif
+ 
+ void GfxRenderingAPIMetal::SetupScreenFramebuffer(uint32_t width, uint32_t height) {
+     mCurrentDrawable = nullptr;
++#ifdef __IOS__
++    // Park the game thread while backgrounded — nextDrawable in the
++    // background stalls/times out (post-resume slowdown, watchdog risk).
++    // The process suspends moments later and resumes here.
++    {
++        // ParkTick services the main run loop (the game loop IS the main
++        // thread on iOS) so the lifecycle events that clear the flag can
++        // deliver — a sleeping park here deadlocks into a black screen
++        // (reference rev, 2026-07-13).
++        while (SohIos_IsBackgrounded()) {
++            SohIos_ParkTick();
++        }
++        const struct timespec sohIosRetryNap = { 0, 10 * 1000 * 1000 };
++        for (int i = 0; i < 100 && mCurrentDrawable == nullptr; i++) {
++            mCurrentDrawable = mLayer->nextDrawable();
++            if (mCurrentDrawable == nullptr) {
++                nanosleep(&sohIosRetryNap, nullptr); // pool drained (just resumed?)
++            }
++        }
++        if (mCurrentDrawable == nullptr) {
++            gSohIosDrawableFailStreak = gSohIosDrawableFailStreak + 1;
++            return; // skip the frame rather than crash on ->texture()
++        }
++        gSohIosDrawableFailStreak = 0;
++    }
++#else
+     mCurrentDrawable = mLayer->nextDrawable();
++#endif
+ 
+     bool msaa_enabled = Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger("gMSAAValue", 1) > 1;
+ 

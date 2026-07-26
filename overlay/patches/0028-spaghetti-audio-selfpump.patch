@@ -1,0 +1,155 @@
+Overlay patch 0028: THE sibling-wide fuzzy-audio fix (2ship 0024 rev3,
+device-confirmed 2026-07-19) — audio self-pump + producer guard + reservoir
++ audio-thread QoS + ring watermarks.
+
+Root cause (confirmed shape in THIS port): GameEngine::HandleAudioThread is
+the OLD coupled loop — a plain cv.wait() that produces audio only on the
+game loop's per-tick notify. On iOS the game loop IS the UIKit main thread;
+a pressed thumb's up-to-120 Hz touch events delay the notify past the
+ring's headroom → backend drains → crackle. SoH upstream evolved this exact
+loop (clicks fix #6594) which is why SoH alone is clean.
+
+MANDATORY degeneracy check, done with THIS port's numbers: DesiredBuffered
+= 1100 (Context Init {26800, 512, 1100}); one burst = NUM_AUDIO_CHANNELS(2)
+× SAMPLES_HIGH(448) = 896 sample-frames. SoH's guard formula
+(Buffered + burst <= Desired) would allow production only under 204
+samples (~7.6 ms at 26.8 kHz) — the exact degeneration 2ship measured
+(their 1680==burst). Using the rev2 intent form instead: produce while
+Buffered <= Desired; overshoot bounded to one burst (~1996 ceiling).
+
+Also: QOS_CLASS_USER_INTERACTIVE on the audio thread (2ship rev3 — calm-
+window underruns under thermal pressure on default QoS), and min/max
+buffered watermarks into atomics the 0014 rev4 probe reports as
+aud_min/aud_max (0 = underrun; the retest instrument — coupled to 0014,
+the series applies atomically). __IOS__-gated: the macOS build keeps
+pristine upstream behavior. The 2S2H-style processing/cv_from_thread
+handshake is preserved — the main thread's EndAudioFrame still waits for
+processing==false per tick; notify only answers real gfx wakes.
+
+--- a/src/port/Engine.cpp
++++ b/src/port/Engine.cpp
+@@ -66,6 +66,15 @@
+ 
+ GameEngine* GameEngine::Instance;
+ 
++#ifdef __IOS__
++#include <atomic>
++#include <pthread/qos.h>
++// SOH_IOS (overlay 0028): min/max backend-buffered samples seen this
++// report window (read/reset by the 0014 probe). Same TU as both users.
++std::atomic<int32_t> sSohIosAudMinBuffered{ INT32_MAX };
++std::atomic<int32_t> sSohIosAudMaxBuffered{ -1 };
++#endif
++
+ bool CreateDirectoryRecursive(std::string const& dirName, std::error_code& err) {
+     err.clear();
+     if (!std::filesystem::create_directories(dirName, err)) {
+@@ -493,6 +502,100 @@
+ 
+ // Audio
+ void GameEngine::HandleAudioThread() {
++#ifdef __IOS__
++    // SOH_IOS (overlay 0028, = 2ship 0024 rev3): explicit user-interactive
++    // QoS — default-QoS audio threads starve under thermal pressure even in
++    // calm windows. Must run ON this thread; first thing it does.
++    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
++
++    // The upstream loop below produces audio ONLY on the game loop's
++    // per-tick notify — on iOS the game loop IS the UIKit main thread, so a
++    // pressed thumb's touch bursts delay the notify past the ring's headroom
++    // and the backend drains to crackle (every sibling port; SoH is clean
++    // because its upstream evolved this loop — clicks fix #6594). Ported
++    // with this port's processing/cv_from_thread handshake preserved.
++    auto produce_and_play = [&](u32 num_audio_samples) {
++        s16 nas_buffer[SAMPLES_PER_FRAME] = { 0 };
++        f32 hmas_buffer[SAMPLES_PER_FRAME] = { 0 };
++        s16 mix_buffer[SAMPLES_PER_FRAME] = { 0 };
++
++        for (size_t i = 0; i < NUM_AUDIO_CHANNELS; i++) {
++            create_next_audio_buffer(nas_buffer + i * (num_audio_samples * 2), num_audio_samples);
++        }
++
++        GameEngine::Instance->gHMAS->CreateBuffer((u8*)hmas_buffer, 4 * num_audio_samples * sizeof(float));
++
++        float master_vol = CVarGetFloat("gGameMasterVolume", 1.0f);
++
++        for (size_t i = 0; i < SAMPLES_PER_FRAME; i++) {
++            mix_buffer[i] = nas_buffer[i] + ((int16_t)(hmas_buffer[i] * 32767.0f) * master_vol);
++        }
++
++        AudioPlayerPlayFrame((u8*) mix_buffer, 2 * num_audio_samples * 4);
++    };
++
++    // Self-pump cadence: also wake on a short timeout, independent of the
++    // gfx frame rate (closer to the console, where audio ran off the
++    // scheduler rather than gated on rendering).
++    constexpr auto kSelfPumpInterval = std::chrono::milliseconds(5);
++    // Wait for the game's first real tick before self-pumping, to avoid
++    // touching uninitialized audio state.
++    bool primed = false;
++
++    while (audio.running) {
++        bool wasProcessing = false;
++        {
++            std::unique_lock<std::mutex> Lock(audio.mutex);
++            if (!primed) {
++                while (!audio.processing && audio.running) {
++                    audio.cv_to_thread.wait(Lock);
++                }
++                primed = true;
++            } else if (!audio.processing && audio.running) {
++                audio.cv_to_thread.wait_for(Lock, kSelfPumpInterval);
++            }
++            if (!audio.running) {
++                break;
++            }
++            wasProcessing = audio.processing;
++        }
++
++        {
++            std::unique_lock<std::mutex> Lock(audio.mutex);
++            int samples_left = AudioPlayerBuffered();
++            int32_t prevMin = sSohIosAudMinBuffered.load();
++            while (samples_left < prevMin && !sSohIosAudMinBuffered.compare_exchange_weak(prevMin, samples_left)) {
++            }
++            int32_t prevMax = sSohIosAudMaxBuffered.load();
++            while (samples_left > prevMax && !sSohIosAudMaxBuffered.compare_exchange_weak(prevMax, samples_left)) {
++            }
++            u32 num_audio_samples = samples_left < AudioPlayerGetDesiredBuffered() ? SAMPLES_HIGH : SAMPLES_LOW;
++            // Producer guard, rev2 intent form (produce while at-or-below
++            // Desired). SoH's exact formula (Buffered + burst <= Desired)
++            // DEGENERATES here: this port inits DesiredBuffered=1100 with a
++            // burst of 2x448=896, which would gate production under 204
++            // samples (~7.6 ms) — the failure 2ship measured. Overshoot is
++            // bounded to one burst (~1996), far under the SDL backend's
++            // refusal threshold.
++            if (AudioPlayerBuffered() <= AudioPlayerGetDesiredBuffered()) {
++                produce_and_play(num_audio_samples);
++            }
++            if (wasProcessing) {
++                audio.processing = false;
++                audio.cv_from_thread.notify_one();
++            }
++        }
++
++        // Pre-buffer: fill the reservoir to Desired — absorbs main-thread
++        // load spikes (HMAS music streams independently of gameplay, so
++        // advancing here is safe). Overshoot bounded to one burst per exit.
++        while (audio.running && AudioPlayerBuffered() < AudioPlayerGetDesiredBuffered()) {
++            int samples_left = AudioPlayerBuffered();
++            u32 num_audio_samples = samples_left < AudioPlayerGetDesiredBuffered() ? SAMPLES_HIGH : SAMPLES_LOW;
++            produce_and_play(num_audio_samples);
++        }
++    }
++#else
+     while (audio.running) {
+         {
+             std::unique_lock<std::mutex> Lock(audio.mutex);
+@@ -530,6 +633,7 @@
+         audio.processing = false;
+         audio.cv_from_thread.notify_one();
+     }
++#endif
+ }
+ 
+ void GameEngine::StartAudioFrame() {

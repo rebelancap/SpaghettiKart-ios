@@ -1,0 +1,34 @@
+Overlay patch 0042: the engine boots once per process, period (= reference
+0026, rebased to Game.cpp; VISION-PRO-LUS-PLAYBOOK Phase 01).
+visionOS scene reconnects (window-resize stress) re-invoked the process
+entry and re-ran the game's main() in-process — through MORE than one
+UIKit path on the Ship of Harkinian port: a postFinishLaunch-level guard (their SDL
+compat patch, our 0038) shipped and was BYPASSED (device log: two engine
+inits 55 s apart with singletons alive across them). Guard at the
+chokepoint every path must cross: the game's main(). The shell separately
+re-attaches the existing SDL window to a reconnected scene (synced
+SohIosShell.m SceneDidActivate block, which assumes this guard exists).
+Ours lands in src/port/Game.cpp (the main= SDL_main TU, overlay 0013).
+
+--- a/src/port/Game.cpp
++++ b/src/port/Game.cpp
+@@ -952,6 +952,19 @@
+     int
+     main(int argc, char* argv[]) {
+ #endif
++#ifdef __IOS__
++    /* SOH_IOS (overlay 0042): visionOS scene reconnects re-invoke the
++     * process entry through multiple UIKit paths; a second in-process boot
++     * restarts the game and leaves twin audio threads racing one device.
++     * The engine boots once per process, ever. */
++    {
++        static int sohIosMainRan = 0;
++        if (sohIosMainRan) {
++            return 0;
++        }
++        sohIosMainRan = 1;
++    }
++#endif
+ #ifdef _WIN32
+     // Allow non-ascii characters for Windows
+     setlocale(LC_ALL, ".UTF8");

@@ -1,0 +1,81 @@
+Overlay patch 0039: visionOS platform dispatch (= reference 0022, rebased;
+VISION-PRO-LUS-PLAYBOOK Phase 01).
+The leetal toolchain sets CMAKE_SYSTEM_NAME=visionOS for
+PLATFORM=SIMULATOR_VISIONOS/VISIONOS, but the whole tree (upstream +
+our iOS overlay CMake) dispatches on STREQUAL "iOS" at 16+ sites. Rather
+than patching every site, flip CMAKE_SYSTEM_NAME back to "iOS" right
+after project(): by then compilers, sysroot (xrsimulator/xros), and
+Xcode's SDKROOT are locked, so the flip only affects dispatch
+conditionals. The real visionOS-ness continues to come from the SDK
+(TARGET_OS_VISION=1 in TargetConditionals). SOH_VISIONOS stays a cache
+var for genuinely vision-specific deltas (Swift entry lib, plist —
+0013 rev2). Three flips because each project()/toolchain include re-runs
+platform init: top level, LUS's project(), and after LUS's
+ios-toolchain-populate include.
+Deployment target: CMake then emits IPHONEOS_DEPLOYMENT_TARGET, which
+Xcode ignores for xros — build-vision[os|-sim].sh compensates with
+CMAKE_XCODE_ATTRIBUTE_XROS_DEPLOYMENT_TARGET=2.0. No-op for iOS builds
+(condition never true).
+Rebase deltas vs reference 0022: project() anchor is ours
+(Spaghettify 1.0.0, +ASM); the rev5 fast-math language-scoping hunk is
+N/A — SpaghettiKart has no global -fno-fast-math/-ffp-contract
+add_compile_options (its warn flags ride per-language CMAKE_<LANG>_FLAGS
+strings, and the three directory add_compile_options are already
+COMPILE_LANGUAGE-scoped; audited 2026-07-22). Known residue: bare
+add_compile_options(-fno-lto) fires only for AppleClang+Debug — a Debug
+vision build would need it language-scoped; Release is clean.
+
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -2,6 +2,17 @@
+ 
+ # Set the project version and language
+ project(Spaghettify VERSION 1.0.0 LANGUAGES C CXX ASM)
++
++# SOH_IOS (overlay 0039): visionOS builds (PLATFORM=SIMULATOR_VISIONOS /
++# VISIONOS) dispatch as iOS throughout the tree. Compilers and SDK are
++# already fixed by the toolchain at this point; only the STREQUAL "iOS"
++# conditionals care. TARGET_OS_VISION (from the xros SDK) remains the
++# source-level discriminator.
++if(CMAKE_SYSTEM_NAME STREQUAL "visionOS")
++    set(CMAKE_SYSTEM_NAME "iOS")
++    set(IOS 1)
++    set(SOH_VISIONOS 1)
++endif()
+ include(FetchContent)
+ 
+ set(NATO_PHONETIC_ALPHABET
+--- a/libultraship/CMakeLists.txt
++++ b/libultraship/CMakeLists.txt
+@@ -19,6 +19,15 @@
+ 
+ project(libultraship LANGUAGES C CXX)
+ 
++# SOH_IOS (overlay 0039): this project() re-ran the toolchain, resetting
++# CMAKE_SYSTEM_NAME to visionOS — re-flip so the tree keeps dispatching as
++# iOS (see the top-level CMakeLists hunk).
++if(CMAKE_SYSTEM_NAME STREQUAL "visionOS")
++    set(CMAKE_SYSTEM_NAME "iOS")
++    set(IOS 1)
++    set(SOH_VISIONOS 1)
++endif()
++
+ if (CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
+     enable_language(OBJCXX)
+     set(CMAKE_OBJC_FLAGS "${CMAKE_OBJC_FLAGS} -fobjc-arc")
+@@ -75,6 +84,15 @@
+ # === Platform Specific Configuration ===
+ if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+     include(cmake/ios-toolchain-populate.cmake)
++    # SOH_IOS (overlay 0039): the toolchain include above re-ran leetal's
++    # platform init IN THIS SCOPE, resetting CMAKE_SYSTEM_NAME to visionOS
++    # again — re-flip a third time so src/ (compile definitions, __IOS__)
++    # dispatches as iOS.
++    if(CMAKE_SYSTEM_NAME STREQUAL "visionOS")
++        set(CMAKE_SYSTEM_NAME "iOS")
++        set(IOS 1)
++        set(SOH_VISIONOS 1)
++    endif()
+ endif()
+ 
+ # =========== Sources =============

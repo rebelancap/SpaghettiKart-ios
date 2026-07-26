@@ -1,0 +1,30 @@
+Overlay patch 0001: bump torch's pinned spdlog to v1.16.0 (modern-clang fix).
+Torch pins spdlog @ 7e635fca (pre-1.15), whose bundled fmt breaks on current
+AppleClang: consteval FMT_STRING in fmt_helper.h is rejected ("call to
+consteval function ... is not a constant expression"), killing TorchExternal
+(USE_STANDALONE=ON fetches unconditionally) and any machine where
+find_package(spdlog) misses. v1.16.0 is exactly what this LUS fork's
+mac.cmake already falls back to, so both spdlog consumers in the tree agree
+on one version. Both GIT_TAG occurrences (standalone + library branch) move.
+Upstreamable to HarbourMasters/Torch.
+
+--- a/torch/CMakeLists.txt
++++ b/torch/CMakeLists.txt
+@@ -242,7 +242,7 @@
+ 	FetchContent_Declare(
+ 		spdlog
+ 		GIT_REPOSITORY https://github.com/gabime/spdlog.git
+-		GIT_TAG 7e635fca68d014934b4af8a1cf874f63989352b7
++		GIT_TAG v1.16.0 # match libultraship/cmake/dependencies/mac.cmake
+ 	)
+ 
+ 	FetchContent_MakeAvailable(spdlog)
+@@ -253,7 +253,7 @@
+         FetchContent_Declare(
+             spdlog
+             GIT_REPOSITORY https://github.com/gabime/spdlog.git
+-            GIT_TAG 7e635fca68d014934b4af8a1cf874f63989352b7
++            GIT_TAG v1.16.0 # match libultraship/cmake/dependencies/mac.cmake
+         )
+ 
+         FetchContent_MakeAvailable(spdlog)

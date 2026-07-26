@@ -1,0 +1,19 @@
+Overlay patch 0016: fix SpaghettiGui.cpp's mobile include path.
+Under __IOS__/__ANDROID__ upstream includes "port/mobile/MobileImpl.h", but
+this LUS exports the header at include/ship/port/mobile/MobileImpl.h — the
+path is one segment short (written against a different LUS layout; first
+compile ever taken down this branch, most likely). No call sites in the
+file today, so the corrected include is inert but faithful to upstream
+intent. Upstreamable one-liner.
+
+--- a/src/port/SpaghettiGui.cpp
++++ b/src/port/SpaghettiGui.cpp
+@@ -17,7 +17,7 @@
+ #endif
+ 
+ #if defined(__ANDROID__) || defined(__IOS__)
+-#include "port/mobile/MobileImpl.h"
++#include "ship/port/mobile/MobileImpl.h"
+ #endif
+ 
+ #ifdef ENABLE_OPENGL

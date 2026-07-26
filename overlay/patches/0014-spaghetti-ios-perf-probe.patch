@@ -1,0 +1,168 @@
+Overlay patch 0014: iOS frame/tick cadence probe (port of reference 0008
+into SpaghettiKart's engine; docs/probe.md). Per present records the wall
+interval AND time inside DrawAndRunGraphicsCommands (eng_ms); per engine
+iteration counts engine_fps (target 30); per process_game_tick counts
+sim_tps (target 60 racing — MK64's gTickLogic=2; ~0 in menus, which don't
+run race ticks). Every 10 s logs a SOH_PERF line (tag kept from the
+reference so pull/parse tooling is shared) with thermal via the shell's
+SohIos_ThermalState. __IOS__-only; desktop build unaffected.
+Honest naming: wall and eng BOTH include in-present blocking — and, via
+push_frame, the engine frame sits between StartAudioFrame/EndAudioFrame,
+so an audio underrun surfaces as engine time. wall≈eng/N (N=interpolation
+factor) healthy; wall>>expected with low eng = CPU outside the render call.
+
+--- a/src/port/Engine.cpp
++++ b/src/port/Engine.cpp
+@@ -421,6 +421,109 @@
+ //     Instance->context->GetWindow()->MainLoop(run_one_game_iter);
+ // }
+ 
++#ifdef __IOS__
++// SOH_IOS_PERF (overlay 0014): frame/tick cadence probe (reference 0008
++// body). wall_ms = interval between consecutive presents; eng_ms = time
++// inside DrawAndRunGraphicsCommands. BOTH include in-present blocking:
++// wall~=eng means blocked-inside (GPU/pacing), wall>>eng means CPU outside.
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <climits>
++// Thermal state provider + cached GPU frame time live in the app shell
++// (SohIosShell.m; gSohIosGpuMs fed by overlay 0027's completed handler).
++extern "C" int SohIos_ThermalState(void);
++extern "C" {
++extern volatile float gSohIosGpuMs;
++}
++// Cross-TU aggregates: loads (LUS ResourceManager, 0029) and uploads
++// (LUS gfx_metal, 0021 rev5). Audio watermarks are same-TU (0028).
++extern "C" void SohIos_LoadStats(float* ms, unsigned int* count);
++extern "C" void SohIos_UploadStats(float* ms, unsigned int* count);
++extern "C" void SohIos_LibWindowStats(float* ms, unsigned int* count);  // 0034 async shaders
++extern "C" void SohIos_PsoWindowStats(float* ms, unsigned int* count);  // 0034 async shaders
++extern "C" int SohIos_MemFootprintMB(void); // shell D8 (jetsam metric)
++extern std::atomic<int32_t> sSohIosAudMinBuffered;
++extern std::atomic<int32_t> sSohIosAudMaxBuffered;
++namespace SohIosPerf {
++struct Probe {
++    std::vector<double> frameMs;
++    std::vector<double> engMs;
++    std::vector<double> gpuMs; // cached per-present GPU pass time (0027)
++    uint64_t ticks = 0;      // process_game_tick calls (60 Hz racing)
++    uint64_t engFrames = 0;  // engine iterations (30 Hz)
++    uint32_t hudFrames = 0;  // rolling 1 s window for the shell's perf HUD
++    float hudFps = 0.0f;
++    std::chrono::steady_clock::time_point hudWindowStart = std::chrono::steady_clock::now();
++    std::chrono::steady_clock::time_point lastFrame{};
++    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
++    void OnFrame(double engineMs) {
++        engMs.push_back(engineMs);
++        gpuMs.push_back((double)gSohIosGpuMs);
++        auto now = std::chrono::steady_clock::now();
++        hudFrames++;
++        double hudEl = std::chrono::duration<double>(now - hudWindowStart).count();
++        if (hudEl >= 1.0) {
++            hudFps = (float)(hudFrames / hudEl);
++            hudFrames = 0;
++            hudWindowStart = now;
++        }
++        if (lastFrame.time_since_epoch().count() != 0) {
++            frameMs.push_back(std::chrono::duration<double, std::milli>(now - lastFrame).count());
++        }
++        lastFrame = now;
++    }
++    void OnEngineFrame() {
++        engFrames++;
++        auto now = std::chrono::steady_clock::now();
++        double el = std::chrono::duration<double>(now - lastReport).count();
++        if (el < 10.0 || frameMs.size() < 8 || engMs.size() < 8) {
++            return;
++        }
++        std::sort(frameMs.begin(), frameMs.end());
++        std::sort(engMs.begin(), engMs.end());
++        std::sort(gpuMs.begin(), gpuMs.end());
++        auto pct = [](std::vector<double>& v, double p) { return v[(size_t)(p * (v.size() - 1))]; };
++        // Full attribution field set (2ship convention): wall spike +
++        // high up_ms -> upload path; + high load_ms -> loader; both ~0 ->
++        // scene/actor init. aud_min 0 = audio underrun.
++        int32_t audMin = sSohIosAudMinBuffered.exchange(INT32_MAX);
++        int32_t audMax = sSohIosAudMaxBuffered.exchange(-1);
++        float loadMs = 0, upMs = 0, libMs = 0, psoMs = 0;
++        unsigned int loadN = 0, upN = 0, libN = 0, psoN = 0;
++        SohIos_LoadStats(&loadMs, &loadN);
++        SohIos_UploadStats(&upMs, &upN);
++        SohIos_LibWindowStats(&libMs, &libN);
++        SohIos_PsoWindowStats(&psoMs, &psoN);
++        SPDLOG_INFO("SOH_PERF wall_ms p50={:.2f} p95={:.2f} p99={:.2f} max={:.2f} "
++                    "eng_ms p50={:.2f} p95={:.2f} gpu_ms p50={:.2f} p95={:.2f} n={} fps={:.1f} "
++                    "eng_fps={:.2f} sim_tps={:.2f} aud_min={} aud_max={} load_ms={:.1f} loads={} "
++                    "up_ms={:.1f} ups={} lib_ms={:.1f} lib_n={} pso_ms={:.1f} pso_n={} mem_mb={} thermal={}",
++                    pct(frameMs, 0.5), pct(frameMs, 0.95), pct(frameMs, 0.99), frameMs.back(),
++                    pct(engMs, 0.5), pct(engMs, 0.95), pct(gpuMs, 0.5), pct(gpuMs, 0.95),
++                    frameMs.size(), frameMs.size() / el,
++                    engFrames / el, ticks / el,
++                    audMin == INT32_MAX ? -1 : audMin, audMax, loadMs, loadN,
++                    upMs, upN, libMs, libN, psoMs, psoN, SohIos_MemFootprintMB(), SohIos_ThermalState());
++        frameMs.clear();
++        engMs.clear();
++        gpuMs.clear();
++        ticks = 0;
++        engFrames = 0;
++        lastReport = now;
++    }
++};
++static Probe gPerfProbe;
++} // namespace SohIosPerf
++extern "C" void SohIosPerf_OnGameTick(void) {
++    SohIosPerf::gPerfProbe.ticks++;
++}
++// Rolling 1-second fps for the shell's performance HUD (SYNC WAVE 1).
++extern "C" void SohIos_HudStats(float* fps) {
++    *fps = SohIosPerf::gPerfProbe.hudFps;
++}
++#endif
++
+ void GameEngine::RunCommands(Gfx* pool, const std::vector<std::unordered_map<Mtx*, MtxF>>& mtx_replacements) {
+     auto wnd = std::dynamic_pointer_cast<Fast::Fast3dWindow>(Ship::Context::GetInstance()->GetWindow());
+ 
+@@ -436,7 +539,14 @@
+     interpreter->mInterpolationIndex = 0;
+ 
+     for (const auto& mtxStack : mtx_replacements) {
++#ifdef __IOS__
++        auto sohIosEngT0 = std::chrono::steady_clock::now();
++#endif
+         wnd->DrawAndRunGraphicsCommands(pool, mtxStack);
++#ifdef __IOS__
++        SohIosPerf::gPerfProbe.OnFrame(
++            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - sohIosEngT0).count());
++#endif
+         interpreter->mInterpolationIndex++;
+     }
+ 
+@@ -495,6 +605,9 @@
+         wnd->SetMaximumFrameLatency(1);
+     }
+     RunCommands(pool, mtx_replacements);
++#ifdef __IOS__
++    SohIosPerf::gPerfProbe.OnEngineFrame();
++#endif
+ 
+     last_fps = fps;
+     last_update_rate = 2;
+--- a/src/main.c
++++ b/src/main.c
+@@ -660,8 +660,15 @@
+         }
+     }
+ }
++
++#ifdef __IOS__
++void SohIosPerf_OnGameTick(void); // overlay 0014 probe (Engine.cpp)
++#endif
+ 
+ void process_game_tick(void) {
++#ifdef __IOS__
++    SohIosPerf_OnGameTick();
++#endif
+ 
+     if (Editor_IsPaused() == false) {
+         if (D_8015011E) {

@@ -1,0 +1,64 @@
+Overlay patch 0037 rev2: TextureCacheDelete releases the Metal texture
+— and deliberately does NOT unload the CPU resource.
+
+The flicker (rev1's correct half): TextureCacheDelete — the
+gSPInvalidateTexCache path — recycled texture ids into free_texture_ids
+WITHOUT DeleteTexture (review-P1-4 class, third site; count-evict fixed
+in 0030 rev5, byte-evict in 0022). Luigi Raceway / Wario Stadium
+invalidate their six 64x32 jumbotron tiles EVERY FRAME; the recycled ids
+made re-imports replaceRegion MTLTextures still referenced by in-flight
+draws (Metal samples at execution), so tiles showed each other's / stale
+content: the user-reported jumbotron shimmer. Releasing here is safe:
+encoders retain bound textures until the command buffer completes (same
+argument as 0022's byte-evict, shipping since rev9).
+
+The white-texture regression (rev1's fatal half, atticed 2026-07-22):
+rev1 ALSO called UnloadResource on the entry's resource_path. But
+TextureCacheDelete's targets are definitionally HOT — invalidated
+because their CPU contents JUST changed and will re-import THIS frame.
+The jumbotron tiles are live readback targets: the game writes each
+frame's rear-view into the RESOURCE's own buffer through raw
+LOAD_ASSET_RAW pointers (LuigiRaceway.cpp copy_framebuffer), then
+invalidates by path. Unloading that resource mid-DL frees a buffer the
+game still addresses (use-after-free writes) and makes every subsequent
+by-path resolution (the invalidate middleware's LoadResource, the packed
+DL's set-image resolution, next tick's LOAD_ASSET_RAW) re-load PRISTINE
+ARCHIVE BYTES — severing the live-content pipeline and churning
+alloc/free every frame. With the 4K pack loaded the churn and re-load
+land in a heap full of MB-scale decode buffers: jumbotron and start-line
+banners rendered solid white on device and sim. UnloadResource belongs
+ONLY to eviction paths, where the LRU-front entry is cold by
+construction (0022/0030). Mip-blit ordering was ruled out:
+sSohIosPendingMips retains on push and EndFrame's blit tolerates deleted
+entries by design (0021 rev4 comment); the bind-skip cache resets per
+frame/encoder and command-buffer retains make a same-address false match
+impossible within a frame.
+
+
+--- a/libultraship/src/fast/interpreter.cpp
++++ b/libultraship/src/fast/interpreter.cpp
+@@ -551,6 +551,24 @@
+                         mRenderingState.mTextures[j] = nullptr;
+                 }
+                 mTextureCache.lru.erase(it->second.lru_location);
++#ifdef __IOS__
++                // SOH_IOS (overlay 0037 rev2): release the Metal texture BEFORE
++                // recycling the id — a recycled id reused at the same dims
++                // replaceRegions an MTLTexture that in-flight draws still
++                // reference (Metal samples at execution time); the jumbotron
++                // invalidates 6 tiles per frame and shimmered from exactly
++                // this aliasing (review-P1-4 class, third site). Safe: command
++                // buffers retain bound textures until completion.
++                // Deliberately NO UnloadResource here (rev1's white-texture
++                // regression): entries deleted here are HOT — invalidated
++                // because their CPU contents just changed and re-import THIS
++                // frame. The jumbotron writes its readback into the RESOURCE
++                // buffer via raw LOAD_ASSET_RAW pointers; unloading swaps the
++                // live-written buffer for pristine archive bytes mid-frame and
++                // frees memory the game still addresses. Unload only at
++                // eviction (cold LRU front, 0022/0030).
++                mRapi->DeleteTexture(it->second.texture_id);
++#endif
+                 mTextureCache.free_texture_ids.push_back(it->second.texture_id);
+                 mTextureCache.map.erase(it->first);
+                 again = true;

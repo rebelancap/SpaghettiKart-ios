@@ -1,0 +1,90 @@
+Overlay patch 0024: touch scrolling for the port menu (reference 0018's
+menu-scroll intent). The shell queues finger scroll deltas
+(SohIos_TakeMenuScrollFor, inherited with the Ship of Harkinian port shell); the menu's
+scrollable children consume them when the finger is horizontally inside
+the child. Mouse-free, so no hover tooltips and no slider side-effects
+(reference device feedback: swipes read as hover and even adjusted sliders
+via wheel). Four sites in kart's Menu.cpp: search results, sidebar
+section, single-column section, multi-column section. __IOS__-only.
+NOTE: also contains the quit hunk's sibling file — no; quit is 0020.
+Disjoint from 0020 (quit, ~line 672) and 0023 (font clobber, ~line 567).
+
+--- a/src/port/ui/Menu.cpp
++++ b/src/port/ui/Menu.cpp
+@@ -18,6 +18,11 @@
+ 
+ extern std::unordered_map<s16, const char*> warpPointSceneList;
+ extern void Warp();
++#ifdef __IOS__
++// SOH_IOS (overlay 0024): finger scroll deltas from the app shell's menu
++// touch-router (SohIosShell.m).
++extern "C" float SohIos_TakeMenuScrollFor(float winX, float winW);
++#endif
+ 
+ namespace BenGui {}
+ 
+@@ -173,6 +178,15 @@
+ uint32_t Menu::DrawSearchResults(std::string& menuSearchText) {
+     auto menuThemeIndex = static_cast<UIWidgets::Colors>(CVarGetInteger("gSettings.Menu.Theme", defaultThemeIndex));
+     ImGui::BeginChild("Search Results");
++
++#ifdef __IOS__
++    {
++        float sohIosDy = SohIos_TakeMenuScrollFor(ImGui::GetWindowPos().x, ImGui::GetWindowSize().x);
++        if (sohIosDy != 0.0f) {
++            ImGui::SetScrollY(ImGui::GetScrollY() - sohIosDy);
++        }
++    }
++#endif
+     int searchCount = 0;
+     for (auto& menuLabel : menuOrder) {
+         auto& menuEntry = menuEntries.at(menuLabel);
+@@ -704,6 +718,15 @@
+     ImGui::SetNextWindowSizeConstraints({ sidebarWidth, 0 }, { sidebarWidth, columnHeight });
+     ImGui::BeginChild((menuEntries.at(headerIndex).label + " Section").c_str(), { sidebarWidth, columnHeight * 3 },
+                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysAutoResize, ImGuiWindowFlags_NoTitleBar);
++
++#ifdef __IOS__
++    {
++        float sohIosDy = SohIos_TakeMenuScrollFor(ImGui::GetWindowPos().x, ImGui::GetWindowSize().x);
++        if (sohIosDy != 0.0f) {
++            ImGui::SetScrollY(ImGui::GetScrollY() - sohIosDy);
++        }
++    }
++#endif
+     for (auto& sidebarLabel : menuEntries.at(headerIndex).sidebarOrder) {
+         std::string nextIndex = "";
+         UIWidgets::PushStyleButton(menuThemeIndex);
+@@ -748,7 +771,16 @@
+         ImGui::SetNextWindowSizeConstraints({ sectionWidth, 0 }, { sectionWidth, columnHeight });
+         ImGui::BeginChild(sectionMenuId.c_str(), { sectionWidth, windowHeight * 4 }, ImGuiChildFlags_AutoResizeY,
+                           ImGuiWindowFlags_NoTitleBar);
++
++#ifdef __IOS__
++    {
++        float sohIosDy = SohIos_TakeMenuScrollFor(ImGui::GetWindowPos().x, ImGui::GetWindowSize().x);
++        if (sohIosDy != 0.0f) {
++            ImGui::SetScrollY(ImGui::GetScrollY() - sohIosDy);
++        }
+     }
++#endif
++    }
+     if (headerSearch && menuSearchText.length() > 0) {
+         uint32_t searchCount = DrawSearchResults(menuSearchText);
+         if (searchCount == 0) {
+@@ -780,6 +812,15 @@
+                 ImGui::SetNextWindowSizeConstraints({ columnWidth, 0 }, { columnWidth, columnHeight });
+                 ImGui::BeginChild(sectionId.c_str(), { columnWidth, windowHeight * 4 }, ImGuiChildFlags_AutoResizeY,
+                                   ImGuiWindowFlags_NoTitleBar);
++
++#ifdef __IOS__
++    {
++        float sohIosDy = SohIos_TakeMenuScrollFor(ImGui::GetWindowPos().x, ImGui::GetWindowSize().x);
++        if (sohIosDy != 0.0f) {
++            ImGui::SetScrollY(ImGui::GetScrollY() - sohIosDy);
++        }
++    }
++#endif
+             }
+             // for (auto& entryName : sidebar->at(sectionIndex).sidebarOrder) {
+             style.ItemSpacing.y = 12;

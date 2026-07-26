@@ -1,0 +1,261 @@
+Overlay patch 0023: iOS settings section (reference 0017 shape adapted to
+SpaghettiKart's PortMenu) + game-side consumers for two of its knobs.
+
+- PortMenu.cpp: "iOS" sidebar in Settings — Touch Controls (Hold to Lock
+  A & Z per the MK64 policy, Haptics, Opacity, Left-Handed, Stick
+  Response, Customize Layout…), Display (Max Frame Rate 60/120,
+  Performance HUD), Menu (Menu Scale LIVE), Advanced (Remote Console
+  :8768). Shell consumes the touch knobs via its 0.25 s poll (inherited
+  with the Ship of Harkinian port shell); the two game-side consumers ride here:
+- Engine.cpp GetInterpolationFPS: gSohIos.MaxFps caps the match-refresh
+  branch (60 = battery saver, 120 = full ProMotion).
+- Menu.cpp: the per-frame `io.FontGlobalScale = uiScale` clobber (the
+  reason boot-time font scale never held once the menu drew) multiplies
+  in gSohIos.MenuScale on iOS — fonts are live every frame; the slider
+  callback ratio-rescales style sizes so paddings track live too.
+Kart deltas vs reference 0017: no RaceDisable in this menu framework
+(dropped); lock knob is the HOLD variant (user policy).
+
+--- a/src/port/ui/PortMenu.cpp
++++ b/src/port/ui/PortMenu.cpp
+@@ -88,6 +88,15 @@
+     }
+     return widget;
+ }
++
++#ifdef __IOS__
++#include <TargetConditionals.h> // TARGET_OS_VISION gates below (rev3)
++// SOH_IOS (overlay 0023): boot value of the menu scale, so the slider
++// callback can ratio-rescale style sizes live (fonts are handled by the
++// per-frame multiply in Menu.cpp). Captured while the menu is built,
++// before the user can touch the slider.
++static float sSohIosPrevMenuScale = 0.85f;
++#endif
+ 
+ void PortMenu::AddSettings() {
+     // Add Settings menu
+@@ -354,6 +363,130 @@
+         .CVar(CVAR_CONTROLLER_CONFIGURATION_WINDOW_OPEN)
+         .WindowName("Input Editor")
+         .Options(ButtonOptions().Tooltip("Enables the separate Bindings Window.").Size(Sizes::Inline));
++
++#ifdef __IOS__
++    // SOH_IOS (overlay 0023): phone-specific settings — reference 0017 shape.
++    // The touch overlay lives in the app shell (SohIosShell.m); these CVars
++    // are its knobs (consumed live by the shell's 0.25 s poll unless noted).
++    sSohIosPrevMenuScale = CVarGetFloat("gSohIos.MenuScale", 0.85f);
++    path = { "Settings", "iOS", SECTION_COLUMN_1 };
++    AddSidebarEntry("Settings", "iOS", 1);
++
++    AddWidget(path, "Touch Controls", WIDGET_SEPARATOR_TEXT);
++    AddWidget(path, "Hold to Lock (A & Z)", WIDGET_CVAR_CHECKBOX)
++        .CVar("gSohIos.HoldToLock")
++        .Options(CheckboxOptions()
++                     .Tooltip("Hold on-screen A (gas) or Z (item) for about half a second to LOCK it held — the "
++                              "button lights up and stays pressed after you lift your finger; tap to release. "
++                              "Brake overrides a locked gas without unlocking it. Physical controllers are "
++                              "unaffected.")
++                     .DefaultValue(true));
++    static std::unordered_map<int32_t, const char*> sohIosHapticsOptions = { { 0, "Off" }, { 1, "Light" }, { 2, "Strong" } };
++    AddWidget(path, "Haptic Feedback", WIDGET_CVAR_COMBOBOX)
++        .CVar("gSohIos.Haptics")
++        .Options(ComboboxOptions()
++                     .ComboMap(sohIosHapticsOptions)
++                     .Tooltip("Vibration when touch buttons are pressed (and when a hold-lock engages).")
++                     .DefaultIndex(1));
++#if !TARGET_OS_VISION
++    AddWidget(path, "Supersampling (SSAA)", WIDGET_CVAR_SLIDER_FLOAT)
++        .CVar("gSohIos.Supersample")
++        .Options(FloatSliderOptions()
++                     .Tooltip("Renders above native resolution and downsamples for smoother, less-grainy visuals "
++                              "(especially with texture packs). 1.0 = native; 2.0 = 4x the pixels. MK64 is a "
++                              "light port - 2.0 is the default and holds full speed on modern iPhones.")
++                     .ShowButtons(true)
++                     .Min(1.0f)
++                     .Max(2.0f)
++                     .Format("%.2f")
++                     .DefaultValue(2.0f));
++#else
++    // rev3 (VP playbook 1.4a): ssaa is PINNED 1.0 on Vision Pro — the 4K
++    // drawable already exceeds what the panel can resolve; the shell's
++    // SohIos_SsaaFactor returns 1.0 unconditionally there. Truth line
++    // instead of a dead slider so iPhone users don't hunt for it.
++    AddWidget(path, "Supersampling: automatic - the 4K render already "
++                    "exceeds what this display can resolve.",
++              WIDGET_TEXT);
++#endif
++    AddWidget(path, "Touch Control Opacity", WIDGET_CVAR_SLIDER_FLOAT)
++        .CVar("gSohIos.TouchOpacity")
++        .Options(FloatSliderOptions()
++                     .Tooltip("How visible the on-screen controls are during play.")
++                     .IsPercentage()
++                     .Min(0.3f)
++                     .Max(1.0f)
++                     .DefaultValue(1.0f));
++    AddWidget(path, "Left-Handed Layout", WIDGET_CVAR_CHECKBOX)
++        .CVar("gSohIos.LeftyFlip")
++        .Options(CheckboxOptions()
++                     .Tooltip("Mirrors all touch controls left<->right (custom layouts mirror too).")
++                     .DefaultValue(false));
++    static std::unordered_map<int32_t, const char*> sohIosCurveOptions = { { 0, "Linear" }, { 1, "Precise (Expo)" } };
++    AddWidget(path, "Stick Response", WIDGET_CVAR_COMBOBOX)
++        .CVar("gSohIos.StickCurve")
++        .Options(ComboboxOptions()
++                     .ComboMap(sohIosCurveOptions)
++                     .Tooltip("Linear: deflection maps 1:1. Precise: finer control near the center, same maximum.")
++                     .DefaultIndex(0));
++    AddWidget(path, "Customize Layout...", WIDGET_BUTTON)
++        .Callback([](WidgetInfo& info) { CVarSetInteger("gSohIos.EditLayout", 1); })
++        .Options(ButtonOptions().Tooltip(
++            "Rearrange the on-screen controls: drag any button (and the stick's spawn area), scale them with the "
++            "slider, then save with the checkmark. Reset restores the default layout."));
++
++    AddWidget(path, "Display", WIDGET_SEPARATOR_TEXT);
++    // rev4: VALUE-keyed map (reference 0017 parity) — the synced shell's
++    // migration + Vision Pro seed write literal fps (120) into the cvar,
++    // and comboMap.at(storedValue) on an index-keyed {0,1} map aborted on
++    // menu open (the Ship of Harkinian port own 2026-07-14 VP regression, re-created
++    // here by porting the pre-migration map; caught on our first VP menu
++    // open, MenuDrawItem widget-name logging).
++    static std::unordered_map<int32_t, const char*> sohIosFpsOptions = { { 60, "60 fps" },
++                                                                         { 90, "90 fps" },
++                                                                         { 120, "120 fps" } };
++    AddWidget(path, "Max Frame Rate", WIDGET_CVAR_COMBOBOX)
++        .CVar("gSohIos.MaxFps")
++        .Options(ComboboxOptions()
++                     .ComboMap(sohIosFpsOptions)
++                     .Tooltip("Cap for Match Refresh Rate. iPhone panels run up to 120 Hz; Vision Pro's window "
++                              "compositor paces at 90 Hz.")
++                     .DefaultIndex(120));
++    AddWidget(path, "Performance HUD", WIDGET_CVAR_CHECKBOX)
++        .CVar("gSohIos.PerfHud")
++        .Options(CheckboxOptions()
++                     .Tooltip("Small fps + thermal readout in the top-right corner.")
++                     .DefaultValue(false));
++
++    AddWidget(path, "Menu", WIDGET_SEPARATOR_TEXT);
++    AddWidget(path, "Menu Scale", WIDGET_CVAR_SLIDER_FLOAT)
++        .CVar("gSohIos.MenuScale")
++        .Callback([](WidgetInfo& info) {
++            // Fonts track the CVar per-frame (Menu.cpp); style sizes need a
++            // ratio rescale exactly once per change.
++            float sohIosScale = CVarGetFloat("gSohIos.MenuScale", 0.85f);
++            if (sohIosScale > 0.0f && sSohIosPrevMenuScale > 0.0f && sohIosScale != sSohIosPrevMenuScale) {
++                ImGui::GetStyle().ScaleAllSizes(sohIosScale / sSohIosPrevMenuScale);
++                sSohIosPrevMenuScale = sohIosScale;
++            }
++        })
++        .Options(FloatSliderOptions()
++                     .Tooltip("Size of this menu and its text. Applies immediately.")
++                     .IsPercentage()
++                     .Min(0.6f)
++                     .Max(1.2f)
++                     .DefaultValue(0.85f));
++
++#if SOH_REMOTE_CONSOLE
++    AddWidget(path, "Advanced", WIDGET_SEPARATOR_TEXT);
++    AddWidget(path, "Remote Console", WIDGET_CVAR_CHECKBOX)
++        .CVar("gSohIos.RemoteConsole")
++        .Options(CheckboxOptions()
++                     .Tooltip("Opens a TCP debug console on port 8768 while the app runs, reachable from your "
++                              "local network. Leave off unless troubleshooting.")
++                     .DefaultValue(false));
++#endif
++#endif
+ }
+ int32_t motionBlurStrength;
+ 
+--- a/src/port/Engine.cpp
++++ b/src/port/Engine.cpp
+@@ -299,7 +299,20 @@
+ 
+ uint32_t GameEngine::GetInterpolationFPS() {
+     if (CVarGetInteger("gMatchRefreshRate", 0)) {
++#ifdef __IOS__
++        // SOH_IOS (overlay 0023 rev4): battery-saver cap — gSohIos.MaxFps
++        // holds a literal fps VALUE (60/90/120; reference semantics — the
++        // shell migration converts legacy 0/1 indices). Guard maps any
++        // straggler index anyway: <30 can only be legacy.
++        uint32_t sohIosCap = (uint32_t)CVarGetInteger("gSohIos.MaxFps", 120);
++        if (sohIosCap < 30) {
++            sohIosCap = (sohIosCap == 0) ? 60 : 120;
++        }
++        uint32_t sohIosRate = Ship::Context::GetInstance()->GetWindow()->GetCurrentRefreshRate();
++        return sohIosRate < sohIosCap ? sohIosRate : sohIosCap;
++#else
+         return Ship::Context::GetInstance()->GetWindow()->GetCurrentRefreshRate();
++#endif
+ 
+     } else if (CVarGetInteger("gVsyncEnabled", 1) ||
+                !Ship::Context::GetInstance()->GetWindow()->CanDisableVerticalSync()) {
+--- a/src/port/ui/Menu.cpp
++++ b/src/port/ui/Menu.cpp
+@@ -578,7 +578,14 @@
+         uiScale = 1.0f; // Scaling doesn't play nice with condensed menu
+     }
+     ImGuiIO& io = ImGui::GetIO();
++#ifdef __IOS__
++    // SOH_IOS (overlay 0023): this per-frame assignment is the clobber that
++    // erased any boot-time font scale the moment the menu drew. Multiply the
++    // iOS menu scale INTO it (spec: don't fight it) — live by construction.
++    io.FontGlobalScale = uiScale * CVarGetFloat("gSohIos.MenuScale", 0.85f);
++#else
+     io.FontGlobalScale = uiScale;
++#endif
+ 
+     pos += window->WorkRect.GetSize() / 2 - menuSize / 2;
+     ImGui::SetNextWindowPos(pos);
+@@ -594,22 +601,10 @@
+         headerHeight += style.ScrollbarSize;
+         scrollbar = true;
+     }
+-    UIWidgets::ButtonOptions options = {};
+-    options.size = UIWidgets::Sizes::Inline;
+-    options.tooltip = "Close Menu (Esc)";
+-    if (UIWidgets::Button(ICON_FA_TIMES_CIRCLE, options)) {
+-        ToggleVisibility();
+-
+-        // Update gamepad navigation after close based on if other menus are still visible
+-        auto mImGuiIo = &ImGui::GetIO();
+-        if (CVarGetInteger(CVAR_IMGUI_CONTROLLER_NAV, 0) &&
+-            Ship::Context::GetInstance()->GetWindow()->GetGui()->GetMenuOrMenubarVisible()) {
+-            mImGuiIo->ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+-        } else {
+-            mImGuiIo->ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
+-        }
+-    }
+-    ImGui::SameLine();
++    // SOH_IOS (overlay 0023): close button moved from here (leading, far
++    // left — where the Dynamic Island covers it in landscape) to the
++    // right-aligned cluster beside Reset/Quit, matching the sibling ports
++    // (user mandate 2026-07-22). Header math already reserves 3 buttons.
+     ImGui::SetNextWindowSizeConstraints({ 0, headerHeight }, { headerWidth, headerHeight });
+     ImVec2 headerSelSize = { menuSize.x - buttonSize.x * 3 - style.ItemSpacing.x * 3, headerHeight };
+     if (scrollbar) {
+@@ -670,7 +665,25 @@
+         ImGui::PopStyleColor();
+     }
+     ImGui::EndChild();
+-    ImGui::SameLine(menuSize.x - (buttonSize.x * 2) - style.ItemSpacing.x);
++    // SOH_IOS (overlay 0023): close button in the right cluster, left of the
++    // red Reset/Quit pair — top-right like every other port.
++    ImGui::SameLine(menuSize.x - (buttonSize.x * 3) - style.ItemSpacing.x * 2);
++    UIWidgets::ButtonOptions optionsClose = {};
++    optionsClose.size = UIWidgets::Sizes::Inline;
++    optionsClose.tooltip = "Close Menu (Esc)";
++    if (UIWidgets::Button(ICON_FA_TIMES_CIRCLE, optionsClose)) {
++        ToggleVisibility();
++
++        // Update gamepad navigation after close based on if other menus are still visible
++        auto mImGuiIo = &ImGui::GetIO();
++        if (CVarGetInteger(CVAR_IMGUI_CONTROLLER_NAV, 0) &&
++            Ship::Context::GetInstance()->GetWindow()->GetGui()->GetMenuOrMenubarVisible()) {
++            mImGuiIo->ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
++        } else {
++            mImGuiIo->ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
++        }
++    }
++    ImGui::SameLine();
+     UIWidgets::ButtonOptions options2 = {};
+     options2.color = UIWidgets::Colors::Red;
+     options2.size = UIWidgets::Sizes::Inline;

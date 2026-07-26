@@ -1,0 +1,95 @@
+Overlay patch 0031: decode-time texture downscale (the correct layer).
+
+The 0021 upload-layer downscale shrank only the GPU copy: stbi decodes at
+native size and the ResourceManager caches THAT buffer, so a resident 4K
+pack still carries full-size CPU shadows (~1 MB per 512x512 kart sprite,
+9504 of them) and the panic-valve sawtooth cannot die (adversarial review
+2026-07-21, P0-2). Downscaling at decode time — where initData->Path is
+naturally in hand — shrinks BOTH copies: per-class caps need no cross-TU
+flag plumbing (0021 rev8 / 0030 rev4 flag experiment superseded), sprites
+and their shadows fit resident, and the reallocated buffer uses new[] to
+match Texture::~Texture's delete[] (fixing the stbi-malloc mismatch for
+every downscaled texture).
+
+Class caps (0 disables — Vision Pro seeds 0 config-side for full 4K):
+  textures/karts/*  -> gSohIos.SpriteMaxDim (256): the kart angle-frame
+                       hot cycle at 512px (~1.7 GB) exceeds any budget;
+                       at 256px (~430 MB) it sits resident.
+  everything else   -> gSohIos.TexMaxDim (2048): the phone panel is
+                       2736x1260; >2048 is oversampled.
+
+
+--- a/src/port/resource/importers/BetterTextureFactory.cpp
++++ b/src/port/resource/importers/BetterTextureFactory.cpp
+@@ -2,6 +2,9 @@
+ #include "fast/resource/type/Texture.h"
+ #include "spdlog/spdlog.h"
+ #include <stb_image.h>
++#include <cstring>
++#include <vector>
++#include "ship/config/ConsoleVariable.h"
+ #include <ship/Context.h>
+ #include "ship/resource/archive/ArchiveManager.h"
+ #include "ship/resource/ResourceManager.h"
+@@ -19,6 +22,61 @@
+     texture->Type = Fast::TextureType::RGBA32bpp;
+     texture->ImageDataSize = texture->Width * texture->Height * 4;
+     texture->Flags = TEX_FLAG_LOAD_AS_IMG;
++
++#ifdef __IOS__
++    // SOH_IOS (overlay 0031): decode-time downscale — the only layer where
++    // BOTH the GPU upload and the ResourceManager's cached CPU copy shrink.
++    // Upload-layer downscale (0021) left full-size CPU shadows: a resident
++    // 4K pack still rode the ~3.35 GB jetsam ceiling through the shadows
++    // alone. Per-class caps, path known right here; 0 disables (Vision Pro).
++    if (texture->ImageData != nullptr) {
++        const bool sohIosIsSprite = initData->Path.compare(0, 15, "textures/karts/") == 0;
++        int sohIosCap = (int)Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(
++            sohIosIsSprite ? "gSohIos.SpriteMaxDim" : "gSohIos.TexMaxDim", sohIosIsSprite ? 256 : 2048);
++        int sohIosW = (int)texture->Width, sohIosH = (int)texture->Height;
++        if (sohIosCap >= 64 && (sohIosW > sohIosCap || sohIosH > sohIosCap)) {
++            const uint8_t* sohIosSrc = (const uint8_t*)texture->ImageData;
++            int sw = sohIosW, sh = sohIosH;
++            std::vector<uint8_t> sohIosTmp;
++            while ((sw > sohIosCap || sh > sohIosCap) && (sw % 2) == 0 && (sh % 2) == 0) {
++                int nw = sw / 2, nh = sh / 2;
++                std::vector<uint8_t> sohIosHalf((size_t)nw * nh * 4);
++                for (int y = 0; y < nh; y++) {
++                    const uint8_t* r0 = sohIosSrc + (size_t)(2 * y) * sw * 4;
++                    const uint8_t* r1 = r0 + (size_t)sw * 4;
++                    uint8_t* d = sohIosHalf.data() + (size_t)y * nw * 4;
++                    for (int x = 0; x < nw; x++) {
++                        for (int ch = 0; ch < 4; ch++) {
++                            d[x * 4 + ch] = (uint8_t)(((uint32_t)r0[x * 8 + ch] + (uint32_t)r0[x * 8 + 4 + ch] +
++                                                       (uint32_t)r1[x * 8 + ch] + (uint32_t)r1[x * 8 + 4 + ch]) /
++                                                      4);
++                        }
++                    }
++                }
++                sohIosTmp.swap(sohIosHalf);
++                sohIosSrc = sohIosTmp.data();
++                sw = nw;
++                sh = nh;
++            }
++            if (sw != sohIosW) {
++                // new[] matches Texture::~Texture's delete[] (the stbi buffer
++                // it replaces was malloc'd — freed here with the right free).
++                uint8_t* sohIosShrunk = new uint8_t[(size_t)sw * sh * 4];
++                std::memcpy(sohIosShrunk, sohIosSrc, (size_t)sw * sh * 4);
++                stbi_image_free(texture->ImageData);
++                texture->ImageData = sohIosShrunk;
++                texture->Width = sw;
++                texture->Height = sh;
++                texture->ImageDataSize = (uint32_t)((size_t)sw * sh * 4);
++                static uint32_t sohIosShrinkLog = 0;
++                if ((sohIosShrinkLog++ % 200) == 0) {
++                    SPDLOG_INFO("loadPngTexture: decode-downscaled {} {}x{} -> {}x{} (cap {})", initData->Path,
++                                sohIosW, sohIosH, sw, sh, sohIosCap);
++                }
++            }
++        }
++    }
++#endif
+     return texture;
+ }
+ 

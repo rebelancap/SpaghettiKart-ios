@@ -1,0 +1,30 @@
+Overlay patch 0010: iOS menu scale — rebase of reference 0015 onto this
+LUS pin. the Ship of Harkinian port patch applied byte-clean but its ADDED code calls
+Ship::Context::GetRawInstance(), which postdates our pin (the rename lands
+in the 8-commit gap) — caught at compile, not by the dry-run audit; lesson
+recorded in the audit doc. Identical behavior with GetInstance().
+The SoH menu at 1x point-scale is ~15% too large on a phone (reference
+device feedback). Scale ImGui style + fonts by gSohIos.MenuScale (default
+0.85) on iOS, mirroring upstream's Android 2x block right above.
+__IOS__-only; desktop build unaffected.
+
+--- a/libultraship/src/ship/window/gui/Gui.cpp
++++ b/libultraship/src/ship/window/gui/Gui.cpp
+@@ -119,6 +119,17 @@
+     mImGuiIo->FontGlobalScale = 2.0f;
+ #endif
+ 
++#ifdef __IOS__
++    // SOH_IOS (overlay 0010): the menu at 1x point-scale is ~15% too large
++    // on a phone. gSohIos.MenuScale is the future in-menu slider hook.
++    {
++        float sohIosMenuScale =
++            Ship::Context::GetInstance()->GetConsoleVariables()->GetFloat("gSohIos.MenuScale", 0.85f);
++        ImGui::GetStyle().ScaleAllSizes(sohIosMenuScale);
++        mImGuiIo->FontGlobalScale = sohIosMenuScale;
++    }
++#endif
++
+     mImGuiIniPath = Context::GetPathRelativeToAppDirectory("imgui.ini");
+     mImGuiLogPath = Context::GetPathRelativeToAppDirectory("imgui_log.txt");
+     mImGuiIo->IniFilename = mImGuiIniPath.c_str();

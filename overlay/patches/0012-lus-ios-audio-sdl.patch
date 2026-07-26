@@ -1,0 +1,71 @@
+Overlay patch 0012: iOS audio = SDL (re-authoring of reference 0003+0014
+for this older LUS pin, where backend selection lives in
+Config::GetCurrentAudioBackend instead of Audio::GetSavedAudioBackend).
+
+Four concerns, same as the Ship of Harkinian port:
+1. Audio.cpp references CoreAudioAudioPlayer under __APPLE__, but LUS only
+   compiles it on macOS — undefined symbol at app link on iOS, and
+   COREAUDIO would be the default backend with no implementation. Gate the
+   include, the InitAudioPlayer case, and the available-backends entry off
+   iOS (SDL-iOS owns the AVAudioSession; SDL backend works on device).
+2. Config.cpp GetCurrentAudioBackend's __APPLE__ default -> COREAUDIO
+   becomes SDL on iOS.
+3. A saved "coreaudio" (config synced from a macOS install) must map to SDL
+   on iOS, else it hits the compiled-out switch case -> default -> silent
+   NullAudioPlayer.
+LUS-side; __IOS__ is defined inside libultraship TUs.
+
+--- a/libultraship/src/ship/audio/Audio.cpp
++++ b/libultraship/src/ship/audio/Audio.cpp
+@@ -1,6 +1,6 @@
+ #include "ship/audio/Audio.h"
+ 
+-#ifdef __APPLE__
++#if defined(__APPLE__) && !defined(__IOS__)
+ #include "ship/audio/CoreAudioAudioPlayer.h"
+ #endif
+ 
+@@ -20,7 +20,7 @@
+             mAudioPlayer = std::make_shared<WasapiAudioPlayer>(this->mAudioSettings);
+             break;
+ #endif
+-#ifdef __APPLE__
++#if defined(__APPLE__) && !defined(__IOS__)
+         case AudioBackend::COREAUDIO:
+             mAudioPlayer = std::make_shared<CoreAudioAudioPlayer>(this->mAudioSettings);
+             break;
+@@ -45,7 +45,7 @@
+ #ifdef _WIN32
+     mAvailableAudioBackends->push_back(AudioBackend::WASAPI);
+ #endif
+-#ifdef __APPLE__
++#if defined(__APPLE__) && !defined(__IOS__)
+     mAvailableAudioBackends->push_back(AudioBackend::COREAUDIO);
+ #endif
+     mAvailableAudioBackends->push_back(AudioBackend::SDL);
+--- a/libultraship/src/ship/config/Config.cpp
++++ b/libultraship/src/ship/config/Config.cpp
+@@ -249,7 +249,14 @@
+     }
+ 
+     if (backendName == "coreaudio") {
++#ifdef __IOS__
++        // CoreAudio player is not built on iOS (HALOutput is macOS-only); a
++        // config synced from macOS would otherwise select the silent Null
++        // player via the switch default. Use SDL (real audio) instead.
++        return AudioBackend::SDL;
++#else
+         return AudioBackend::COREAUDIO;
++#endif
+     }
+ 
+     if (backendName == "sdl") {
+@@ -266,7 +273,7 @@
+     return AudioBackend::WASAPI;
+ #endif
+ 
+-#ifdef __APPLE__
++#if defined(__APPLE__) && !defined(__IOS__)
+     return AudioBackend::COREAUDIO;
+ #endif
+ 

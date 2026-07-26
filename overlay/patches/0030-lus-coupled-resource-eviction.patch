@@ -1,0 +1,118 @@
+Overlay patch 0030 (rev5): eviction-coupled CPU release (rev2 at-import unload OFF by default — pointer-identity bug) — THE 4K-pack
+jetsam fix (live device session 2026-07-20, three reproductions).
+
+Measured: with MK64 Reloaded 4K, phys_footprint climbs ~60 MB/s and the
+app jetsams at ~3.3-3.4 GB about 60-90 s into a race — three times, at
+identical ceilings. The discriminator: cutting the GPU texture budget
+1536→768 live (bridge cvarset) freed ~700 MB instantly, then the climb
+resumed at full rate and the app died on schedule anyway. Conclusion:
+LUS's ResourceManager cache holds every decompressed pack texture forever
+— unbounded, invisible to the 0022 GPU ledger, and the actual killer.
+
+Fix: the texture cache remembers each entry's resource path (available at
+import: RawTexMetadata.resource->GetInitData()->Path), and BOTH eviction
+paths (upstream's count cap here; 0022's byte budget in its own patch,
+rev3) unload the CPU-side resource when they evict the GPU texture. The
+GPU already has the texels; the CPU copy is pure waste after upload. A
+later re-reference reloads from the o2r (cost = load_ms, bounded and
+instrumented). Raw-address and mask textures store no path and are
+skipped. Field is unconditional (tiny); behavior __IOS__-gated so the
+macOS build keeps upstream semantics. Compile-coupled with 0022 rev3
+(series applies in order).
+
+--- a/libultraship/include/fast/interpreter.h
++++ b/libultraship/include/fast/interpreter.h
+@@ -200,6 +200,11 @@
+     uint32_t texture_id;
+     uint8_t cms, cmt;
+     bool linear_filter;
++    // SOH_IOS (overlay 0030): resource path backing this entry (empty for
++    // raw-address/mask textures). Eviction unloads the CPU-side resource —
++    // the unbounded resource cache was the 4K-pack jetsam (device-measured:
++    // footprint climbs ~60 MB/s to a ~3.4 GB kill regardless of GPU budget).
++    std::string resource_path;
+ 
+     std::list<struct TextureCacheMapIter>::iterator lru_location;
+ };
+--- a/libultraship/src/fast/interpreter.cpp
++++ b/libultraship/src/fast/interpreter.cpp
+@@ -470,9 +470,33 @@
+         return true;
+     }
+ 
++#ifdef __IOS__
++    // SOH_IOS (overlay 0030 rev5): the upstream 1024-entry cap binds BEFORE
++    // the byte budget once sprites are decode-capped to 256 (hot union is
++    // ~1300 entries) — count churn would replace byte churn (adversarial
++    // review P0-1). The byte budget + panic valve are the real bounds; the
++    // count cap becomes a generous cvar'd backstop.
++    size_t sohIosMaxEntries = (size_t)Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(
++        "gSohIos.TexCacheMaxEntries", 4096);
++    if (mTextureCache.map.size() >= sohIosMaxEntries) {
++#else
+     if (mTextureCache.map.size() >= TEXTURE_CACHE_MAX_SIZE) {
++#endif
+         // Remove the texture that was least recently used
+         it = mTextureCache.lru.front().it;
++#ifdef __IOS__
++        // SOH_IOS (overlay 0030): drop the CPU-side decompressed copy with
++        // the GPU texture (see TextureCacheValue::resource_path).
++        if (!it->second.resource_path.empty()) {
++            Ship::Context::GetInstance()->GetResourceManager()->UnloadResource(it->second.resource_path);
++        }
++        // rev5: actually release the Metal texture. Upstream recycles the id
++        // WITHOUT DeleteTexture, so a same-dims reuse replaceRegions the same
++        // MTLTexture that this frame's earlier encoded draws still reference
++        // (Metal samples at execution) -> one kart flashes another's frame.
++        // Also keeps the 0022 byte ledger honest at count-evicts.
++        mRapi->DeleteTexture(it->second.texture_id);
++#endif
+         mTextureCache.free_texture_ids.push_back(it->second.texture_id);
+         for (int j = 0; j < SHADER_MAX_TEXTURES; j++) {
+             if (mRenderingState.mTextures[j] == &*it)
+@@ -1216,6 +1240,45 @@
+         return;
+     }
+ 
++#ifdef __IOS__
++    // SOH_IOS (overlay 0030): the miss-path insert just ran — remember the
++    // backing resource path so eviction can unload the CPU-side copy.
++    if (mRenderingState.mTextures[i] != nullptr && metadata->resource != nullptr &&
++        metadata->resource->GetInitData() != nullptr) {
++        mRenderingState.mTextures[i]->second.resource_path = metadata->resource->GetInitData()->Path;
++        // (rev4's per-import upload-cap flag was superseded by 0031's
++        // decode-time downscale — the flag leaked on no-upload exits and
++        // shrank only the GPU copy anyway; see review P0-2/P1-3.)
++        // rev2 (rev1 falsified live, 2026-07-20): eviction-coupled unload
++        // alone left a full CPU shadow of the RESIDENT set (~GPU-budget
++        // sized) and the app still hit the ~3.4 GB ceiling. The CPU copy is
++        // dead weight once the texels reach the GPU: drop the manager's ref
++        // NOW for pack-class textures. metadata->resource's shared_ptr (held
++        // in the TMEM slot) keeps the bytes alive through this import; they
++        // free when the slot is overwritten. Base-game textures sit far
++        // below the threshold and keep their upstream caching. Re-imports
++        // after GPU eviction reload from the o2r (cost = load_ms,
++        // instrumented). Live-tunable: gSohIos.ResUnloadMinKB.
++        // rev3: DEFAULT OFF — device-falsified (2026-07-20 screenshot):
++        // the texture cache keys entries by DATA POINTER, so unloading a
++        // still-cached entry's resource makes its reload land at a NEW
++        // pointer -> duplicate entries, forced evictions, black track
++        // surfaces and flickering billboards. Unload must only accompany
++        // entry death (the eviction paths below/0022). Kept behind a CVar
++        // for live experiments only.
++        if (Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger("gSohIos.ResUnloadAtImport", 0)) {
++            uint32_t sohIosMinBytes =
++                (uint32_t)Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger("gSohIos.ResUnloadMinKB",
++                                                                                         256) *
++                1024;
++            if (metadata->resource->ImageDataSize >= sohIosMinBytes) {
++                Ship::Context::GetInstance()->GetResourceManager()->UnloadResource(
++                    mRenderingState.mTextures[i]->second.resource_path);
++            }
++        }
++    }
++#endif
++
+     // Guard against zero-sized textures that would cause divide-by-zero
+     // or GPU API errors in UploadTexture.
+     if (mRdp->texture_tile[tile].line_size_bytes == 0 || mRdp->loaded_texture[tmemIdex].size_bytes == 0 ||

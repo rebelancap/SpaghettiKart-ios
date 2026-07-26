@@ -1,0 +1,56 @@
+Overlay patch 0036 rev2: gDPFillWideRectangle — sign-safe packing.
+
+Two independent sign killers stacked on the same macro; rev1 fixed only
+the second, which is why the device gap survived it:
+
+(1) FLOAT->U32 SATURATION (the actual left-edge bug, rev2). Callers pass
+    floats — draw_box_fill_wide feeds OTRGetDimensionFromLeftEdge(0)-1 =
+    -101.57 at 2.17:1 — and _SHIFTL's first act is (u32)(v). Float ->
+    unsigned of a negative value is UB; ARM64 (device AND Apple-Silicon
+    sim) lowers it to fcvtzu, which SATURATES to 0. The wide rect's left
+    edge therefore packed as 0 regardless of field width: the cinematic
+    bars start at exactly N64 x=0 (device column 528 of 2736 — measured
+    in artifacts/live-session-4k/intro-letterbox-gap.png; the "380" in
+    the consult brief was read off a scaled viewer). Fix: truncate via
+    (int) FIRST — float->signed truncation is defined — then let the
+    (u32) wrap preserve the two's-complement bit pattern.
+
+(2) 22-BIT SIGN TRUNCATION (rev1, kept). The interpreter handler decodes
+    24-bit sign-extended ((int32_t)(C0(0,24) << 8) >> 8); packing with a
+    22-bit mask drops the sign bits of negative integer coords.
+
+Also (3): mask the packed field to 24 bits AFTER the shift — _SHIFTL
+masks before shifting, so bits 24..25 of a negative coord would OR into
+w0's opcode byte. Harmless for _g1 (no opcode), fatal for _g0 if a
+negative lrx ever reaches the macro; make the packing total instead of
+relying on callers' clamps.
+
+
+--- a/libultraship/include/libultraship/libultra/gbi.h
++++ b/libultraship/include/libultraship/libultra/gbi.h
+@@ -4030,10 +4030,21 @@
+ #define gDPFillWideRectangle(pkt, ulx, uly, lrx, lry)                           \
+     {                                                                           \
+         Gfx *_g0 = (Gfx*)(pkt), *_g1 = (Gfx*)(pkt);                             \
+-        _g0->words.w0 = _SHIFTL(G_FILLWIDERECT, 24, 8) | _SHIFTL((lrx), 2, 22); \
+-        _g0->words.w1 = _SHIFTL((lry), 2, 22);                                  \
+-        _g1->words.w0 = _SHIFTL((ulx), 2, 22);                                  \
+-        _g1->words.w1 = _SHIFTL((uly), 2, 22);                                  \
++        /* SOH_IOS (overlay 0036 rev2): sign-safe packing, three parts.     \
++           (1) (int) casts: callers pass FLOATS (OTRGetDimensionFromLeftEdge \
++           yields -101.57 on 2.17:1 panels) and _SHIFTL's (u32)(v) on a      \
++           negative float is UB that ARM64 lowers to fcvtzu = saturate to 0  \
++           -> the left edge packed as 0 no matter the field width. Truncate  \
++           via (int) first (defined), then wrap to u32.                      \
++           (2) 24-bit fields, NOT 22: the interpreter decodes 24-bit         \
++           sign-extended; 22 bits dropped the sign of negative int coords.   \
++           (3) mask AFTER the shift so a negative coord's bits 24..25        \
++           can't reach w0's opcode byte. */                                  \
++        _g0->words.w0 = _SHIFTL(G_FILLWIDERECT, 24, 8) |                        \
++                        (_SHIFTL((int)(lrx), 2, 24) & 0x00FFFFFF);              \
++        _g0->words.w1 = _SHIFTL((int)(lry), 2, 24) & 0x00FFFFFF;                \
++        _g1->words.w0 = _SHIFTL((int)(ulx), 2, 24) & 0x00FFFFFF;                \
++        _g1->words.w1 = _SHIFTL((int)(uly), 2, 24) & 0x00FFFFFF;                \
+     }
+ 
+ /* Fraction never used in fill */

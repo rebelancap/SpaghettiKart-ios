@@ -1,0 +1,46 @@
+Overlay patch 0027: true GPU frame time (reference 0028, SYNC WAVE 2
+item 3 — the instrument that FOUND the vista GPU overload). The probe's
+eng_ms includes in-present blocking, so it cannot distinguish "GPU
+saturated" from "GPU idle, stall elsewhere". Sample each screen command
+buffer's GPUEndTime-GPUStartTime via addCompletedHandler into the shell's
+gSohIosGpuMs (defined in SohIosShell.m; bridge `drawable` and the 0014
+probe read it). Traps already paid by the Ship of Harkinian port: FILE-scope extern "C"
+(block-scope externs namespace-mangle), and readers poll the cached value
+— never block on the GPU. Anchors identical at this pin.
+
+--- a/libultraship/src/fast/backends/gfx_metal.cpp
++++ b/libultraship/src/fast/backends/gfx_metal.cpp
+@@ -31,6 +31,14 @@
+ #include <imgui_impl_metal.h>
+ #include <spdlog/spdlog.h>
+ #include <spdlog/fmt/fmt.h>
++
++#ifdef __IOS__
++// SOH_IOS (overlay 0027): defined in the app shell; C linkage (the shell is
++// ObjC). File scope — block-scope linkage specs don't compile in C++.
++extern "C" {
++extern volatile float gSohIosGpuMs;
++}
++#endif
+ 
+ #include "fast/backends/gfx_metal_shader.h"
+ 
+@@ -632,6 +640,18 @@
+ 
+     screen_framebuffer.mCommandBuffer->presentDrawable(mCurrentDrawable);
+     mCurrentVertexBufferPoolIndex = (mCurrentVertexBufferPoolIndex + 1) % kMaxVertexBufferPoolSize;
++#ifdef __IOS__
++    // SOH_IOS (overlay 0027): true GPU duration of the frame's screen pass —
++    // the perf probe's eng_ms includes present blocking and cannot separate
++    // GPU saturation from pacing waits.
++    screen_framebuffer.mCommandBuffer->addCompletedHandler(
++        MTL::HandlerFunction([](MTL::CommandBuffer* cb) {
++            double ms = (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
++            if (ms > 0 && ms < 1000.0) {
++                gSohIosGpuMs = (float)ms;
++            }
++        }));
++#endif
+     screen_framebuffer.mCommandBuffer->commit();
+ 
+     // Now that commit has been called, retain the command buffer for GPU sync

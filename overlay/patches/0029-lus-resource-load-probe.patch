@@ -1,0 +1,75 @@
+Overlay patch 0029: synchronous resource-load probe (2ship 0025 rev2,
+near-verbatim — anchors byte-identical at this pin). Per-window AGGREGATE
+of load time + count into atomics the 0014 probe reports as load_ms/loads
+— 2ship's round 1 proved per-file thresholds lie (bursts of small loads
+sum invisibly) and failed alt-pack lookups early-return before a naive
+timer (a texture pack makes EVERY load try alt/ first). >10 ms singles
+still log named (MISS-tagged on the failure path). Cache hits pay
+nothing. __IOS__-only.
+
+--- a/libultraship/src/ship/resource/ResourceManager.cpp
++++ b/libultraship/src/ship/resource/ResourceManager.cpp
+@@ -1,5 +1,20 @@
+ #include "ship/resource/ResourceManager.h"
+ #include <spdlog/spdlog.h>
++#ifdef __IOS__
++#include <atomic>
++#include <chrono>
++// SOH_IOS (overlay 0029 = 2ship 0025 rev2): per-window aggregate of
++// synchronous load time — single loads rarely cross 10 ms, but a burst of
++// small loads (track transition) or failed alt-pack lookups can sum to a
++// 100-600 ms frame invisibly. The 0014 probe reads/resets via
++// SohIos_LoadStats.
++static std::atomic<uint64_t> sSohIosLoadUs{ 0 };
++static std::atomic<uint32_t> sSohIosLoadCount{ 0 };
++extern "C" void SohIos_LoadStats(float* ms, unsigned int* count) {
++    *ms = (float)(sSohIosLoadUs.exchange(0) / 1000.0);
++    *count = sSohIosLoadCount.exchange(0);
++}
++#endif
+ #include "ship/resource/File.h"
+ #include "ship/resource/archive/Archive.h"
+ #include <algorithm>
+@@ -150,15 +165,42 @@
+     }
+ 
+     // Get the file from the OTR
++#ifdef __IOS__
++    auto sohIosLoadT0 = std::chrono::steady_clock::now();
++#endif
+     auto file = LoadFileProcess(identifier.Path);
+     if (file == nullptr) {
+         SPDLOG_TRACE("Failed to load resource file at path {}", identifier.Path);
+         mResourceCache[identifier] = ResourceLoadError::NotFound;
++#ifdef __IOS__
++        // SOH_IOS (overlay 0029): failed lookups (every alt-pack MISS walks
++        // this) must be counted into the aggregate too.
++        {
++            double sohIosMs =
++                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - sohIosLoadT0).count();
++            sSohIosLoadUs.fetch_add((uint64_t)(sohIosMs * 1000.0));
++            sSohIosLoadCount.fetch_add(1);
++            if (sohIosMs > 10.0) {
++                SPDLOG_INFO("SOH_LOAD {:.1f}ms MISS {}", sohIosMs, identifier.Path);
++            }
++        }
++#endif
+         return nullptr;
+     }
+ 
+     // Transform the raw data into a resource
+     auto resource = GetResourceLoader()->LoadResource(identifier.Path, file, initData);
++#ifdef __IOS__
++    {
++        double sohIosMs =
++            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - sohIosLoadT0).count();
++        sSohIosLoadUs.fetch_add((uint64_t)(sohIosMs * 1000.0));
++        sSohIosLoadCount.fetch_add(1);
++        if (sohIosMs > 10.0) {
++            SPDLOG_INFO("SOH_LOAD {:.1f}ms {}", sohIosMs, identifier.Path);
++        }
++    }
++#endif
+ 
+     // Another thread could have loaded the resource while we were processing, so we want to check before setting to
+     // the cache.

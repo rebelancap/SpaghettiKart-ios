@@ -1,0 +1,93 @@
+Overlay patch 0017 v2: single-flow first-run + SOH_AUTOEXTRACT.
+
+v1 added the SOH_AUTOEXTRACT scripted path (sim ladder; idb HID dead on
+iOS 27). v2 merges the iOS interactive flow into the same hunk (D6: same
+region = one concern) after DEVICE feedback: the game's SDL prompt chain
+(No O2R Files → Found ROM → error) stacked THREE alerts over the shell's
+ROM picker, which could never be reached; answering the top chain exited
+the app. On iOS the SHELL now owns all first-run UI:
+
+- GenerateAssetsMods on __IOS__ (interactive): call the shell's
+  SohIos_RunRomOnboarding() — one alert (Choose ROM… / Later), pumps the
+  main runloop (SDL's own message-box pattern) until baserom.us.z64
+  appears (picker or Files drop) or the user defers. Defer = clean exit
+  (the alert said what to do); ROM = promptless extraction by entering
+  the scripted path for exactly that window (setenv/unsetenv envelope —
+  bounded so the later "Missing mods.toml" YesNo at ModManager.cpp:260
+  keeps prompting normally).
+- ShowMessage/ShowYesNoBox degrade to spdlog lines under SOH_AUTOEXTRACT
+  (v1, unchanged). Desktop behavior unchanged.
+
+--- a/src/engine/mods/ModManager.cpp
++++ b/src/engine/mods/ModManager.cpp
+@@ -57,7 +57,44 @@
+ // run: its CleanWorld() dereferences Sky::Instance and other singletons that are still null
+ // at this point, which segfaults — a crash report on what should be a clean quit (e.g. when
+ // the user declines the first-run "Generate one now?" prompt).
++#ifdef __IOS__
++// Overlay 0017 v2: shell-owned single-flow onboarding (SohIosShell.m D7).
++// File scope: block-scope extern "C" declarations do not compile in C++.
++extern "C" int SohIos_RunRomOnboarding(void);
++#endif
++
+ void GenerateAssetsMods() {
++    // SOH_AUTOEXTRACT (overlay 0017): hands-free first-run extraction for
++    // scripted verification (sim ladder). ShowMessage/ShowYesNoBox also
++    // degrade to log lines under this env (Engine.cpp).
++    if (getenv("SOH_AUTOEXTRACT") != NULL) {
++        SPDLOG_INFO("SOH_AUTOEXTRACT: generating O2R without prompts");
++        if (!GameEngine::GenAssetFile()) {
++            SPDLOG_ERROR("SOH_AUTOEXTRACT: extraction failed");
++            _Exit(1);
++        }
++        return;
++    }
++#ifdef __IOS__
++    // Overlay 0017 v2 (device feedback 2026-07-11): the SDL prompt chain
++    // stacked three alerts over the shell's ROM picker. The shell owns ALL
++    // first-run UI: one alert, then promptless extraction.
++    {
++        if (!SohIos_RunRomOnboarding()) {
++            SPDLOG_INFO("iOS onboarding: user deferred (Files drop later); exiting cleanly");
++            _Exit(0);
++        }
++        SPDLOG_INFO("iOS onboarding: ROM ready, extracting");
++        setenv("SOH_AUTOEXTRACT", "1", 1); // promptless window (boxes -> logs)
++        const bool sohExtractOk = GameEngine::GenAssetFile();
++        unsetenv("SOH_AUTOEXTRACT"); // bounded: later prompts (mods.toml) stay interactive
++        if (!sohExtractOk) {
++            SPDLOG_ERROR("iOS onboarding: extraction failed");
++            _Exit(1);
++        }
++        return;
++    }
++#endif
+     if (GameEngine::ShowYesNoBox("No O2R Files", "No O2R files found. Generate one now?") == IDYES) {
+         if (!GameEngine::GenAssetFile()) {
+             GameEngine::ShowMessage("Error", "An error occured, no O2R file was generated.\n\nExiting...");
+--- a/src/port/Engine.cpp
++++ b/src/port/Engine.cpp
+@@ -310,6 +310,11 @@
+ }
+ 
+ void GameEngine::ShowMessage(const char* title, const char* message, SDL_MessageBoxFlags type) {
++    // SOH_AUTOEXTRACT (overlay 0017): no blocking boxes in scripted runs.
++    if (getenv("SOH_AUTOEXTRACT") != NULL) {
++        SPDLOG_INFO("SOH_AUTOEXTRACT ShowMessage suppressed: {} — {}", title, message);
++        return;
++    }
+ #if defined(__SWITCH__)
+     SPDLOG_ERROR(message);
+ #else
+@@ -320,6 +325,11 @@
+ 
+ int GameEngine::ShowYesNoBox(const char* title, const char* box) {
+     int ret;
++    // SOH_AUTOEXTRACT (overlay 0017): scripted runs answer Yes.
++    if (getenv("SOH_AUTOEXTRACT") != NULL) {
++        SPDLOG_INFO("SOH_AUTOEXTRACT ShowYesNoBox auto-Yes: {} — {}", title, box);
++        return IDYES;
++    }
+ #ifdef _WIN32
+     ret = MessageBoxA(nullptr, box, title, MB_YESNO | MB_ICONQUESTION);
+ #elif defined(__SWITCH__)

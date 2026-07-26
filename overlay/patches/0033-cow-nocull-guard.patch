@@ -1,0 +1,21 @@
+Overlay patch 0033: gNoCulling guard for the one unguarded cull site.
+
+The Moo Moo Farm cow renderer is the only is_within_render_distance caller
+that ignores gNoCulling (audit 2026-07-21: 24 sites guarded, this one not).
+With gNoCulling=1 now seeded as the iOS default (shell DefaultsVersion v6),
+cows would remain the last angle-culled — and thus edge-flickering — actor.
+Same guard style as the sibling sites.
+
+
+--- a/src/racing/actors.c
++++ b/src/racing/actors.c
+@@ -538,6 +538,9 @@
+         sp88[2] = var_s1->pos[2];
+         temp_f0 = is_within_render_distance(camera->pos, sp88, camera->rot[1], 0.0f, camera->fieldOfView,
+                                             4000000.0f);
++        if (CVarGetInteger("gNoCulling", 0) == 1) {
++            temp_f0 = MAX(temp_f0, 0.0f);
++        }
+         if (temp_f0 > 0.0f) {
+             if (temp_f0 < D_8015F704) {
+                 D_8015F704 = temp_f0;

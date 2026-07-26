@@ -1,0 +1,21 @@
+Overlay patch 0002: TorchExternal builds only the factories this game needs.
+The standalone torch (ExternalProject, used by ExtractAssets/GenerateO2R) is a
+fresh CMake invocation, so torch's own defaults apply and it compiles SM64/
+SF64/F-Zero/Mario-Artist factories the kart build never uses — and the SM64
+ones don't compile against fmt 11 (scoped-enum SPDLOG_INFO args at
+BehaviorScriptFactory.cpp:188, GeoLayoutFactory.cpp:331,
+LevelScriptFactory.cpp:209). Mirror the parent's game flags (MK64 on,
+everything else off) into the ExternalProject CMAKE_ARGS. Upstreamable to
+HarbourMasters/SpaghettiKart.
+
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -708,6 +708,8 @@
+     PREFIX TorchExternal
+     SOURCE_DIR ${CMAKE_SOURCE_DIR}/torch
+     CMAKE_ARGS -DCMAKE_INSTALL_PREFIX=${CMAKE_BINARY_DIR}/torch
++               -DBUILD_SM64=OFF -DBUILD_SF64=OFF -DBUILD_FZERO=OFF
++               -DBUILD_MARIO_ARTIST=OFF # match the parent's game flags
+ )
+ 
+   ExternalProject_Get_Property(TorchExternal install_dir)

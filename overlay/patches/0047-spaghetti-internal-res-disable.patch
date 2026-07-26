@@ -1,0 +1,37 @@
+Overlay patch 0047: grey out the inert Internal Resolution slider on
+iOS/visionOS (pinned 100%).
+The multiplier (CVAR_INTERNAL_RESOLUTION) is consumed ONLY by Fast3dGui's
+ImGui game-window path (ImGui::Image upscales the game texture) — the
+iOS/visionOS present pipeline never uses it: the game renders to mGameFb
+at the native drawable resolution and supersampling is the SSAA slider
+(iPhone) / automatic (Vision Pro, overlay 0035 + 0044 eye path). The
+slider therefore does NOTHING here (measured on sim, shell seed v2 note),
+so it misleads. Pin the CVar at 1.0 and disable the widget with an
+explanatory tooltip. PreFunc runs after ResetDisables(), so setting
+options->disabled + disabledTooltip directly sticks (no disabledMap entry
+needed). __IOS__-guarded — desktop keeps the working slider.
+
+--- a/src/port/ui/PortMenu.cpp
++++ b/src/port/ui/PortMenu.cpp
+@@ -247,6 +247,21 @@
+                 CVarGetFloat(CVAR_INTERNAL_RESOLUTION, 1));
+         })
+         .PreFunc([](WidgetInfo& info) {
++#ifdef __IOS__
++            // SOH_IOS (overlay 0047): inert on this platform — the multiplier
++            // only drives Fast3dGui's ImGui game-window upscale, which the
++            // iOS/visionOS present path never uses (native-res render to
++            // mGameFb; supersampling is the SSAA slider / auto on Vision Pro).
++            // Pin at 100% and grey it out so it can't mislead.
++            if (CVarGetFloat(CVAR_INTERNAL_RESOLUTION, 1.0f) != 1.0f) {
++                CVarSetFloat(CVAR_INTERNAL_RESOLUTION, 1.0f);
++            }
++            info.options->disabled = true;
++            info.options->disabledTooltip =
++                "Automatic on this platform - the game already renders at native "
++                "resolution. Use Supersampling (SSAA) in Settings > iOS.";
++            return;
++#endif
+             if (mPortMenu->disabledMap.at(DISABLE_FOR_ADVANCED_RESOLUTION_ON).active &&
+                 mPortMenu->disabledMap.at(DISABLE_FOR_VERTICAL_RES_TOGGLE_ON).active) {
+                 info.activeDisables.push_back(DISABLE_FOR_ADVANCED_RESOLUTION_ON);

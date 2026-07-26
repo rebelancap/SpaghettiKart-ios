@@ -1,0 +1,49 @@
+Overlay patch 0019: yaml-cpp constructs std::locale("C") PER SCALAR
+CONVERSION (convert.h YAML_DEFINE_CONVERT_STREAMABLE, encode+decode) —
+sample(1) during in-app extraction shows 52% of ALL time inside
+std::locale::locale(char const*) under DListFactory::parse (Apple libc++'s
+named-locale ctor is extremely slow, and torch decodes hundreds of
+thousands of YAML uints). This — not log flushing (0018's hypothesis,
+falsified by measurement: 554 s -> 488 s) — is the extraction-time
+pathology from D5.
+
+yaml-cpp is FetchContent'd, not vendored, so the fix rides a PATCH_COMMAND:
+a CMake script (new file torch/yaml-cpp-locale-fix.cmake) rewrites the two
+imbue lines to use a function-local static locale (thread-safe since
+C++11). Idempotent (skips if already patched) and loud (FATAL_ERROR if the
+expected text is missing). Applies to both the in-tree torch library and
+the standalone TorchExternal (same Declare). Upstreamable to yaml-cpp
+itself.
+
+--- a/torch/CMakeLists.txt
++++ b/torch/CMakeLists.txt
+@@ -224,6 +224,9 @@
+     yaml-cpp
+     GIT_REPOSITORY https://github.com/jbeder/yaml-cpp.git
+     GIT_TAG 2f86d13775d119edbb69af52e5f566fd65c6953b
++    # Overlay 0019: per-conversion std::locale("C") construction dominates
++    # extraction time on Apple libc++ — hoist to a static (see the script).
++    PATCH_COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/yaml-cpp-locale-fix.cmake
+ )
+ set(YAML_CPP_BUILD_TESTS OFF)
+ FetchContent_MakeAvailable(yaml-cpp)
+--- a/torch/yaml-cpp-locale-fix.cmake
++++ b/torch/yaml-cpp-locale-fix.cmake
+@@ -0,0 +1,17 @@
++# Overlay 0019 (SpaghettiKart-ios): yaml-cpp convert.h constructs
++# std::locale("C") on EVERY scalar encode/decode — on Apple libc++ the
++# named-locale constructor dominated in-app extraction (52% of samples).
++# Rewrite both imbue sites to a function-local static. Idempotent + loud.
++set(_f "${CMAKE_CURRENT_SOURCE_DIR}/include/yaml-cpp/node/convert.h")
++file(READ "${_f}" _c)
++if(_c MATCHES "sYamlCLocale")
++    return() # already patched (re-populate / re-configure)
++endif()
++set(_old "stream.imbue(std::locale(\"C\"));")
++set(_new "static const std::locale sYamlCLocale(\"C\"); stream.imbue(sYamlCLocale);")
++string(REPLACE "${_old}" "${_new}" _c2 "${_c}")
++if(_c STREQUAL _c2)
++    message(FATAL_ERROR "yaml-cpp locale fix: expected imbue lines not found — yaml-cpp changed; re-verify overlay 0019")
++endif()
++file(WRITE "${_f}" "${_c2}")
++message(STATUS "yaml-cpp locale fix applied (overlay 0019)")

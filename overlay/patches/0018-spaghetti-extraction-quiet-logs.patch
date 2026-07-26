@@ -1,0 +1,64 @@
+Overlay patch 0018: extraction must not fsync per asset (D5's 9.2-min
+first run). Mechanism, confirmed in code: Companion::Init unconditionally
+sets the PROCESS-default spdlog level to debug + its own pattern
+(Companion.cpp:133-134) — in-app that's LUS's file-sink logger with
+flush_on(info) (LUS Context.cpp:174), and torch logs per-asset at info →
+thousands of fsyncs into Documents/logs on a sandboxed FS.
+Two hunks, one concern:
+- torch/Companion.cpp: only stomp level/pattern when the caller asked for
+  debug (gConfig.debug — the game passes false; the standalone CLI keeps
+  its output at spdlog defaults). Upstreamable: a library must not
+  reconfigure the host's global logger.
+- GameExtractor.cpp GenerateOTR (__IOS__): quiet the default logger to
+  `err` for the extraction window and restore after — errors and torch's
+  final critical "Done!" still emit + flush; the per-asset chatter never
+  reaches the sink. Desktop oracle unaffected.
+
+--- a/torch/src/Companion.cpp
++++ b/torch/src/Companion.cpp
+@@ -130,8 +130,13 @@
+ 
+ void Companion::Init(const ExportType type) {
+ 
+-    spdlog::set_level(spdlog::level::debug);
+-    spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
++    // Only reconfigure the process-wide logger when debug output was
++    // requested: as an embedded library (SpaghettiKart in-app extraction)
++    // the host owns the default logger, and its sink may flush per line.
++    if (this->gConfig.debug) {
++        spdlog::set_level(spdlog::level::debug);
++        spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
++    }
+ 
+     this->gConfig.exporterType = type;
+     this->RegisterFactory("BLOB", std::make_shared<BlobFactory>());
+--- a/src/port/GameExtractor.cpp
++++ b/src/port/GameExtractor.cpp
+@@ -192,11 +192,25 @@
+     Companion::Instance = new Companion(this->mGameData, ArchiveType::O2R, false, assets_path, game_path);
+     Companion::Instance->SetAdditionalFiles({ "meta/mods.toml" });
+ 
++#ifdef __IOS__
++    // LUS's default logger flushes on every info line into Documents/logs;
++    // torch logs per asset. That made first-run extraction take 9.2 min on
++    // the simulator (overlay 0018 / D5). Quiet to err for the extraction
++    // window; errors and the final critical summary still emit.
++    const auto sohIosPrevLevel = spdlog::get_level();
++    spdlog::set_level(spdlog::level::err);
++#endif
++
++    bool sohExtractOk = true;
+     try {
+         Companion::Instance->Init(ExportType::Binary);
+     } catch (const std::exception& e) {
+-        return false;
++        sohExtractOk = false;
+     }
+ 
+-    return true;
++#ifdef __IOS__
++    spdlog::set_level(sohIosPrevLevel);
++#endif
++
++    return sohExtractOk;
+ }

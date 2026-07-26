@@ -1,0 +1,65 @@
+Overlay patch 0020: quit = confirm dialog, then CVarSave + exit(0).
+
+Part 1 (rev1, reference SYNC WAVE 1 mandatory fix 3): the menu's power
+button calls Window->Close(), which on desktop unwinds the main loop; on
+iOS there is no loop to unwind to and the Ship of Harkinian port measured a frozen
+screen. Save config and exit cleanly.
+
+Part 2 (rev2, device feedback 2026-07-23): the red power button sits in
+the top-right cluster right beside Reset, and it quit INSTANTLY — one
+stray tap (easy on a touch screen) killed the app and any unsaved
+progress. Every sibling port asks first. Now it opens a confirmation
+modal; only its "Quit" button performs the close/exit, "Cancel" dismisses.
+Uses the port's own ImGui BeginPopupModal pattern (as in Tools.cpp's
+ConfirmDeleteAllPopup) — SoH's SohGui::mModalWindow/RegisterPopup
+infrastructure does not exist in this port. Both the button and the popup
+live in the same ID scope (immediately adjacent in Menu::DrawElement), so
+OpenPopup/BeginPopupModal pair correctly.
+
+The whole quit-button body is owned by THIS patch, so the confirmation
+lands here as a revision rather than a later patch editing 0020's text
+(a later patch mutating an earlier patch's installed lines breaks that
+patch's applied-state probe in apply-overlay.sh).
+
+--- a/src/port/ui/Menu.cpp
++++ b/src/port/ui/Menu.cpp
+@@ -697,10 +697,36 @@
+     options3.size = UIWidgets::Sizes::Inline;
+     options3.tooltip = "Quit";
+     if (UIWidgets::Button(ICON_FA_POWER_OFF, options3)) {
+-        if (!popped) {
+-            ToggleVisibility();
++        // SOH_IOS (overlay 0020 rev2): never quit on the raw tap — the red
++        // power button is one stray touch away from killing the app (it
++        // sits beside Reset in the top-right cluster). Ask first.
++        ImGui::OpenPopup("Quit Spaghetti Kart");
++    }
++    {
++        ImVec2 sohQuitCenter = ImGui::GetMainViewport()->GetCenter();
++        ImGui::SetNextWindowPos(sohQuitCenter, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
++        if (ImGui::BeginPopupModal("Quit Spaghetti Kart", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
++            ImGui::TextUnformatted("Are you sure you want to quit Spaghetti Kart?");
++            ImGui::Separator();
++            if (ImGui::Button("Quit", ImVec2(140, 0))) {
++                ImGui::CloseCurrentPopup();
++                if (!popped) {
++                    ToggleVisibility();
++                }
++                Ship::Context::GetInstance()->GetWindow()->Close();
++#ifdef __IOS__
++                // no desktop main loop to unwind to; Close() alone left a
++                // frozen screen on device (reference fix 3).
++                CVarSave();
++                exit(0);
++#endif
++            }
++            ImGui::SameLine();
++            if (ImGui::Button("Cancel", ImVec2(140, 0))) {
++                ImGui::CloseCurrentPopup();
++            }
++            ImGui::EndPopup();
+         }
+-        Ship::Context::GetInstance()->GetWindow()->Close();
+     }
+     ImGui::PopStyleVar();
+ 

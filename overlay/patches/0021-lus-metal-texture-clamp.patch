@@ -1,0 +1,295 @@
+Overlay patch 0021 (rev4 = reference 0019 rev4, SYNC WAVE 2): harden
+Metal UploadTexture — clamp + null-guard + mip-aware byte ledger +
+DEFERRED mip-chain generation.
+rev1: clamp dims to GetMaxTextureSize (Metal aborts past the limit; the
+OOB-load fallback makes degenerate 16384x1+ strips). Keep SOURCE stride.
+rev2: null-guard newTexture (nil under memory pressure was dereferenced);
+exact GPU byte ledger feeding the 0022 budget eviction.
+rev3: >=256 px textures get a full mip chain — single-level minification
+of 2048px+ pack textures cost the Ship of Harkinian port 31 ms GPU frames in vistas
+(3.8 ms with mips).
+rev4 (NON-OPTIONAL freeze fix): mip generation must NOT create per-upload
+mid-frame command buffers — the frame's CB is enqueue()d and uncommitted,
+so upload CBs stack behind it and >63 uploads/frame deadlock
+commandBuffer() (reference: Hyrule Field frozen with music playing).
+Uploads push retained textures onto a pending list; EndFrame encodes ONE
+generateMipmaps blit pass on the frame's own command buffer. Mips valid
+next frame; ledger counts +1/3 for chains.
+
+--- a/libultraship/src/fast/backends/gfx_metal.cpp
++++ b/libultraship/src/fast/backends/gfx_metal.cpp
+@@ -382,21 +382,121 @@
+ void GfxRenderingAPIMetal::SelectTexture(int tile, uint32_t texture_id) {
+     mCurrentTile = tile;
+     mCurrentTextureIds[tile] = texture_id;
++}
++
++// SOH_IOS (overlay 0021 rev4): textures awaiting a mip-chain build in
++// EndFrame's single blit pass. Entries are retained on push — the 0022
++// byte-budget cache may evict (release) a texture before the frame ends.
++static std::vector<MTL::Texture*> sSohIosPendingMips;
++
++#ifdef __IOS__
++#include <atomic>
++#include <chrono>
++// SOH_IOS (overlay 0021 rev5 = 2ship up_ms): UploadTexture CPU-time
++// aggregate — the first-draw replaceRegion memcpy burst happens on the
++// game thread and is invisible to both gpu_ms (it's CPU) and the loader
++// probe (it happens at first draw, not load). Read/reset by the 0014
++// probe as up_ms/ups.
++static std::atomic<uint64_t> sSohIosUpUs{ 0 };
++static std::atomic<uint32_t> sSohIosUpCount{ 0 };
++extern "C" void SohIos_UploadStats(float* ms, unsigned int* count) {
++    *ms = (float)(sSohIosUpUs.exchange(0) / 1000.0);
++    *count = sSohIosUpCount.exchange(0);
+ }
++#endif
+ 
+ void GfxRenderingAPIMetal::UploadTexture(const uint8_t* rgba32_buf, uint32_t width, uint32_t height) {
+     if (width == 0 || height == 0) {
+         return;
++    }
++
++    // SOH_IOS (overlay 0021): Metal aborts the process (no error return) if a
++    // texture dimension exceeds the device limit. ImportTextureRaw's OOB-load
++    // fallback flattens over-requested HD-pack loads into a single line
++    // (e.g. 65536x1), which trips that limit. Clamp and log instead of dying;
++    // the flattened bytes past the clamp are zero-fill/garbage by construction.
++    // bytes_per_row keeps the SOURCE stride so a clamped region stays
++    // row-correct.
++    uint32_t sohIosSrcWidth = width; // rev7: non-const — downscale updates it
++    const uint32_t sohIosMaxDim = (uint32_t)GetMaxTextureSize();
++    if (width > sohIosMaxDim || height > sohIosMaxDim) {
++        SPDLOG_WARN("UploadTexture: clamping oversized texture {}x{} to device max {}", width, height, sohIosMaxDim);
++        width = width > sohIosMaxDim ? sohIosMaxDim : width;
++        height = height > sohIosMaxDim ? sohIosMaxDim : height;
+     }
+ 
++    // SOH_IOS (overlay 0021 rev7): the phone panel is 2736x1260 — 4K pack
++    // textures are ~2x oversampled and their mass cannot fit any affordable
++    // byte budget (DK 4K churned 10-20 evictions/sec at 1280 MB; the churn
++    // IS the user-visible sprite/tree blinking). Box-downscale oversized
++    // uploads to gSohIos.TexMaxDim so the whole set fits RESIDENT. 0
++    // disables (Vision Pro seeds 0 config-side to keep full 4K).
++    std::vector<uint8_t> sohIosShrunkA, sohIosShrunkB;
++    {
++        uint32_t sohIosTexMax = (uint32_t)Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(
++            "gSohIos.TexMaxDim", 2048);
++        const uint8_t* sohIosSrc = rgba32_buf;
++        uint32_t sohIosStride = sohIosSrcWidth;
++        bool sohIosUseA = true;
++        uint32_t sohIosOrigW = width, sohIosOrigH = height;
++        while (sohIosTexMax >= 64 && (width > sohIosTexMax || height > sohIosTexMax) && (width % 2) == 0 &&
++               (height % 2) == 0) {
++            uint32_t nw = width / 2, nh = height / 2;
++            std::vector<uint8_t>& sohIosDst = sohIosUseA ? sohIosShrunkA : sohIosShrunkB;
++            sohIosDst.resize((size_t)nw * nh * 4);
++            for (uint32_t y = 0; y < nh; y++) {
++                const uint8_t* r0 = sohIosSrc + (size_t)(2 * y) * sohIosStride * 4;
++                const uint8_t* r1 = r0 + (size_t)sohIosStride * 4;
++                uint8_t* d = sohIosDst.data() + (size_t)y * nw * 4;
++                for (uint32_t x = 0; x < nw; x++) {
++                    for (int c = 0; c < 4; c++) {
++                        d[x * 4 + c] = (uint8_t)(((uint32_t)r0[x * 8 + c] + (uint32_t)r0[x * 8 + 4 + c] +
++                                                  (uint32_t)r1[x * 8 + c] + (uint32_t)r1[x * 8 + 4 + c]) /
++                                                 4);
++                    }
++                }
++            }
++            sohIosSrc = sohIosDst.data();
++            sohIosStride = nw;
++            width = nw;
++            height = nh;
++            sohIosUseA = !sohIosUseA;
++        }
++        if (sohIosSrc != rgba32_buf) {
++            rgba32_buf = sohIosSrc;
++            sohIosSrcWidth = sohIosStride;
++            static uint32_t sohIosShrinkLog = 0;
++            if ((sohIosShrinkLog++ % 100) == 0) {
++                SPDLOG_INFO("UploadTexture: downscaled {}x{} -> {}x{} (TexMaxDim {})", sohIosOrigW, sohIosOrigH,
++                            width, height, sohIosTexMax);
++            }
++        }
++    }
++
+     TextureDataMetal* texture_data = &mTextures[mCurrentTextureIds[mCurrentTile]];
+ 
+     NS::AutoreleasePool* autorelease_pool = NS::AutoreleasePool::alloc()->init();
+ 
++    // SOH_IOS (overlay 0021 rev3): HD/4K replacement textures were uploaded
++    // with a single mip level — minified sampling of 2048px+ textures is a
++    // memory-bandwidth catastrophe (reference device gpu_ms hit 31ms/frame in
++    // vista scenes). Give large textures a full mip chain; tiny native-N64
++    // textures stay single-level (mip gen overhead isn't worth it there).
++    // rev6: threshold is live-tunable (bridge cvarset) — MK64's sprite-
++    // animated karts/Lakitu churn re-uploads under big packs, and each
++    // fresh upload draws one frame before its deferred mips exist (visible
++    // blink). Sprites sit near the camera where mips matter least; raising
++    // the floor exempts them while keeping the vista win on large track
++    // textures. A/B live: gSohIos.MipMinDim 256|512|1024.
++    const uint32_t sohIosMipMin = (uint32_t)Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(
++        "gSohIos.MipMinDim", 512); // rev9: 256-capped sprites skip mips — kills the first-frame-no-mips flash on re-upload; tracks (>=1280 after decode-cap) keep the vista win. Device A/B at 1024 showed no visual regression.
++    const bool sohIosWantMips = (width >= sohIosMipMin || height >= sohIosMipMin);
+     MTL::TextureDescriptor* texture_descriptor =
+-        MTL::TextureDescriptor::texture2DDescriptor(MTL::PixelFormatRGBA8Unorm, width, height, true);
++        MTL::TextureDescriptor::texture2DDescriptor(MTL::PixelFormatRGBA8Unorm, width, height, sohIosWantMips);
+     texture_descriptor->setArrayLength(1);
+-    texture_descriptor->setMipmapLevelCount(1);
++    if (!sohIosWantMips) {
++        texture_descriptor->setMipmapLevelCount(1);
++    }
+     texture_descriptor->setSampleCount(1);
+     texture_descriptor->setStorageMode(MTL::StorageModeShared);
+ 
+@@ -404,18 +504,63 @@
+ 
+     MTL::Texture* texture = texture_data->texture;
+     if (texture_data->texture == nullptr || texture_data->texture->width() != width ||
+-        texture_data->texture->height() != height) {
+-        if (texture_data->texture != nullptr)
++        texture_data->texture->height() != height ||
++        (sohIosWantMips && texture_data->texture->mipmapLevelCount() <= 1)) {
++        if (texture_data->texture != nullptr) {
++            // SOH_IOS (overlay 0021 rev2): keep the GPU byte ledger exact
++            // (rev4: a mip chain adds one third over the base level).
++            size_t sohIosOldBytes =
++                (size_t)texture_data->texture->width() * texture_data->texture->height() * 4;
++            if (texture_data->texture->mipmapLevelCount() > 1) {
++                sohIosOldBytes += sohIosOldBytes / 3;
++            }
++            mTextureBytes -= sohIosOldBytes;
+             texture_data->texture->release();
++            texture_data->texture = nullptr;
++        }
+ 
+         texture = mDevice->newTexture(texture_descriptor);
++        // SOH_IOS (overlay 0021 rev2): under memory pressure newTexture returns
++        // nil; the unchecked replaceRegion below then dereferenced null. Skip
++        // the upload (stale/garbage texel data beats a crash) and log loudly.
++        if (texture == nullptr) {
++            SPDLOG_ERROR("UploadTexture: newTexture failed ({}x{}, {} MB resident) — skipping upload", width,
++                         height, mTextureBytes / (1024 * 1024));
++            autorelease_pool->release();
++            return;
++        }
++        size_t sohIosNewBytes = (size_t)width * height * 4;
++        if (texture->mipmapLevelCount() > 1) {
++            sohIosNewBytes += sohIosNewBytes / 3;
++        }
++        mTextureBytes += sohIosNewBytes;
+     }
+ 
+     NS::UInteger bytes_per_pixel = 4;
+-    NS::UInteger bytes_per_row = bytes_per_pixel * width;
++    NS::UInteger bytes_per_row = bytes_per_pixel * sohIosSrcWidth;
++#ifdef __IOS__
++    // SOH_IOS (overlay 0021 rev5): time the game-thread upload memcpy.
++    auto sohIosUpT0 = std::chrono::steady_clock::now();
+     texture->replaceRegion(region, 0, rgba32_buf, bytes_per_row);
++    sSohIosUpUs.fetch_add((uint64_t)(std::chrono::duration<double, std::micro>(
++                                         std::chrono::steady_clock::now() - sohIosUpT0)
++                                         .count()));
++    sSohIosUpCount.fetch_add(1);
++#else
++    texture->replaceRegion(region, 0, rgba32_buf, bytes_per_row);
++#endif
+     texture_data->texture = texture;
+ 
++    // SOH_IOS (overlay 0021 rev4): DO NOT create a command buffer here — the
++    // frame's command buffer is already enqueue()d and uncommitted, so buffers
++    // created mid-frame stack up behind it unexecuted; >63 uploads in one frame
++    // deadlocks commandBuffer() (reference Hyrule Field freeze). Defer to
++    // EndFrame's single blit pass instead.
++    if (sohIosWantMips && texture->mipmapLevelCount() > 1) {
++        texture->retain();
++        sSohIosPendingMips.push_back(texture);
++    }
++
+     autorelease_pool->release();
+ }
+ 
+@@ -557,16 +702,52 @@
+ 
+     for (int i = 0; i < SHADER_MAX_TEXTURES; i++) {
+         if (mShaderProgram->usedTextures[i]) {
++            // SOH_IOS (overlay 0021 rev11): a texture uploaded THIS frame has
++            // uninitialized mip levels until EndFrame's blit — sampling them
++            // minified is the one-frame flash on every fresh animated-sprite
++            // frame (character select faces, Lakitu; user-reported). While
++            // its mips are pending, bind a shared LOD0-clamped sampler; the
++            // pointer mismatch in the cache rebinds the real sampler next
++            // frame (pending list clears at EndFrame).
++            bool sohIosPending = false;
++            if (!sSohIosPendingMips.empty()) {
++                MTL::Texture* sohIosTex = mTextures[mCurrentTextureIds[i]].texture;
++                for (MTL::Texture* sohIosP : sSohIosPendingMips) {
++                    if (sohIosP == sohIosTex) {
++                        sohIosPending = true;
++                        break;
++                    }
++                }
++            }
+             if (current_framebuffer.mLastBoundTextures[i] != mTextures[mCurrentTextureIds[i]].texture) {
+                 current_framebuffer.mLastBoundTextures[i] = mTextures[mCurrentTextureIds[i]].texture;
+                 current_framebuffer.mCommandEncoder->setFragmentTexture(mTextures[mCurrentTextureIds[i]].texture, i);
+-
+-                if (current_framebuffer.mLastBoundSamplers[i] != mTextures[mCurrentTextureIds[i]].sampler) {
+-                    current_framebuffer.mLastBoundSamplers[i] = mTextures[mCurrentTextureIds[i]].sampler;
+-                    current_framebuffer.mCommandEncoder->setFragmentSamplerState(
+-                        mTextures[mCurrentTextureIds[i]].sampler, i);
++            }
++            MTL::SamplerState* sohIosWant = mTextures[mCurrentTextureIds[i]].sampler;
++            if (sohIosPending) {
++                static MTL::SamplerState* sSohIosClampedLinear = nullptr;
++                static MTL::SamplerState* sSohIosClampedNearest = nullptr;
++                bool sohIosLin = mTextures[mCurrentTextureIds[i]].linear_filtering;
++                MTL::SamplerState** sohIosSlot = sohIosLin ? &sSohIosClampedLinear : &sSohIosClampedNearest;
++                if (*sohIosSlot == nullptr) {
++                    MTL::SamplerDescriptor* sohIosSd = MTL::SamplerDescriptor::alloc()->init();
++                    MTL::SamplerMinMagFilter sohIosF =
++                        sohIosLin ? MTL::SamplerMinMagFilterLinear : MTL::SamplerMinMagFilterNearest;
++                    sohIosSd->setMinFilter(sohIosF);
++                    sohIosSd->setMagFilter(sohIosF);
++                    sohIosSd->setLodMaxClamp(0.0f);
++                    sohIosSd->setSAddressMode(MTL::SamplerAddressModeRepeat);
++                    sohIosSd->setTAddressMode(MTL::SamplerAddressModeRepeat);
++                    sohIosSd->setRAddressMode(MTL::SamplerAddressModeRepeat);
++                    *sohIosSlot = mDevice->newSamplerState(sohIosSd);
++                    sohIosSd->release();
+                 }
++                sohIosWant = *sohIosSlot;
+             }
++            if (current_framebuffer.mLastBoundSamplers[i] != sohIosWant) {
++                current_framebuffer.mLastBoundSamplers[i] = sohIosWant;
++                current_framebuffer.mCommandEncoder->setFragmentSamplerState(sohIosWant, i);
++            }
+         }
+ 
+         if (mCurrentFilterMode == FILTER_THREE_POINT) {
+@@ -636,6 +817,25 @@
+     if (!screen_framebuffer.mHasEndedEncoding)
+         screen_framebuffer.mCommandEncoder->endEncoding();
+ 
++    // SOH_IOS (overlay 0021 rev4): build mip chains for this frame's uploads in
++    // ONE blit pass on the frame's own command buffer (see UploadTexture for
++    // why per-upload command buffers deadlock). The command buffer retains
++    // encoder-referenced textures until completion, so our list retain can be
++    // dropped right after encoding — including textures 0022 already evicted.
++    if (!sSohIosPendingMips.empty()) {
++        if (screen_framebuffer.mCommandBuffer != nullptr) {
++            MTL::BlitCommandEncoder* sohIosBlit = screen_framebuffer.mCommandBuffer->blitCommandEncoder();
++            for (MTL::Texture* sohIosTex : sSohIosPendingMips) {
++                sohIosBlit->generateMipmaps(sohIosTex);
++            }
++            sohIosBlit->endEncoding();
++        }
++        for (MTL::Texture* sohIosTex : sSohIosPendingMips) {
++            sohIosTex->release();
++        }
++        sSohIosPendingMips.clear();
++    }
++
+     // Deferred screen FB readback: blit the rendered texture into a shared
+     // MTLBuffer using a blit encoder (cheap DMA — no render pass boundary,
+     // no TBDR tile flush/reload).  The CPU reads this buffer next frame in

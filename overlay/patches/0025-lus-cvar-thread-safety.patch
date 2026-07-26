@@ -1,0 +1,120 @@
+Overlay patch 0025: thread-safe CVar map (reference 0030 = SYNC WAVE 2
+item 1, CRITICAL — latent crash every port ships). SpaghettiKart has the
+exact architecture that SEGV'd the Ship of Harkinian port: GameEngine::HandleAudioThread
+reads CVarGetFloat("gGameMasterVolume") EVERY audio frame (Engine.cpp:504)
+while the main thread writes CVars (menu interaction, race transitions) —
+ConsoleVariable::mVariables is a bare unordered_map, and a concurrent
+insert can rehash while the audio thread is inside find() → freed-bucket
+deref → SEGV. Fix: recursive_mutex over every mVariables access (reads
+funnel through Get(); writes are the five Set*, ClearVariable,
+CopyVariable, Save, Load). Recursive because Register*/ClearVariable/Load
+re-enter via Get()/Set*(). Uncontended cost is tens of ns — noise.
+Sole pin delta vs the Ship of Harkinian port patch: Context::GetInstance (pre-rename)
+in ClearVariable/Save/Load context lines. Residual (reference-documented):
+GetString's char* after a concurrent SetString — no audio-thread string
+reads exist in this port either (master volume is a float).
+
+--- a/libultraship/include/ship/config/ConsoleVariable.h
++++ b/libultraship/include/ship/config/ConsoleVariable.h
+@@ -4,6 +4,7 @@
+ #include <nlohmann/json.hpp>
+ #include <stdint.h>
+ #include <memory>
++#include <mutex>
+ #include <unordered_map>
+ #include <string>
+ #include <string_view>
+@@ -209,5 +210,10 @@
+         }
+     };
+     std::unordered_map<std::string, std::shared_ptr<CVar>, TransparentStringHash, TransparentStringEqual> mVariables;
++    // SOH_IOS (overlay 0025): guards mVariables — this port's audio thread
++    // reads CVars every synth frame (gGameMasterVolume) while the main
++    // thread writes them; an unguarded rehash SEGVs the concurrent find().
++    // Recursive: Register*/ClearVariable/Load re-enter via Get()/Set*().
++    mutable std::recursive_mutex mVariablesMutex;
+ };
+ } // namespace Ship
+--- a/libultraship/src/ship/config/ConsoleVariable.cpp
++++ b/libultraship/src/ship/config/ConsoleVariable.cpp
+@@ -21,6 +21,8 @@
+ }
+ 
+ std::shared_ptr<CVar> ConsoleVariable::Get(const char* name) {
++    // SOH_IOS (overlay 0025): every read funnels through here — see header.
++    std::lock_guard<std::recursive_mutex> sohIosLock(mVariablesMutex);
+     auto it = mVariables.find(name);
+     return it != mVariables.end() ? it->second : nullptr;
+ }
+@@ -89,6 +91,7 @@
+ }
+ 
+ void ConsoleVariable::SetInteger(const char* name, int32_t value) {
++    std::lock_guard<std::recursive_mutex> sohIosLock(mVariablesMutex);
+     auto& variable = mVariables[name];
+     if (variable == nullptr) {
+         variable = std::make_shared<CVar>();
+@@ -99,6 +102,7 @@
+ }
+ 
+ void ConsoleVariable::SetFloat(const char* name, float value) {
++    std::lock_guard<std::recursive_mutex> sohIosLock(mVariablesMutex);
+     auto& variable = mVariables[name];
+     if (variable == nullptr) {
+         variable = std::make_shared<CVar>();
+@@ -109,6 +113,7 @@
+ }
+ 
+ void ConsoleVariable::SetString(const char* name, const char* value) {
++    std::lock_guard<std::recursive_mutex> sohIosLock(mVariablesMutex);
+     auto& variable = mVariables[name];
+     if (variable == nullptr) {
+         variable = std::make_shared<CVar>();
+@@ -122,6 +127,7 @@
+ }
+ 
+ void ConsoleVariable::SetColor(const char* name, Color_RGBA8 value) {
++    std::lock_guard<std::recursive_mutex> sohIosLock(mVariablesMutex);
+     auto& variable = mVariables[name];
+     if (!variable) {
+         variable = std::make_shared<CVar>();
+@@ -132,6 +138,7 @@
+ }
+ 
+ void ConsoleVariable::SetColor24(const char* name, Color_RGB8 value) {
++    std::lock_guard<std::recursive_mutex> sohIosLock(mVariablesMutex);
+     auto& variable = mVariables[name];
+     if (!variable) {
+         variable = std::make_shared<CVar>();
+@@ -172,6 +179,7 @@
+ }
+ 
+ void ConsoleVariable::ClearVariable(const char* name) {
++    std::lock_guard<std::recursive_mutex> sohIosLock(mVariablesMutex);
+     std::shared_ptr<Config> conf = Context::GetInstance()->GetConfig();
+     auto var = Get(name);
+     if (var != nullptr) {
+@@ -208,6 +216,7 @@
+ }
+ 
+ void ConsoleVariable::CopyVariable(const char* from, const char* to) {
++    std::lock_guard<std::recursive_mutex> sohIosLock(mVariablesMutex);
+     auto& variableFrom = mVariables[from];
+     if (!variableFrom) {
+         return;
+@@ -241,6 +250,7 @@
+ }
+ 
+ void ConsoleVariable::Save() {
++    std::lock_guard<std::recursive_mutex> sohIosLock(mVariablesMutex);
+     std::shared_ptr<Config> conf = Context::GetInstance()->GetConfig();
+ 
+     for (const auto& variable : mVariables) {
+@@ -277,6 +287,7 @@
+ }
+ 
+ void ConsoleVariable::Load() {
++    std::lock_guard<std::recursive_mutex> sohIosLock(mVariablesMutex);
+     std::shared_ptr<Config> conf = Context::GetInstance()->GetConfig();
+     conf->Reload();
+     if (!mVariables.empty()) {
