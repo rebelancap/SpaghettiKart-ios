@@ -5,7 +5,10 @@ SpaghettiKart's PortMenu) + game-side consumers for two of its knobs.
   A & Z per the MK64 policy, Haptics, Opacity, Left-Handed, Stick
   Response, Customize Layout…), Display (Max Frame Rate 60/120,
   Performance HUD), Menu (Menu Scale LIVE), Advanced (Remote Console
-  :8768). Shell consumes the touch knobs via its 0.25 s poll (inherited
+  :8768 — emitted inside `#if SOH_REMOTE_CONSOLE`, the SAME macro that
+  gates the bridge itself in SohIosShell.m, so a public build carries
+  neither the listener nor a toggle that would do nothing; see D9/D-040
+  and the option() in 0013). Shell consumes the touch knobs via its 0.25 s poll (inherited
   with the Ship of Harkinian port shell); the two game-side consumers ride here:
 - Engine.cpp GetInterpolationFPS: gSohIos.MaxFps caps the match-refresh
   branch (60 = battery saver, 120 = full ProMotion).
@@ -34,7 +37,7 @@ Kart deltas vs reference 0017: no RaceDisable in this menu framework
  
  void PortMenu::AddSettings() {
      // Add Settings menu
-@@ -354,6 +363,130 @@
+@@ -369,6 +378,130 @@
          .CVar(CVAR_CONTROLLER_CONFIGURATION_WINDOW_OPEN)
          .WindowName("Input Editor")
          .Options(ButtonOptions().Tooltip("Enables the separate Bindings Window.").Size(Sizes::Inline));

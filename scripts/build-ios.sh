@@ -16,6 +16,7 @@ CONSOLE="${SOH_REMOTE_CONSOLE:-ON}"
 rm -rf "$BUILD/Release-iphoneos" "$BUILD/Spaghettify.xcarchive" "$BUILD/export"
 
 cmake --no-warn-unused-cli -S "$ROOT/vendor/SpaghettiKart" -B "$BUILD" -GXcode \
+    -DCMAKE_XCODE_ATTRIBUTE_STRIP_INSTALLED_PRODUCT=NO \
     -DCMAKE_SYSTEM_NAME=iOS \
     -DCMAKE_OSX_DEPLOYMENT_TARGET=16.4 -DDEPLOYMENT_TARGET=16.4 \
     -DCMAKE_BUILD_TYPE:STRING=Release \

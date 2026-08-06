@@ -13,6 +13,7 @@ CONSOLE="${SOH_REMOTE_CONSOLE:-ON}"
 [[ -f "$SHIP_O2R" ]] || { echo "FATAL: no spaghetti.o2r — run build-oracle.sh + extract-mk64-o2r.sh" >&2; exit 1; }
 
 cmake --no-warn-unused-cli -S "$ROOT/vendor/SpaghettiKart" -B "$BUILD" -GXcode \
+    -DCMAKE_XCODE_ATTRIBUTE_STRIP_INSTALLED_PRODUCT=NO \
     -DCMAKE_SYSTEM_NAME=iOS -DPLATFORM=SIMULATORARM64 \
     -DCMAKE_OSX_SYSROOT=iphonesimulator \
     -DCMAKE_OSX_DEPLOYMENT_TARGET=16.4 -DDEPLOYMENT_TARGET=16.4 \
