@@ -23,14 +23,18 @@ on-screen touch layout. The same build also runs in stereoscopic 3D.*
 **Add the SideStore source** — the easiest path, and the app auto-updates when new
 versions ship:
 
-| Device | Source URL |
-| --- | --- |
-| iPhone / iPad | `https://raw.githubusercontent.com/rebelancap/harbourmasters-ports/main/apps-ios.json` |
-| Apple Vision Pro | `https://raw.githubusercontent.com/rebelancap/harbourmasters-ports/main/apps-visionos.json` |
+| Device | Source | Source URL |
+| --- | --- | --- |
+| iPhone / iPad | HarbourMasters ports | `https://raw.githubusercontent.com/rebelancap/harbourmasters-ports/main/apps-ios.json` |
+| iPhone / iPad | All ports | `https://raw.githubusercontent.com/rebelancap/all-ports/main/apps-ios.json` |
+| Apple Vision Pro | HarbourMasters ports | `https://raw.githubusercontent.com/rebelancap/harbourmasters-ports/main/apps-visionos.json` |
+| Apple Vision Pro | All ports | `https://raw.githubusercontent.com/rebelancap/all-ports/main/apps-visionos.json` |
+
+SpaghettiKart is in both sources — add either one (HarbourMasters ports carries just the
+HarbourMasters family; All ports carries every rebelancap port).
 
 In [SideStore](https://sidestore.io) / [AltStore](https://altstore.io): *Sources → **+** →
-paste the URL*, then install SpaghettiKart. These are shared sources — they also carry
-the other HarbourMasters ports as they ship.
+paste the URL*, then install SpaghettiKart.
 
 **Getting SideStore onto your device** — on both platforms SideStore itself is installed
 with **iloader**:
