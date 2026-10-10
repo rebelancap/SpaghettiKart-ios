@@ -1,0 +1,423 @@
+Overlay patch 0055: the unguarded Metal framebuffer allocations (VR R9 item
+1b). The other half of the rainbow work — the eye-slot handoff — lives in
+overlay 0044 rev4, because it edits code 0044 itself adds and a patch that
+lands inside another patch's hunk context breaks apply-overlay.sh's
+reverse-probe idempotence check. Read 0044 rev4's header first; this one is
+the memory-pressure half of the same story.
+
+`UpdateFramebufferParameters` calls `mDevice->newTexture()` five times and
+checks NONE of them, while `tex.width/height` are stamped with the requested
+size regardless. Under memory pressure `newTexture` returns nil — this repo
+already knows that and already guards the same call in the TEXTURE UPLOAD path
+(overlay 0021 rev2, "UploadTexture: newTexture failed"). The FRAMEBUFFER path
+is where the 83 MB objects live and it had no guard at all.
+
+The failure mode is worse than a dropped frame: the incumbent texture has
+ALREADY been released by then, the new pointer is null, and the size fields say
+the resize succeeded — so `diff` reads false from then on and IT NEVER RETRIES.
+One failed allocation and that framebuffer is dead for the rest of the session,
+with the compositor left holding whatever it last saw.
+
+At 100% render quality on device the VR attachments alone are ~830 MB: four eye
+slots at 5087x4081, colour AND Depth32Float, plus a HUD framebuffer at the same
+extent. That is exactly the size of thing a Siri screenshot's transient spike
+can push over — which is the user's new evidence, and it is why the artefacts get
+likelier at the screenshot moment even at LOW quality.
+
+THE FIX, and the ordering is the whole of it: allocate the replacement FIRST,
+and release the incumbent only once every allocation for that framebuffer has
+succeeded. On failure — log loudly (this project does not do silent skips),
+bump `gSohIosGfxAllocFails`, and leave the old texture AND the old size fields
+alone, so the framebuffer stays VALID (stale size, real contents) instead of
+becoming garbage, and `diff` stays true so the next frame tries again.
+
+`gSohIosGfxFbBytes` totals the live framebuffer attachment bytes, recomputed
+whenever one changes size, so `vr contract` can report what is actually
+resident at the moment the device misbehaves.
+
+REV2 (review finding, 2026-08-22). rev1 armed the retry for the COLOUR
+attachment only. The colour block stamps `tex.width/height` the moment its own
+allocation succeeds — before the depth block runs — so a frame where colour
+succeeded and depth then failed left the function in exactly the dead state the
+patch was written to prevent: next call `diff` is false (the size fields match
+the request), `fb.mHasDepthBuffer` is already true, the depth guard never fires
+again, and the framebuffer keeps a new-size colour attachment bound against an
+old-size depth attachment for the rest of the session. Fix: the depth guard now
+also compares the incumbent depth texture's OWN width/height against the
+request. `MTL::Texture` carries its extent and this file already reads it that
+way in the floating-frame path, so no new struct state is needed and the retry
+stays armed through any partial failure, in either order. Logging and the
+`gSohIosGfxAllocFails` telemetry are unchanged.
+
+REV3 (VR R13 item 1a, from docs/vr-r13-maps/allocfail-quiesce-map.md). rev2 kept
+the retry armed but never reasoned about the FRAMES IN BETWEEN. The depth guard's
+bare `return` jumps over the depth-ATTACHMENT fixup at the end of the function —
+and by then the COLOUR attachment has already been swapped into
+`fb.mRenderPassDescriptor` at the new size and `tex.width/height` stamped. What
+is left behind is a descriptor holding a new-size colour attachment against an
+old-size depth attachment: Metal rejects it, and `StartDrawToFramebuffer` has no
+nil-encoder guard, so it is an NSInternalInconsistencyException (SIGABRT, or
+SIGTRAP through the Metal validation layer) or a nil-encoder dereference
+(SIGSEGV). That is the user's third-map-load crash and, with the mirror in the
+live set, very likely the Siri-screenshot one too.
+
+rev3 does three things:
+  1. On depth failure the descriptor is made STRUCTURALLY CONSISTENT — the depth
+     attachment is dropped outright — so nothing invalid can reach Metal.
+  2. That framebuffer is marked SKIPPED, and `StartDrawToFramebuffer` refuses to
+     open a pass on it (loudly, bounded) until an `UpdateFramebufferParameters`
+     call completes for it. A frame of missing content beats a crash, and the
+     retry is still armed by the rev2 depth-size clause.
+  3. `gSohIosGfxFbFailIn` — THE MISSING RED CONTROL. Until now nothing in the
+     tree could drive `gSohIosGfxAllocFails` above zero, so every green run
+     reporting `alloc_fails=0` was a tautology rather than evidence (trap D11).
+     The knob is `vr set fbfail <n>`: fail the Nth next attachment allocation.
+     It lives in `SohIosShell.m` (defined on every target — the Fast3D overlay's
+     externs are strong and `__IOS__` is defined on iPhone too) and is consumed
+     here.
+`gSohIosGfxFbSkips` counts the refusals; `vr contract` reports it.
+
+
+--- a/libultraship/src/fast/backends/gfx_metal.cpp
++++ b/libultraship/src/fast/backends/gfx_metal.cpp
+@@ -742,7 +742,58 @@
+     fb.mHasDepthBuffer = true;
+ 
+     autorelease_pool->release();
++}
++
++#ifdef __IOS__
++// SOH_IOS (overlay 0055, VR R9 item 1b): allocation telemetry, read by
++// the shell for `vr contract`. File scope with C linkage — block-scope
++// linkage specs do not compile in C++ and this project's recurring
++// linkage trap is exactly that.
++extern "C" {
++volatile unsigned int gSohIosGfxAllocFails = 0; // newTexture -> nil
++volatile double gSohIosGfxFbBytes = 0.0;        // live attachment bytes
++// SOH_IOS (overlay 0055 rev2, VR R12 item 1): HOW OFTEN A COLOUR
++// ATTACHMENT IS REPLACED. R12 measured the published eye texture
++// carrying a DIFFERENT pointer on every single sample -- the eye
++// render target is being reallocated continuously, which makes the
++// three-slot ping-pong and its handoff gate meaningless (nothing is
++// ever re-entered) and puts the whole lifetime of a published
++// texture in the hands of the 16-entry retire ring. Nobody had a
++// number for this because nothing counted it.
++volatile unsigned int gSohIosGfxFbRecreates = 0;
++// SOH_IOS (overlay 0055 rev3, VR R13 item 1a): render passes REFUSED
++// because the framebuffer's descriptor could not be made whole.
++volatile unsigned int gSohIosGfxFbSkips = 0;
++// SOH_IOS (overlay 0055 rev3, VR R13 item 2): framebuffers CONFIGURED
++// onto the VR alpha-coverage pipeline variant, counted AFTER the store
++// so it reads what fb.mMsaaLevel actually ends up holding rather than
++// what the caller asked for. rev2 asked for 0 and stored 1, which is
++// exactly the regression that hid the HUD; a counter on the REQUEST
++// would have stayed green through it. `vr contract` reports it as
++// alphacov_fbs, and the suite forces a resize and asserts it moves.
++volatile unsigned int gSohIosGfxAlphaFbs = 0;
++}
++// SOH_IOS (overlay 0055 rev3, VR R13 item 1d): THE FAILURE-INJECTION
++// KNOB. `vr set fbfail <n>` fails the Nth next attachment allocation
++// from here. Defined in SohIosShell.m on every target (the linkage
++// rule this file's counters already follow, inverted: the shell owns
++// anything the BRIDGE writes). Without it `alloc_fails=0` in a green
++// run proves nothing at all -- there was no way to make it non-zero.
++extern "C" volatile int gSohIosGfxFbFailIn;
++// Framebuffers whose descriptor is not safe to render into. Indexed
++// by fb id; the tracked range is generous (this game runs ~20).
++#define SOH_IOS_FB_SKIP_N 128
++static bool sSohIosFbSkip[SOH_IOS_FB_SKIP_N];
++static bool sohios_fb_fail_now(void) {
++    if (gSohIosGfxFbFailIn > 0) {
++        gSohIosGfxFbFailIn = gSohIosGfxFbFailIn - 1;
++        if (gSohIosGfxFbFailIn == 0) {
++            return true;
++        }
++    }
++    return false;
+ }
++#endif
+ 
+ void GfxRenderingAPIMetal::UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
+                                                        bool opengl_invertY, bool render_target, bool has_depth_buffer,
+@@ -766,7 +817,61 @@
+         --msaa_level;
+     }
+ 
+-    bool diff = tex.width != width || tex.height != height || fb.mMsaaLevel != msaa_level;
++    // SOH_IOS (overlay 0055 rev2, VR R12 item 1): NORMALISE msaa_level
++    // BEFORE THE DIFF TEST -- this one line is the left-eye artefact.
++    //
++    // 0 and 1 both mean "no multisampling" and every consumer below
++    // already treats them identically (the msaa texture is built only
++    // for > 1). The DIFF TEST did not: callers pass 0 from one site and
++    // 1 from another, so `fb.mMsaaLevel != msaa_level` was true on every
++    // alternation and the framebuffer's colour attachment was thrown
++    // away and reallocated -- AT THE SAME SIZE -- twice per host frame.
++    // Measured in the visionOS simulator, first person, racing:
++    // 4876 recreations in the first ten seconds and ~700 PER SECOND
++    // sustained, each one a 3840x2164 attachment, with the log reading
++    // `SOH_FBNEW fb=9 3840x2164 -> 3840x2164 msaa 1 rt=1` immediately
++    // after `... msaa 0 rt=1` for the same framebuffer.
++    //
++    // Everything the last three rounds built assumed a published eye
++    // texture is a STABLE object that gets re-entered: the three-slot
++    // ping-pong, R9's handoff gate, R11's in-use claim. None of them can
++    // do anything when the producer allocates a brand-new texture for
++    // every pass -- the slot is never re-entered, so the gate never
++    // fires, and the lifetime of the object the compositor is holding
++    // passes entirely to the 16-entry retire ring, which at 700
++    // allocations a second wraps in milliseconds. The compositor reads
++    // gSoh3DEyeTexture[e] as a RAW pointer and only then does ARC retain
++    // it; with the allocator recycling addresses at that rate, the
++    // object it ends up holding can be a DIFFERENT texture that some
++    // other framebuffer is drawing into right now. That is incoherent
++    // rainbow garbage in whichever eye latched first -- eye 0, which is
++    // cp_drawable view 0, which is the LEFT eye (trap D29, and this is
++    // the structural left-first thing R11 was still looking for).
++    //
++    // REV3 (VR R13 item 2 -- READ THIS BEFORE TOUCHING THE LINE BELOW).
++    // rev2 normalised msaa_level IN PLACE, which fixed the diff test and
++    // silently broke something else: `fb.mMsaaLevel` is not only a record
++    // of the sample count, it is the INDEX INTO THE PIPELINE VARIANT TABLE
++    // (`prg->pipeline_state_variants[current_framebuffer.mMsaaLevel]`), and
++    // overlay 0035 rev2 owns SLOT 0 of that table as the VR ALPHA-COVERAGE
++    // pipeline -- the one whose alpha blend is a real `over`, so DESTINATION
++    // ALPHA accumulates coverage for the compositor to blend on. The VR eye
++    // and HUD framebuffers ask for it by carrying mMsaaLevel 0. Stamping 1
++    // instead moved every VR framebuffer onto the ordinary single-sample
++    // pipeline, whose alpha factors are (Zero, One): the HUD framebuffer
++    // stopped accumulating any alpha at all, and with `alphaCov` on (first
++    // person and third person) the HUD plane composites `float4(rgb, 0)` --
++    // INVISIBLE, in every view mode, exactly as the user reported on 1.0.0.9.
++    // The world survived it because a fully-dimmed first-person frame
++    // composites its eye blit force-opaque; the HUD plane has no such path.
++    //
++    // So: normalise for the DIFF TEST ONLY. Every other consumer below asks
++    // `msaa_level > 1`, for which 0 and 1 are already identical, and
++    // fb.mMsaaLevel keeps the value the CALLER asked for -- which is the
++    // variant selector.
++    const uint32_t sohMsaaNorm = (msaa_level > 1u) ? msaa_level : 1u;
++    const uint32_t sohMsaaWas = (fb.mMsaaLevel > 1u) ? (uint32_t)fb.mMsaaLevel : 1u;
++    bool diff = tex.width != width || tex.height != height || sohMsaaWas != sohMsaaNorm;
+ 
+     NS::AutoreleasePool* autorelease_pool = NS::AutoreleasePool::alloc()->init();
+ 
+@@ -780,20 +885,60 @@
+         tex_descriptor->setPixelFormat(mSrgbMode ? MTL::PixelFormatBGRA8Unorm_sRGB : MTL::PixelFormatBGRA8Unorm);
+         tex_descriptor->setUsage((render_target ? MTL::TextureUsageRenderTarget : 0) | MTL::TextureUsageShaderRead);
+ 
+-        if (tex.texture != nullptr)
+-            tex.texture->release();
+-
+-        tex.texture = mDevice->newTexture(tex_descriptor);
+-
+-        if (msaa_level > 1) {
++        // SOH_IOS (overlay 0055, VR R9 item 1b): ALLOCATE FIRST, RELEASE
++        // SECOND. Upstream released the incumbent and then called
++        // newTexture unchecked; under memory pressure that returns nil
++        // (this repo already guards the same call in UploadTexture,
++        // overlay 0021 rev2) and the framebuffer was left with a null
++        // texture AND a stamped size, so `diff` read false from then on
++        // and it never retried. One 83 MB allocation failing at 100%
++        // render quality killed that eye for the rest of the session.
++        // Now: on failure the OLD texture stays bound (stale size,
++        // valid contents), the size fields are not stamped, and the
++        // next frame tries again.
++        MTL::Texture* sohNewTex = sohios_fb_fail_now() ? nullptr : mDevice->newTexture(tex_descriptor);
++        MTL::Texture* sohNewMsaa = nullptr;
++        if (sohNewTex != nullptr && msaa_level > 1) {
+             tex_descriptor->setTextureType(MTL::TextureType2DMultisample);
+             tex_descriptor->setSampleCount(msaa_level);
+             tex_descriptor->setStorageMode(MTL::StorageModePrivate);
+             tex_descriptor->setUsage(render_target ? MTL::TextureUsageRenderTarget : 0);
+-
++            sohNewMsaa = mDevice->newTexture(tex_descriptor);
++            if (sohNewMsaa == nullptr) {
++                sohNewTex->release();
++                sohNewTex = nullptr;
++            }
++        }
++        if (sohNewTex == nullptr) {
++            gSohIosGfxAllocFails = gSohIosGfxAllocFails + 1;
++            SPDLOG_ERROR("UpdateFramebufferParameters: newTexture FAILED for fb {} ({}x{}, msaa {}) — "
++                         "keeping the previous attachment and retrying next frame (fails={})",
++                         fb_id, width, height, msaa_level, (unsigned)gSohIosGfxAllocFails);
++            tex_descriptor->release();
++            autorelease_pool->release();
++            return;
++        }
++        gSohIosGfxFbRecreates = gSohIosGfxFbRecreates + 1;
++        if (gSohIosGfxFbRecreates <= 24 || (gSohIosGfxFbRecreates % 512u) == 0u) {
++            // First few, then one in every 512 (rev4, VR R14). Trap
++            // D33 forbids logging this per frame -- it flooded the
++            // console bridge's 25-line tail and broke the suite --
++            // but the first 24 are all from startup, so a churn that
++            // begins later (the rear-view pane's alternating extent,
++            // found in R14) had NO attribution at all: the counter
++            // said 200 a second and nothing said WHICH framebuffer.
++            // One in 512 is ~0.4 lines a second at that rate.
++            SPDLOG_INFO("SOH_FBNEW fb={} {}x{} -> {}x{} msaa {} rt={} (n={})", fb_id,
++                        (unsigned)tex.width, (unsigned)tex.height, width, height, msaa_level,
++                        (int)render_target, (unsigned)gSohIosGfxFbRecreates);
++        }
++        if (tex.texture != nullptr)
++            tex.texture->release();
++        tex.texture = sohNewTex;
++        if (sohNewMsaa != nullptr) {
+             if (tex.msaaTexture != nullptr)
+                 tex.msaaTexture->release();
+-            tex.msaaTexture = mDevice->newTexture(tex_descriptor);
++            tex.msaaTexture = sohNewMsaa;
+         }
+ 
+         if (render_target) {
+@@ -828,7 +973,14 @@
+         tex_descriptor->release();
+     }
+ 
+-    if (has_depth_buffer && (diff || !fb.mHasDepthBuffer || (fb.mDepthTexture != nullptr) != can_extract_depth)) {
++    // SOH_IOS (overlay 0055 rev2): the last clause is the partial-failure
++    // retry signal — see the patch header. tex.width/height are stamped by
++    // the colour block above, so on a colour-ok/depth-failed frame `diff`
++    // is false next call and only the depth texture's OWN size still says
++    // the resize is unfinished.
++    if (has_depth_buffer && (diff || !fb.mHasDepthBuffer || (fb.mDepthTexture != nullptr) != can_extract_depth ||
++                             (fb.mDepthTexture != nullptr && (fb.mDepthTexture->width() != width ||
++                                                             fb.mDepthTexture->height() != height)))) {
+         MTL::TextureDescriptor* depth_tex_desc =
+             MTL::TextureDescriptor::texture2DDescriptor(MTL::PixelFormatDepth32Float, width, height, true);
+         depth_tex_desc->setTextureType(MTL::TextureType2D);
+@@ -838,19 +990,56 @@
+         depth_tex_desc->setMipmapLevelCount(1);
+         depth_tex_desc->setUsage(MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead);
+ 
+-        if (fb.mDepthTexture != nullptr)
+-            fb.mDepthTexture->release();
+-
+-        fb.mDepthTexture = mDevice->newTexture(depth_tex_desc);
+-
+-        if (msaa_level > 1) {
++        // SOH_IOS (overlay 0055, VR R9 item 1b): same ordering rule as the
++        // colour attachment above. A null DEPTH texture is if anything
++        // worse — the pass descriptor keeps a dangling depth attachment
++        // and the eye publishes a depth pointer the compositor then
++        // samples for its reverse-Z conversion.
++        MTL::Texture* sohNewDepth = sohios_fb_fail_now() ? nullptr : mDevice->newTexture(depth_tex_desc);
++        MTL::Texture* sohNewMsaaDepth = nullptr;
++        if (sohNewDepth != nullptr && msaa_level > 1) {
+             depth_tex_desc->setTextureType(MTL::TextureType2DMultisample);
+             depth_tex_desc->setSampleCount(msaa_level);
+-
++            sohNewMsaaDepth = mDevice->newTexture(depth_tex_desc);
++            if (sohNewMsaaDepth == nullptr) {
++                sohNewDepth->release();
++                sohNewDepth = nullptr;
++            }
++        }
++        if (sohNewDepth == nullptr) {
++            gSohIosGfxAllocFails = gSohIosGfxAllocFails + 1;
++            SPDLOG_ERROR("UpdateFramebufferParameters: DEPTH newTexture FAILED for fb {} ({}x{}) — "
++                         "keeping the previous attachment and retrying next frame (fails={})",
++                         fb_id, width, height, (unsigned)gSohIosGfxAllocFails);
++            // SOH_IOS (overlay 0055 rev3, VR R13 item 1a): THE CRASH.
++            // The colour attachment for this framebuffer was already
++            // swapped to the NEW size above and written into the render
++            // pass descriptor, and tex.width/height are already stamped.
++            // Returning here jumps over the depth-attachment fixup below,
++            // leaving a descriptor whose colour and depth attachments
++            // disagree in size -- which Metal rejects, and which
++            // StartDrawToFramebuffer then walks into with no nil-encoder
++            // guard. Make the descriptor CONSISTENT (colour-only is legal;
++            // a mismatched pair is not) and refuse to render this
++            // framebuffer until an update completes for it. The rev2
++            // depth-size clause keeps the retry armed.
++            if (fb.mRenderPassDescriptor != nullptr) {
++                fb.mRenderPassDescriptor->setDepthAttachment(nullptr);
++            }
++            if (fb_id >= 0 && fb_id < SOH_IOS_FB_SKIP_N) {
++                sSohIosFbSkip[fb_id] = true;
++            }
++            gSohIosGfxFbSkips = gSohIosGfxFbSkips + 1;
++            autorelease_pool->release();
++            return;
++        }
++        if (fb.mDepthTexture != nullptr)
++            fb.mDepthTexture->release();
++        fb.mDepthTexture = sohNewDepth;
++        if (sohNewMsaaDepth != nullptr) {
+             if (fb.mMsaaDepthTexture != nullptr)
+                 fb.mMsaaDepthTexture->release();
+-
+-            fb.mMsaaDepthTexture = mDevice->newTexture(depth_tex_desc);
++            fb.mMsaaDepthTexture = sohNewMsaaDepth;
+         }
+     }
+ 
+@@ -874,7 +1063,44 @@
+     fb.mRenderTarget = render_target;
+     fb.mHasDepthBuffer = has_depth_buffer;
+     fb.mMsaaLevel = msaa_level;
++    if (fb.mMsaaLevel == 0u) {
++        gSohIosGfxAlphaFbs = gSohIosGfxAlphaFbs + 1;
++    }
+ 
++    // SOH_IOS (overlay 0055 rev3, VR R13 item 1a): reaching here means
++    // every allocation this framebuffer needed succeeded and the
++    // descriptor is whole again, so lift the render refusal.
++    if (fb_id >= 0 && fb_id < SOH_IOS_FB_SKIP_N) {
++        sSohIosFbSkip[fb_id] = false;
++    }
++
++    // SOH_IOS (overlay 0055, VR R9 item 1b): what is actually resident in
++    // framebuffer attachments, recomputed whenever one changes size. At
++    // 100% render quality on device this is the number that explains the
++    // allocation failures — four 5087x4081 eye slots plus a HUD at the
++    // same extent, colour AND depth. `vr contract` reports it.
++    {
++        double sohBytes = 0.0;
++        for (size_t sohI = 0; sohI < mFramebuffers.size(); sohI++) {
++            const FramebufferMetal& sohF = mFramebuffers[sohI];
++            const TextureDataMetal& sohT = mTextures[sohF.mTextureId];
++            double sohPx = (double)sohT.width * (double)sohT.height;
++            if (sohT.texture != nullptr) {
++                sohBytes += sohPx * 4.0;
++            }
++            if (sohT.msaaTexture != nullptr) {
++                sohBytes += sohPx * 4.0 * (double)(sohF.mMsaaLevel > 1 ? sohF.mMsaaLevel : 1);
++            }
++            if (sohF.mDepthTexture != nullptr) {
++                sohBytes += sohPx * 4.0;
++            }
++            if (sohF.mMsaaDepthTexture != nullptr) {
++                sohBytes += sohPx * 4.0 * (double)(sohF.mMsaaLevel > 1 ? sohF.mMsaaLevel : 1);
++            }
++        }
++        gSohIosGfxFbBytes = sohBytes;
++    }
++
+     autorelease_pool->release();
+ }
+ 
+@@ -882,6 +1108,22 @@
+     FramebufferMetal& fb = mFramebuffers[fb_id];
+     mRenderTargetHeight = mTextures[fb.mTextureId].height;
+ 
++#ifdef __IOS__
++    // SOH_IOS (overlay 0055 rev3, VR R13 item 1a): see the patch header.
++    // Loud, but bounded -- this can run per frame and a diagnostic that
++    // floods the console bridge breaks the instrument reading it (D33).
++    if (fb_id >= 0 && fb_id < SOH_IOS_FB_SKIP_N && sSohIosFbSkip[fb_id]) {
++        static unsigned int sohSaid = 0;
++        if (sohSaid < 8) {
++            sohSaid++;
++            SPDLOG_ERROR("StartDrawToFramebuffer: fb {} SKIPPED — its attachments could not "
++                         "be allocated and its descriptor is not renderable (skips={})",
++                         fb_id, (unsigned)gSohIosGfxFbSkips);
++        }
++        mCurrentFramebuffer = fb_id;
++        return;
++    }
++#endif
+     mCurrentFramebuffer = fb_id;
+     mDrawnFramebuffers.insert(fb_id);
+ 

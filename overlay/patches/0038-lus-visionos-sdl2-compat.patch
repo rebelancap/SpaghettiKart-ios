@@ -21,7 +21,7 @@ errors). This patch:
 
 --- /dev/null
 +++ b/libultraship/cmake/dependencies/patches/sdl2-visionos-compat.patch
-@@ -0,0 +1,680 @@
+@@ -0,0 +1,731 @@
 +diff --git a/src/misc/ios/SDL_sysurl.m b/src/misc/ios/SDL_sysurl.m
 +index 08722ba9e..228ea8c0a 100644
 +--- a/src/misc/ios/SDL_sysurl.m
@@ -702,6 +702,57 @@ errors). This patch:
 +     }
 + 
 +     /* Integer truncation of fractional values matches SDL_uikitmetalview and
++diff --git a/src/joystick/iphoneos/SDL_mfijoystick.m b/src/joystick/iphoneos/SDL_mfijoystick.m
++--- a/src/joystick/iphoneos/SDL_mfijoystick.m
+++++ b/src/joystick/iphoneos/SDL_mfijoystick.m
++@@ -355,6 +355,47 @@
++     Uint8 subtype = 0;
++     Uint16 signature = 0;
++     const char *name = NULL;
+++
+++#if TARGET_OS_VISION
+++    /* SOH_IOS (overlay 0038, VR R4): hand PSVR2 Sense controllers to the native
+++     * backend and let SDL skip them entirely.
+++     *
+++     * SDL 2.32 predates spatial controllers, so its generic
+++     * ENABLE_PHYSICAL_INPUT_PROFILE branch below opens EACH HALF of a Sense pair
+++     * as a raw joystick with elements auto-mapped in alphabetical order and no
+++     * GameController mapping for that GUID: two half-pads, randomly handed,
+++     * neither of which can tell a steering stick from a camera stick. The port
+++     * drives the pair itself, with a fixed kart layout, at MK64's own
+++     * read_controllers seam (overlay 0053).
+++     *
+++     * VR R16-D — THE RUNTIME GATE IS GONE, AND THAT IS THE POINT.
+++     *
+++     * R4 wrote `&& SohSense_Active()` here so the pair could never be filtered
+++     * out of SDL while the native layout was not yet driving it — "never leave
+++     * the headset with no input at all", the donor's documented worst case.
+++     * But this gate is evaluated ONCE, at device-add time, and SohSense_Active()
+++     * was fed by an async, authorization-gated ARKit accessory load that only
+++     * ran inside an immersive space. On a cold flat launch it was 0, both halves
+++     * were admitted to SDL, and they stayed admitted for the whole process — so
+++     * in flat mode the gate did not race, it always lost. SDL's MFi auto-mapper
+++     * then matched three element names on a spatial controller (`Button A`,
+++     * `Button B`, `Button Menu`) and produced gas plus a phantom item, which is
+++     * exactly what the user reported on 1.0.0.12.
+++     *
+++     * Since R16-D the native fold is mode-independent AND ARKit-independent: it
+++     * is live as soon as a controller is adopted (SohSense_StartInput, called at
+++     * shell launch, pure GameController), so the argument for the runtime gate
+++     * no longer applies and the double producer it allowed is removed.
+++     *
+++     * The literal string rather than GCProductCategorySpatialController: this is
+++     * vendored SDL, which does not import the visionOS 26 constants. */
+++    if (@available(visionOS 26.0, *)) {
+++        NSString *cat = controller.productCategory;
+++        if (cat != nil && [cat isEqualToString:@"Spatial Controller"]) {
+++            return FALSE;
+++        }
+++    }
+++#endif
++ 
++     if (@available(macOS 11.3, iOS 14.5, tvOS 14.5, *)) {
++         if (!GCController.shouldMonitorBackgroundEvents) {
 --- a/libultraship/cmake/dependencies/ios.cmake
 +++ b/libultraship/cmake/dependencies/ios.cmake
 @@ -3,10 +3,16 @@

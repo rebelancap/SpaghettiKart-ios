@@ -25,6 +25,112 @@ injector needs the camera basis exported from the game:
   ENDING podium and CREDITS stay flat (v1; perspective sites exist for
   later). No aiming export — MK64 has no first-person mode; look-behind
   is an instant cut handled as a convergence snap, not a profile.
+REV2 (R6, VR first-person seat): the camera export alone cannot seat a
+first-person view. MK64's racing camera aims at
+`player->pos + R(yaw) * camera->unk_3C` (src/camera.c ~line 512) — a
+target AHEAD of the kart, not the kart — so `camEye + camFwd*camDist`
+lands in FRONT of the machine with the kart BEHIND the eye, which is
+exactly what the user saw in the headset ("I looked behind me, I can see
+myself (Toad)"). So rev2 additionally exports the PLAYER KART's own
+pose from `gPlayerOne`, at the same player-1-gated site:
+- gSohVRKartPos[3]  = gPlayerOne->pos
+- gSohVRKartVel[3]  = gPlayerOne->velocity  (the seat suite's
+  "neutral gaze faces the direction of travel" cross-check)
+- gSohVRKartYawBam  = the kart's yaw in the CAMERA (atan2s) convention.
+  REV3 (R8) NEGATES `gPlayerOne->rotation[1]` to get there. Rev2 shipped
+  it raw on the strength of `cameras[id].rot[1] = gPlayerOne[i].rot[1]`
+  (camera.c:1281) — which is a one-off GRAND-PRIX STAGING assignment,
+  not the racing convention, and getting it wrong is the whole of
+  the user's "joystick left, camera turns right" inverted-orbit bug.
+  The ground truth is the physics, not an angle: func_8002AE38
+  (player_controller.c:1115) advances the kart with
+  `sins(-rotation[1]) * speed, coss(-rotation[1]) * speed`, and
+  calculate_orientation_matrix's rot-Y (racing/math_util.c:616) maps the
+  kart model's +Z onto (-sin(rot1), 0, cos(rot1)) — the same vector —
+  while atan2s(x, z) (racing/math_util.c:900) returns the angle whose
+  forward is (+sin, +cos). MIRRORED. One conversion, at this boundary.
+- gSohVRKartValid   = 1 only while the GameCamera export site runs for
+  player 1 (racing, 1P). TourCamera (fly-by) deliberately does NOT set
+  it: there is no kart to sit in during a fly-by, and the shell falls
+  back to the camera-derived seat.
+The kart export is GameCamera-only, so it lives beside the shared basis
+helper rather than inside it.
+REV5 (R16-C, the rear-view pane): MK64's OWN look-behind camera is exported
+from LookBehindCamera::Tick. It is a whole second Camera object created for
+player 1 at spawn (src/spawn_players.c:1301) whose only difference from the
+chase camera is the Z sign of both kart-local offsets
+(src/engine/cameras/LookBehindCamera.cpp:26-30) -- same height, same pitch,
+same FOV, same smoothing, same wall pushout -- and World::TickCameras ticks
+it EVERY FRAME whether or not C-left is held (bActive is set in the ctor and
+never cleared). So its pos/lookAt/up are live, warm and free, and 0044 can
+build the pane's view from them for exact C-left parity instead of guessing
+a mirror. Published as a SEQLOCK with a frame stamp, exactly like the kart
+pose (rev4): the consumer is the 90-120 Hz compositor and the bridge, and a
+validity flag whose false state is part of a normal frame is trap D40.
+  gSohVRRearPos/At/Up  -- the look-behind camera's own eye, target and up.
+  gSohVRRearSeq/Frame  -- the seqlock and the game frame it belongs to.
+  gSohVRRearValid      -- 1 once a player-1 look-behind camera has exported.
+REV5 also exports gSoh3DCamAspect (= gScreenAspect, 1.3333 in 1P racing).
+The rear pane's framebuffer was sized off the EYE extent on a comment that
+claimed the aspects matched; they do not, and the shell needs the game's own
+number to size the pane's target correctly.
+REV6 (R17-A item 1, THE GHOST DRIVERS): both position exports gain a PREVIOUS
+value. The engine walks the display list N times per game frame at
+FrameInterpolation_Interpolate(t), so every object it draws advances in
+sub-frame steps -- but the VR seat is composed from THIS pose, exported once
+per game frame, and therefore steps only at game-frame boundaries. Relative to
+the seat a nearby kart alternates on-time / half-a-frame-ahead on every
+present: a monocular, un-screenshottable, speed- and parallax-proportional
+double image, which is exactly what the user reported on 1.0.0.13. The seat has
+to be interpolated with the SAME t as the walk it is composed for, and that
+needs the frame it is interpolating FROM.
+  gSohVRKartPosPrev[3] -- the kart position exported for the previous game
+    frame, published inside the SAME seqlock as the current one so the consumer
+    gets a coherent PAIR or neither.
+  gSoh3DCamEyePrev[3]  -- the chase camera's previous eye position, for the
+    modes whose seat is the camera (third person, Diorama, and first person's
+    no-kart fallback).
+Nothing else changes: the shell differences them, the ENGINE applies the
+difference scaled by the walk's own t (overlay 0044 rev13), and `vr set
+seatinterp 0` restores 1.0.0.13 exactly.
+REV7 (R17-C, from the R17-A code review): THE SEED. rev6 set prev = cur
+UNCONDITIONALLY on every export, so the FIRST export after a discontinuity
+paired this game frame's pose with a pose from whenever the site last ran --
+the last frame of the previous race, the frame before a Lakitu respawn, the
+frame before a menu. 0044 rev13's only protection was the 400-unit teleport
+heuristic, and a race restart or a retry respawns on the grid, which is near
+the finish line the previous export left the kart on: a delta UNDER 400 units
+that is not a frame of travel at all, spent as a one-frame seat nudge of up to
+400*(1-t). R16-A was a whole round about a one-frame seat jump reading as a
+violent snap in the headset, so this is not cosmetic.
+So each export site now remembers the game frame it last ran on and SEEDS
+prev = cur -- a zero delta, no interpolation, exactly the rev5 behaviour for
+that one frame -- whenever this export is the first of the process, the first
+after `gSohVRKartValid` went 0 -> 1, or the first after a game-frame
+discontinuity (`gSohVRGameFrame != last + 1`: a menu, a fly-by, a pause, a
+restart, or the R16-A hole fault). The bookkeeping is a file-scope static per
+TU, which is also correct across the GameCamera <-> TourCamera hand-over: a
+fly-by cut is a discontinuity for the camera basis too.
+  gSohVRSeatSeeds       counts the seeded exports (the "it is in the path" line).
+  gSohVRSeatSeedFault   the RED CONTROL / fault injector. 0 = shipping.
+    1 = rev6 exactly: never seed. N > 1 = never seed AND fabricate a stale prev
+    N units away on the first export after a discontinuity, so the defect has a
+    KNOWN magnitude instead of depending on where the last race happened to end
+    (trap D11: an assert that can only NOT see something is worthless).
+REV8 (R21 item 2, THE REAR PANE'S GHOSTS): the look-behind camera export gains
+the same PREVIOUS value the kart and the chase camera got in rev6, seeded the
+same way as rev7 (prev = cur on the first export of the process and after any
+game-frame discontinuity), inside the same seqlock as the current pose so the
+consumer reads a coherent pair or neither. the user on 1.0.1.19: the ghosts R18
+removed from the forward view are still in the REAR-VIEW pane. The pane's view
+was built around this export (game frame N) on every walk, while every object
+in the list is drawn at FrameInterpolation's sub-frame t -- so the pane camera
+stepped at game rate while the world glided, which is R17-A's ghost exactly,
+and its pre-multiply made it worse (VR-R21-NOTES §2). 0044 rev16 interpolates
+the pane camera along (prev, cur) with the walk's own t.
+  gSohVRRearPosPrev[3] -- the look-behind camera's previous eye position.
+  gSohVRRearSeeds      -- its seeded exports (own counter; rev7's is the seat's).
+
 All exports write shell-owned globals (SohIosShell.m); extern "C" decls
 at FILE scope in the C++ TUs (block-scope externs namespace-mangle — the
 project's recurring linkage trap). __IOS__-guarded: the macOS build
@@ -32,7 +138,7 @@ builds this vendor and links no shell.
 
 --- a/src/engine/cameras/GameCamera.cpp
 +++ b/src/engine/cameras/GameCamera.cpp
-@@ -80,6 +80,48 @@
+@@ -80,6 +80,192 @@
      return &LookAtMatrix;
  }
  
@@ -42,8 +148,24 @@ builds this vendor and links no shell.
 +// FILE-scope extern "C" — block-scope externs namespace-mangle in C++.
 +extern "C" {
 +extern volatile float gSoh3DCamDist, gSoh3DCamP00;
++// rev5 (R16-C): the GAME's own projection aspect. The rear pane's
++// framebuffer was sized off the EYE extent, on a comment claiming the
++// two matched; they do not (sim eye 1.778, device 1.246, game 1.3333).
++extern volatile float gSoh3DCamAspect;
 +extern volatile float gSoh3DCamRight[3], gSoh3DCamFwd[3], gSoh3DCamEye[3];
++// rev6 (R17-A item 1): the PREVIOUS game frame's camera eye. The seat is
++// composed from a pose exported once per game frame while every object in
++// the list is drawn at FrameInterpolation's sub-frame t; this is the other
++// end of the segment the seat has to be interpolated along.
++extern volatile float gSoh3DCamEyePrev[3];
++// rev7 (R17-C): the seed. See the patch header.
++extern volatile unsigned int gSohVRGameFrame, gSohVRSeatSeeds;
++extern volatile float gSohVRSeatSeedFault;
 +}
++// rev7: per-TU, and deliberately so -- a GameCamera <-> TourCamera
++// hand-over is a shot cut, which is exactly a discontinuity.
++static unsigned int sSoh3DCamLastFrame = 0u;
++static int sSoh3DCamSeeded = 0;
 +static void Soh3DExportCameraBasis(Camera* sohCam, float sohAspect) {
 +    if (sohCam == NULL || sohCam->playerId != 0) {
 +        return; // player 1 only — split-screen order is winner-dependent
@@ -69,42 +191,190 @@ builds this vendor and links no shell.
 +    gSoh3DCamFwd[0] = sohFx;
 +    gSoh3DCamFwd[1] = sohFy;
 +    gSoh3DCamFwd[2] = sohFz;
++    // rev6: prev, before it is overwritten. rev7: SEEDED (prev = cur) on the
++    // first export of the process and after any game-frame discontinuity --
++    // otherwise the pose from before a menu or a fly-by is differenced
++    // against this one and spent as a one-frame seat nudge.
++    const unsigned int sohFr = gSohVRGameFrame;
++    const int sohDisc = (!sSoh3DCamSeeded) || (sohFr != sSoh3DCamLastFrame + 1u);
++    if (sohDisc && gSohVRSeatSeedFault <= 0.0f) {
++        gSoh3DCamEyePrev[0] = sohCam->pos[0];
++        gSoh3DCamEyePrev[1] = sohCam->pos[1];
++        gSoh3DCamEyePrev[2] = sohCam->pos[2];
++        gSohVRSeatSeeds = gSohVRSeatSeeds + 1u;
++    } else if (sohDisc && gSohVRSeatSeedFault > 1.0f) {
++        gSoh3DCamEyePrev[0] = sohCam->pos[0] + gSohVRSeatSeedFault;
++        gSoh3DCamEyePrev[1] = sohCam->pos[1];
++        gSoh3DCamEyePrev[2] = sohCam->pos[2];
++    } else {
++        gSoh3DCamEyePrev[0] = gSoh3DCamEye[0];
++        gSoh3DCamEyePrev[1] = gSoh3DCamEye[1];
++        gSoh3DCamEyePrev[2] = gSoh3DCamEye[2];
++    }
++    sSoh3DCamLastFrame = sohFr;
++    sSoh3DCamSeeded = 1;
 +    gSoh3DCamEye[0] = sohCam->pos[0];
 +    gSoh3DCamEye[1] = sohCam->pos[1];
 +    gSoh3DCamEye[2] = sohCam->pos[2];
 +    float sohHalfFovX = tanf(sohCam->fieldOfView * 0.5f * (3.14159265f / 180.0f)) * sohAspect;
 +    gSoh3DCamP00 = (sohHalfFovX > 1e-4f) ? (1.0f / sohHalfFovX) : 1.0f;
 +    gSoh3DCamDist = sohDist;
++    gSoh3DCamAspect = sohAspect;
++}
++#endif
++
++#ifdef __IOS__
++// SOH_IOS (overlay 0045 rev2): player-1 kart pose for the VR first-person
++// seat. MK64's camera lookAt is a target AHEAD of the kart, so the camera
++// basis alone cannot place a driver's head; this is the kart itself.
++extern "C" {
++extern volatile float gSohVRKartPos[3], gSohVRKartVel[3];
++// SOH_IOS (overlay 0045 rev6, VR R17-A item 1): the kart position exported
++// for the PREVIOUS game frame, published inside this same seqlock so a
++// consumer gets a coherent pair or neither. See the patch header.
++extern volatile float gSohVRKartPosPrev[3];
++extern volatile int gSohVRKartYawBam, gSohVRKartValid;
++// SOH_IOS (overlay 0045 rev4, VR R16-A): the SEQLOCK. rev2 published this
++// pose as five independent stores guarded by a flag that was CLEARED at
++// the head of every game frame and re-raised here, mid-frame -- so a
++// 90-120 Hz consumer reading in the gap was told there was no kart while a
++// kart was being raced, and composed the world from the chase camera for
++// one frame. gSohVRKartSeq is odd while this function is writing and even
++// when the snapshot is whole; gSohVRKartFrame names the game frame it
++// belongs to, and the consumer expresses "no kart" as an AGE instead of a
++// hole. It also closes a genuine torn read: three position floats stored
++// non-atomically and consumed at four times this rate.
++extern volatile unsigned int gSohVRKartSeq, gSohVRKartFrame, gSohVRGameFrame;
++// R16-A FAL-B's RED CONTROL: skip the export for N CONSECUTIVE game frames
++// out of every 16, so the staleness bound can be shown HOLDING for a burst
++// no longer than the bound and LETTING GO for one that is. Consecutive is
++// the point: a single missed frame is what the old mid-frame clear caused
++// and the bound absorbs it by design, so a one-in-N fault could never
++// discriminate. 0 = off, which is every shipped configuration.
++extern volatile int gSohVRKartHoleFault;
++// rev7 (R17-C): the seed. See the patch header.
++extern volatile unsigned int gSohVRSeatSeeds;
++extern volatile float gSohVRSeatSeedFault;
++}
++static unsigned int sSohVRKartLastFrame = 0u;
++static int sSohVRKartSeeded = 0;
++static void SohVRExportKartPose(Camera* sohCam) {
++    if (sohCam == NULL || sohCam->playerId != 0 || gPlayerOne == NULL) {
++        return;
++    }
++    if (gSohVRKartHoleFault > 0 &&
++        (gSohVRGameFrame % 16u) < (unsigned int) gSohVRKartHoleFault) {
++        return; /* R16-A red control: a deliberate burst of missed frames */
++    }
++    Player* sohP = gPlayerOne;
++    gSohVRKartSeq = gSohVRKartSeq + 1u; /* odd: write in progress */
++    __sync_synchronize();
++    /* rev6: prev, before overwriting. rev7: SEEDED (prev = cur) whenever this
++     * export is the first of the process, the first after validity went
++     * 0 -> 1, or the first after a game-frame discontinuity -- a menu, a
++     * fly-by, a pause, a race restart or the R16-A hole fault. Without it
++     * the grid pose is differenced against the pose the LAST race ended on,
++     * and a finish line is near the grid, so the 400-unit teleport heuristic
++     * in 0044 rev13 does not catch it. */
++    const unsigned int sohKFr = gSohVRGameFrame;
++    const int sohKDisc = (!sSohVRKartSeeded) || (!gSohVRKartValid) ||
++                         (sohKFr != sSohVRKartLastFrame + 1u);
++    if (sohKDisc && gSohVRSeatSeedFault <= 0.0f) {
++        gSohVRKartPosPrev[0] = sohP->pos[0];
++        gSohVRKartPosPrev[1] = sohP->pos[1];
++        gSohVRKartPosPrev[2] = sohP->pos[2];
++        gSohVRSeatSeeds = gSohVRSeatSeeds + 1u;
++    } else if (sohKDisc && gSohVRSeatSeedFault > 1.0f) {
++        /* the fault injector: a stale prev of a KNOWN size */
++        gSohVRKartPosPrev[0] = sohP->pos[0] + gSohVRSeatSeedFault;
++        gSohVRKartPosPrev[1] = sohP->pos[1];
++        gSohVRKartPosPrev[2] = sohP->pos[2];
++    } else {
++        gSohVRKartPosPrev[0] = gSohVRKartPos[0];
++        gSohVRKartPosPrev[1] = gSohVRKartPos[1];
++        gSohVRKartPosPrev[2] = gSohVRKartPos[2];
++    }
++    sSohVRKartLastFrame = sohKFr;
++    sSohVRKartSeeded = 1;
++    gSohVRKartPos[0] = sohP->pos[0];
++    gSohVRKartPos[1] = sohP->pos[1];
++    gSohVRKartPos[2] = sohP->pos[2];
++    gSohVRKartVel[0] = sohP->velocity[0];
++    gSohVRKartVel[1] = sohP->velocity[1];
++    gSohVRKartVel[2] = sohP->velocity[2];
++    // REV3 (R8): NEGATED. `player->rotation[1]` does NOT share the
++    // camera's atan2s convention — rev2's citation (camera.c:1281) is a
++    // one-off STAGING camera assignment, not the racing convention, and
++    // it is the whole of the user's inverted-orbit steering bug.
++    // GROUND TRUTH, from the physics rather than from any angle:
++    // func_8002AE38 (src/player_controller.c:1115) integrates the kart's
++    // own position with
++    //     x += sins(-player->rotation[1]) * speed;
++    //     z += coss(-player->rotation[1]) * speed;
++    // and calculate_orientation_matrix's rot-Y (racing/math_util.c:616)
++    // maps the kart model's +Z to (-sin(rot1), 0, cos(rot1)) — the same
++    // vector. So the kart's world forward is (sins(-rot1), coss(-rot1)),
++    // while atan2s(x, z) (racing/math_util.c:900) returns the angle whose
++    // forward is (+sin, +cos). The two conventions are MIRRORED.
++    // Everything downstream of this export (the shell's A composition,
++    // gSohVREyeYawBam's atan2f(x, z) re-key, 0051's sky/billboard
++    // re-key) speaks the atan2s convention, so the conversion happens
++    // ONCE, here, at the boundary.
++    gSohVRKartYawBam = (int) (s16) (-(s32) (s16) sohP->rotation[1]);
++    gSohVRKartFrame = gSohVRGameFrame; /* rev4: the frame this belongs to */
++    __sync_synchronize();
++    gSohVRKartSeq = gSohVRKartSeq + 1u; /* even: the snapshot is whole */
++    gSohVRKartValid = 1;
 +}
 +#endif
 +
  void GameCamera::SetViewProjection() {
      u16 perspNorm;
  
-@@ -100,5 +142,9 @@
+@@ -100,5 +286,11 @@
      gSPMatrix(gDisplayListHead++, &LookAtMatrix,
                G_MTX_NOPUSH | G_MTX_MUL | G_MTX_PROJECTION);
  
 +#ifdef __IOS__
 +    // SOH_IOS (overlay 0045): export at the exact values guLookAt consumed.
 +    Soh3DExportCameraBasis(_camera, gScreenAspect);
++    // SOH_IOS (overlay 0045 rev2): and the kart the VR seat belongs in.
++    SohVRExportKartPose(_camera);
 +#endif
      FrameInterpolation_RecordCloseChild();
  }
 --- a/src/engine/cameras/TourCamera.cpp
 +++ b/src/engine/cameras/TourCamera.cpp
-@@ -184,6 +184,48 @@
-     return bTourComplete;
- }
+@@ -182,7 +182,88 @@
  
+ bool TourCamera::IsTourComplete() {
+     return bTourComplete;
++}
++
 +#ifdef __IOS__
 +#include <math.h>
 +// SOH_IOS (overlay 0045): live camera basis for stereoscopic 3D (0044).
 +// FILE-scope extern "C" — block-scope externs namespace-mangle in C++.
 +extern "C" {
 +extern volatile float gSoh3DCamDist, gSoh3DCamP00;
++// rev5 (R16-C): the GAME's own projection aspect. The rear pane's
++// framebuffer was sized off the EYE extent, on a comment claiming the
++// two matched; they do not (sim eye 1.778, device 1.246, game 1.3333).
++extern volatile float gSoh3DCamAspect;
 +extern volatile float gSoh3DCamRight[3], gSoh3DCamFwd[3], gSoh3DCamEye[3];
++// rev6 (R17-A item 1): the PREVIOUS game frame's camera eye. The seat is
++// composed from a pose exported once per game frame while every object in
++// the list is drawn at FrameInterpolation's sub-frame t; this is the other
++// end of the segment the seat has to be interpolated along.
++extern volatile float gSoh3DCamEyePrev[3];
++// rev7 (R17-C): the seed. See the patch header.
++extern volatile unsigned int gSohVRGameFrame, gSohVRSeatSeeds;
++extern volatile float gSohVRSeatSeedFault;
 +}
++// rev7: per-TU, and deliberately so -- a GameCamera <-> TourCamera
++// hand-over is a shot cut, which is exactly a discontinuity.
++static unsigned int sSoh3DCamLastFrame = 0u;
++static int sSoh3DCamSeeded = 0;
 +static void Soh3DExportCameraBasis(Camera* sohCam, float sohAspect) {
 +    if (sohCam == NULL || sohCam->playerId != 0) {
 +        return; // player 1 only — split-screen order is winner-dependent
@@ -130,19 +400,41 @@ builds this vendor and links no shell.
 +    gSoh3DCamFwd[0] = sohFx;
 +    gSoh3DCamFwd[1] = sohFy;
 +    gSoh3DCamFwd[2] = sohFz;
++    // rev6: prev, before it is overwritten. rev7: SEEDED (prev = cur) on the
++    // first export of the process and after any game-frame discontinuity --
++    // otherwise the pose from before a menu or a fly-by is differenced
++    // against this one and spent as a one-frame seat nudge.
++    const unsigned int sohFr = gSohVRGameFrame;
++    const int sohDisc = (!sSoh3DCamSeeded) || (sohFr != sSoh3DCamLastFrame + 1u);
++    if (sohDisc && gSohVRSeatSeedFault <= 0.0f) {
++        gSoh3DCamEyePrev[0] = sohCam->pos[0];
++        gSoh3DCamEyePrev[1] = sohCam->pos[1];
++        gSoh3DCamEyePrev[2] = sohCam->pos[2];
++        gSohVRSeatSeeds = gSohVRSeatSeeds + 1u;
++    } else if (sohDisc && gSohVRSeatSeedFault > 1.0f) {
++        gSoh3DCamEyePrev[0] = sohCam->pos[0] + gSohVRSeatSeedFault;
++        gSoh3DCamEyePrev[1] = sohCam->pos[1];
++        gSoh3DCamEyePrev[2] = sohCam->pos[2];
++    } else {
++        gSoh3DCamEyePrev[0] = gSoh3DCamEye[0];
++        gSoh3DCamEyePrev[1] = gSoh3DCamEye[1];
++        gSoh3DCamEyePrev[2] = gSoh3DCamEye[2];
++    }
++    sSoh3DCamLastFrame = sohFr;
++    sSoh3DCamSeeded = 1;
 +    gSoh3DCamEye[0] = sohCam->pos[0];
 +    gSoh3DCamEye[1] = sohCam->pos[1];
 +    gSoh3DCamEye[2] = sohCam->pos[2];
 +    float sohHalfFovX = tanf(sohCam->fieldOfView * 0.5f * (3.14159265f / 180.0f)) * sohAspect;
 +    gSoh3DCamP00 = (sohHalfFovX > 1e-4f) ? (1.0f / sohHalfFovX) : 1.0f;
 +    gSoh3DCamDist = sohDist;
-+}
++    gSoh3DCamAspect = sohAspect;
+ }
 +#endif
-+
+ 
  void TourCamera::SetViewProjection() {
      u16 perspNorm;
-     Mat4 matrix;
-@@ -209,6 +251,13 @@
+@@ -209,6 +290,13 @@
      gSPMatrix(gDisplayListHead++, &LookAtMatrix, G_MTX_NOPUSH | G_MTX_MUL | G_MTX_PROJECTION);
      FrameInterpolation_RecordCloseChild();
  
@@ -156,9 +448,110 @@ builds this vendor and links no shell.
      gDPPipeSync(gDisplayListHead++);
  }
  
+--- a/src/engine/cameras/LookBehindCamera.cpp
++++ b/src/engine/cameras/LookBehindCamera.cpp
+@@ -29,6 +29,87 @@
+     _camera->unk_3C[2] = -_camera->unk_3C[2];
+ }
+ 
++#ifdef __IOS__
++#include <math.h>
++// SOH_IOS (overlay 0045 rev5, VR R16-C): MK64's OWN look-behind camera,
++// exported for the VR rear-view pane. 0044's pane used to pre-multiply a
++// 180-degree rotation about `camEye + camFwd*camDist`, which is the chase
++// camera's LOOK-AT POINT -- a target 70 units AHEAD of the kart -- so the
++// pane camera sat 140 units in front of where a mirror belongs and the
++// bottom half of the pane showed the road AHEAD, reversed. This is the
++// camera the game itself uses for C-left: same height above the kart, same
++// pitch, same FOV, same smoothing, same wall pushout, and free.
++// SEQLOCK + frame stamp, not a validity flag (trap D40): the consumer is a
++// 90-120 Hz compositor reading three floats a 30 Hz writer stores.
++extern "C" {
++extern volatile float gSohVRRearPos[3], gSohVRRearAt[3], gSohVRRearUp[3];
++extern volatile int gSohVRRearValid;
++extern volatile unsigned int gSohVRRearSeq, gSohVRRearFrame, gSohVRGameFrame;
++// rev8 (R21 item 2): the PREVIOUS game frame's look-behind eye, published
++// inside the same seqlock, seeded on a discontinuity exactly like rev7's
++// kart and camera pairs. The pane interpolates along it (0044 rev16).
++extern volatile float gSohVRRearPosPrev[3];
++extern volatile unsigned int gSohVRRearSeeds;
++}
++static unsigned int sSohVRRearLastFrame = 0u;
++static int sSohVRRearSeeded = 0;
++static void SohVRExportRearCamera(Camera* sohCam) {
++    if (sohCam == NULL || sohCam->playerId != 0) {
++        return; // player 1 only, exactly like every other 0045 export
++    }
++    float sohDx = sohCam->lookAt[0] - sohCam->pos[0];
++    float sohDy = sohCam->lookAt[1] - sohCam->pos[1];
++    float sohDz = sohCam->lookAt[2] - sohCam->pos[2];
++    if ((sohDx * sohDx + sohDy * sohDy + sohDz * sohDz) <= 1e-6f) {
++        return; // degenerate: keep the last good rear pose
++    }
++    gSohVRRearSeq = gSohVRRearSeq + 1u; /* odd: write in progress */
++    __sync_synchronize();
++    /* rev8: prev before overwriting; SEEDED (prev = cur) on the first
++     * export and after a game-frame discontinuity -- a menu, a fly-by, a
++     * pause, a restart -- so a pose from before it is never differenced
++     * against this one (rev7's reasoning, verbatim).
++     * UNLIKE the kart and chase-camera sites this one runs per logic TICK,
++     * and MK64 ticks twice per game frame (60 Hz logic, 30 Hz frames: trap
++     * A1's engine_fps=30 / tick_tps=60). The first build of rev8 treated the
++     * second tick of a frame as a discontinuity and seeded prev = cur every
++     * frame -- the pane then had no segment at all and read 0.5 of a step
++     * (R17-A's ghost) instead of 0. prev is the LAST export of the PREVIOUS
++     * game frame: a second tick in the same frame refreshes cur only. */
++    {
++        const unsigned int sohRFr = gSohVRGameFrame;
++        const int sohRSame = sSohVRRearSeeded && gSohVRRearValid && (sohRFr == sSohVRRearLastFrame);
++        const int sohRDisc = (!sSohVRRearSeeded) || (!gSohVRRearValid) ||
++                             ((sohRFr != sSohVRRearLastFrame + 1u) && !sohRSame);
++        if (sohRDisc) {
++            for (int sohI = 0; sohI < 3; sohI++) {
++                gSohVRRearPosPrev[sohI] = sohCam->pos[sohI];
++            }
++            gSohVRRearSeeds = gSohVRRearSeeds + 1u;
++        } else if (!sohRSame) {
++            for (int sohI = 0; sohI < 3; sohI++) {
++                gSohVRRearPosPrev[sohI] = gSohVRRearPos[sohI];
++            }
++        }
++        sSohVRRearLastFrame = sohRFr;
++        sSohVRRearSeeded = 1;
++    }
++    gSohVRRearPos[0] = sohCam->pos[0];
++    gSohVRRearPos[1] = sohCam->pos[1];
++    gSohVRRearPos[2] = sohCam->pos[2];
++    gSohVRRearAt[0] = sohCam->lookAt[0];
++    gSohVRRearAt[1] = sohCam->lookAt[1];
++    gSohVRRearAt[2] = sohCam->lookAt[2];
++    gSohVRRearUp[0] = sohCam->up[0];
++    gSohVRRearUp[1] = sohCam->up[1];
++    gSohVRRearUp[2] = sohCam->up[2];
++    gSohVRRearFrame = gSohVRGameFrame;
++    __sync_synchronize();
++    gSohVRRearSeq = gSohVRRearSeq + 1u; /* even: the snapshot is whole */
++    gSohVRRearValid = 1;
++}
++#endif
++
+ void LookBehindCamera::Tick() {
+     if (!bActive) { return; }
+ 
+@@ -38,4 +119,10 @@
+     }
+ 
+     func_8001EE98(&gPlayers[_camera->playerId], _camera, _camera->cameraId);
++#ifdef __IOS__
++    // SOH_IOS (overlay 0045 rev5): export AFTER the tick, so pos/lookAt
++    // are this frame's -- the same values guLookAt would consume if the
++    // player were holding C-left.
++    SohVRExportRearCamera(_camera);
++#endif
+ }
 --- a/src/main.c
 +++ b/src/main.c
-@@ -826,8 +826,23 @@
+@@ -826,8 +826,39 @@
   * until the state changes (ie. Exit menus and start a race).
   */
  
@@ -166,6 +559,21 @@ builds this vendor and links no shell.
 +/* SOH_IOS (overlay 0045): stereo comfort flags for 0044 (shell-owned
 + * globals). C TU — plain extern, no mangling concerns. */
 +extern volatile int gSoh3DPaused, gSoh3DInPlay;
++/* rev2: cleared at the head of EVERY frame; GameCamera's player-1
++ * export site re-raises it. A frame with no racing camera (menus,
++ * fly-by, podium) therefore reports no kart, and the VR seat falls
++ * back to the camera-derived placement instead of sitting in a
++ * kart that is not on screen. */
++extern volatile int gSohVRKartValid;
++/* rev4 (R16-A): the clear is GONE. See the seqlock note in
++ * GameCamera.cpp — clearing validity here made "there is no kart"
++ * true for the whole of every game update, and a compositor frame
++ * landing in that hole snapped the world onto the chase camera. This
++ * counter replaces it: it advances once per game frame in every
++ * state, so the consumer can bound how OLD the last exported kart
++ * pose is and fall back when the game stops racing — which is all
++ * the clear was ever for. */
++extern volatile unsigned int gSohVRGameFrame;
 +#endif
 +
  void game_state_handler(void) {
@@ -178,6 +586,7 @@ builds this vendor and links no shell.
 +    gSoh3DPaused = (gIsGamePaused != 0);
 +    gSoh3DInPlay = (gGamestate == RACING) && (gActiveScreenMode == SCREEN_MODE_1P) &&
 +                   (gIsInQuitToMenuTransition == 0);
++    gSohVRGameFrame = gSohVRGameFrame + 1u; /* rev4: the staleness clock */
 +#endif
  
  #if DVDL

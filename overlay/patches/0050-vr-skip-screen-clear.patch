@@ -1,0 +1,45 @@
+Overlay patch 0050: skip MK64's opaque screen fill in VR world frames.
+
+R0 finding 3 read the symptom right — the diorama sits in a black rectangle
+instead of in the room — but only half the cause. Clearing the eye
+framebuffers to alpha 0 (0044) is necessary and not sufficient: MK64 paints
+its own full-screen opaque black quad over them a moment later.
+`clear_framebuffer(0)` runs from the TOP of the game loop, every frame, in
+every game state (main.c, just before game_state_handler), and Fast3D
+renders it as a real full-screen fill — alpha 1, depth untouched. Measured,
+not guessed: the R1 blit diagnostics (`vr set dbg 2` / `dbg 3`) show engine
+depth still at the clear value across the whole background while the alpha
+channel is 1 everywhere, which is exactly the signature of a fill drawn with
+depth writes off.
+
+In VR world frames the fill has no job to do — the engine already cleared
+the eye framebuffer at the head of the pass, and what the fill would erase
+is precisely the passthrough we want to keep. Guarded on gSohVRWorldActive,
+so flat, 3D-panel and the VR panel fallback all keep the stock clear.
+
+Patched in the function rather than at the call site so every caller is
+covered by construction (there are five, across menus, racing and the
+credits) and no future one can slip past.
+
+
+--- a/src/main.c
++++ b/src/main.c
+@@ -459,6 +459,18 @@
+ // clear_frame_buffer from SM64, with a few edits
+ //! @todo Why did void* work for matching
+ void* clear_framebuffer(s32 color) {
++#ifdef __IOS__
++    /* SOH_IOS (overlay 0050): in VR world frames the eye framebuffer was
++     * already cleared — to alpha 0 (overlay 0044) — at the head of the pass,
++     * and this full-screen opaque fill would paint the room back out again.
++     * Every other mode keeps the stock clear. */
++    {
++        extern volatile int gSohVRWorldActive;
++        if (gSohVRWorldActive) {
++            return NULL;
++        }
++    }
++#endif
+     gDPPipeSync(gDisplayListHead++);
+ 
+     gDPSetRenderMode(gDisplayListHead++, G_RM_OPA_SURF, G_RM_OPA_SURF2);

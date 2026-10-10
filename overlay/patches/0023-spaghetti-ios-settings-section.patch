@@ -4,7 +4,7 @@ SpaghettiKart's PortMenu) + game-side consumers for two of its knobs.
 - PortMenu.cpp: "iOS" sidebar in Settings — Touch Controls (Hold to Lock
   A & Z per the MK64 policy, Haptics, Opacity, Left-Handed, Stick
   Response, Customize Layout…), Display (Max Frame Rate 60/120,
-  Performance HUD), Menu (Menu Scale LIVE), Advanced (Remote Console
+  Performance HUD), Menu (Menu Scale LIVE, Always Show Menu Button), Advanced (Remote Console
   :8768 — emitted inside `#if SOH_REMOTE_CONSOLE`, the SAME macro that
   gates the bridge itself in SohIosShell.m, so a public build carries
   neither the listener nor a toggle that would do nothing; see D9/D-040
@@ -21,11 +21,10 @@ Kart deltas vs reference 0017: no RaceDisable in this menu framework
 
 --- a/src/port/ui/PortMenu.cpp
 +++ b/src/port/ui/PortMenu.cpp
-@@ -88,6 +88,15 @@
-     }
+@@ -89,6 +89,21 @@
      return widget;
  }
-+
+ 
 +#ifdef __IOS__
 +#include <TargetConditionals.h> // TARGET_OS_VISION gates below (rev3)
 +// SOH_IOS (overlay 0023): boot value of the menu scale, so the slider
@@ -33,11 +32,18 @@ Kart deltas vs reference 0017: no RaceDisable in this menu framework
 +// per-frame multiply in Menu.cpp). Captured while the menu is built,
 +// before the user can touch the slider.
 +static float sSohIosPrevMenuScale = 0.85f;
++// SOH_IOS (overlay 0023 rev5, VR-spec D10): the VR settings seam. Defined
++// in SohIosShell.m, which is compiled on EVERY target — on iPhone it is a
++// no-op, on visionOS it forwards to the VR module's CVar -> per-mode-config
++// apply. Declared here rather than in a header because the shell has no
++// header the game side includes.
++extern "C" void SohVRSettings_Changed(void);
 +#endif
- 
++
  void PortMenu::AddSettings() {
      // Add Settings menu
-@@ -369,6 +378,130 @@
+     AddMenuEntry("Settings", "gSettings.Menu.SettingsSidebarSection");
+@@ -354,6 +369,227 @@
          .CVar(CVAR_CONTROLLER_CONFIGURATION_WINDOW_OPEN)
          .WindowName("Input Editor")
          .Options(ButtonOptions().Tooltip("Enables the separate Bindings Window.").Size(Sizes::Inline));
@@ -154,6 +160,103 @@ Kart deltas vs reference 0017: no RaceDisable in this menu framework
 +                     .Min(0.6f)
 +                     .Max(1.2f)
 +                     .DefaultValue(0.85f));
++    // DECISIONS.md D10 (reference D-083): keep the menu button on screen during gameplay
++    // too (the shell's menuButtonVisible reads this live).
++    AddWidget(path, "Always Show Menu Button", WIDGET_CVAR_CHECKBOX)
++        .CVar("gSohIos.MenuAlwaysVisible")
++        .Options(CheckboxOptions()
++                     .Tooltip("Keep the menu button on screen during gameplay instead of only at the title "
++                              "screen and pause menu.")
++                     .DefaultValue(false));
++
++#if TARGET_OS_VISION
++    // SOH_IOS (overlay 0023 rev5, VR-spec D10): the Vision Pro VR group.
++    // Every row is backed by the shell's per-mode VR config store — the CVar
++    // is the PERSISTENCE, the store is the live state, and SohVRSettings_
++    // Changed() is the one seam between them (it is defined in SohIosShell.m
++    // on every target and forwards to the VR module only on visionOS, because
++    // SohImmersive.m is a visionOS-only source).
++    AddWidget(path, "Vision Pro VR", WIDGET_SEPARATOR_TEXT);
++    static std::unordered_map<int32_t, const char*> sohVrViewOptions = { { 0, "Diorama" },
++                                                                         { 1, "First Person" },
++                                                                         { 2, "Third Person" } };
++    AddWidget(path, "View Mode", WIDGET_CVAR_COMBOBOX)
++        .CVar("gSohVR.ViewMode")
++        .Callback([](WidgetInfo& info) { SohVRSettings_Changed(); })
++        .Options(ComboboxOptions()
++                     .ComboMap(sohVrViewOptions)
++                     .Tooltip("Which view VR opens in. First Person seats you in the kart; Third Person places "
++                              "you behind it at model scale; Diorama puts the whole track on your table.")
++                     .DefaultIndex(1));
++    AddWidget(path, "Surroundings: First Person", WIDGET_CVAR_SLIDER_FLOAT)
++        .CVar("gSohVR.Dim.Fp")
++        .Callback([](WidgetInfo& info) { SohVRSettings_Changed(); })
++        .Options(FloatSliderOptions()
++                     .Tooltip("How much of your room is dimmed out around the game, in first person. 0% is full "
++                              "passthrough; 100% is a dark room.")
++                     .IsPercentage()
++                     .Min(0.0f)
++                     .Max(1.0f)
++                     .DefaultValue(1.0f));
++    AddWidget(path, "Surroundings: Third Person", WIDGET_CVAR_SLIDER_FLOAT)
++        .CVar("gSohVR.Dim.Third")
++        .Callback([](WidgetInfo& info) { SohVRSettings_Changed(); })
++        .Options(FloatSliderOptions().IsPercentage().Min(0.0f).Max(1.0f).DefaultValue(1.0f));
++    AddWidget(path, "Surroundings: Diorama", WIDGET_CVAR_SLIDER_FLOAT)
++        .CVar("gSohVR.Dim.Diorama")
++        .Callback([](WidgetInfo& info) { SohVRSettings_Changed(); })
++        .Options(FloatSliderOptions()
++                     .Tooltip("Diorama defaults to full passthrough - the track sits in your real room.")
++                     .IsPercentage()
++                     .Min(0.0f)
++                     .Max(1.0f)
++                     .DefaultValue(0.0f));
++    AddWidget(path, "Fixed Horizon", WIDGET_CVAR_CHECKBOX)
++        .CVar("gSohVR.FixedHorizon")
++        .Callback([](WidgetInfo& info) { SohVRSettings_Changed(); })
++        .Options(CheckboxOptions()
++                     .Tooltip("Keeps the world level and still when your kart spins out or tumbles - the kart "
++                              "spins under you instead of taking your head with it. Turn it off for the "
++                              "authentic (and much more intense) ride.")
++                     .DefaultValue(true));
++    AddWidget(path, "Rear-View Auto-Show", WIDGET_CVAR_CHECKBOX)
++        .CVar("gSohVR.MirrorAuto")
++        .Callback([](WidgetInfo& info) { SohVRSettings_Changed(); })
++        .Options(CheckboxOptions()
++                     .Tooltip("Pops the rear-view pane up for three seconds whenever you put an item out behind "
++                              "you. Hold D-pad Down any time to bring it up by hand.")
++                     .DefaultValue(true));
++    AddWidget(path, "HUD Distance", WIDGET_CVAR_SLIDER_FLOAT)
++        .CVar("gSohVR.HudDist")
++        .Callback([](WidgetInfo& info) { SohVRSettings_Changed(); })
++        .Options(FloatSliderOptions()
++                     .Tooltip("How far ahead of you the lap/time/minimap panel floats, in metres.")
++                     .Min(0.5f)
++                     .Max(4.0f)
++                     .Format("%.2f m")
++                     .DefaultValue(1.4f));
++    AddWidget(path, "HUD Height", WIDGET_CVAR_SLIDER_FLOAT)
++        .CVar("gSohVR.HudHeight")
++        .Callback([](WidgetInfo& info) { SohVRSettings_Changed(); })
++        .Options(FloatSliderOptions().Min(-1.5f).Max(1.5f).Format("%.2f m").DefaultValue(-0.3f));
++    AddWidget(path, "HUD Scale", WIDGET_CVAR_SLIDER_FLOAT)
++        .CVar("gSohVR.HudScale")
++        .Callback([](WidgetInfo& info) { SohVRSettings_Changed(); })
++        .Options(FloatSliderOptions().IsPercentage().Min(0.3f).Max(2.0f).DefaultValue(0.9f));
++    AddWidget(path, "Eye Render Scale", WIDGET_CVAR_SLIDER_FLOAT)
++        .CVar("gSohVR.EyeScale")
++        .Callback([](WidgetInfo& info) { SohVRSettings_Changed(); })
++        .Options(FloatSliderOptions()
++                     .Tooltip("Resolution each eye renders at, as a fraction of the headset's own. Lower it if "
++                              "a heavy track drops frames; 100% is native.")
++                     .IsPercentage()
++                     .Min(0.5f)
++                     .Max(1.0f)
++                     .DefaultValue(1.0f));
++    AddWidget(path, "Your own kart is always drawn in first person - the user's headset verdict decides "
++                    "whether that stays.",
++              WIDGET_TEXT);
++#endif
 +
 +#if SOH_REMOTE_CONSOLE
 +    AddWidget(path, "Advanced", WIDGET_SEPARATOR_TEXT);
@@ -170,7 +273,7 @@ Kart deltas vs reference 0017: no RaceDisable in this menu framework
  
 --- a/src/port/Engine.cpp
 +++ b/src/port/Engine.cpp
-@@ -299,7 +299,20 @@
+@@ -290,7 +290,20 @@
  
  uint32_t GameEngine::GetInterpolationFPS() {
      if (CVarGetInteger("gMatchRefreshRate", 0)) {
@@ -193,7 +296,7 @@ Kart deltas vs reference 0017: no RaceDisable in this menu framework
                 !Ship::Context::GetInstance()->GetWindow()->CanDisableVerticalSync()) {
 --- a/src/port/ui/Menu.cpp
 +++ b/src/port/ui/Menu.cpp
-@@ -578,7 +578,14 @@
+@@ -564,7 +564,14 @@
          uiScale = 1.0f; // Scaling doesn't play nice with condensed menu
      }
      ImGuiIO& io = ImGui::GetIO();
@@ -208,7 +311,7 @@ Kart deltas vs reference 0017: no RaceDisable in this menu framework
  
      pos += window->WorkRect.GetSize() / 2 - menuSize / 2;
      ImGui::SetNextWindowPos(pos);
-@@ -594,22 +601,10 @@
+@@ -580,22 +587,10 @@
          headerHeight += style.ScrollbarSize;
          scrollbar = true;
      }
@@ -235,7 +338,7 @@ Kart deltas vs reference 0017: no RaceDisable in this menu framework
      ImGui::SetNextWindowSizeConstraints({ 0, headerHeight }, { headerWidth, headerHeight });
      ImVec2 headerSelSize = { menuSize.x - buttonSize.x * 3 - style.ItemSpacing.x * 3, headerHeight };
      if (scrollbar) {
-@@ -670,7 +665,25 @@
+@@ -656,7 +651,25 @@
          ImGui::PopStyleColor();
      }
      ImGui::EndChild();

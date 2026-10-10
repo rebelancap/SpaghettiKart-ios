@@ -12,12 +12,10 @@ __IOS__-only; the macOS build keeps the pristine synchronous path.
 
 --- a/libultraship/src/fast/backends/gfx_metal.cpp
 +++ b/libultraship/src/fast/backends/gfx_metal.cpp
-@@ -230,7 +230,29 @@
-     for (auto& [key, prg] : mShaderProgramPool) {
-         prg.markedForDeletion = true;
+@@ -232,6 +232,28 @@
      }
-+}
-+
+ }
+ 
 +#ifdef __IOS__
 +#include <atomic>
 +#include <chrono>
@@ -37,12 +35,13 @@ __IOS__-only; the macOS build keeps the pristine synchronous path.
 +extern "C" void SohIos_PsoWindowStats(float* ms, unsigned int* count) {
 +    *ms = (float)(sSohIosPsoWinUs.exchange(0) / 1000.0);
 +    *count = sSohIosPsoWinCount.exchange(0);
- }
++}
 +#endif
- 
++
  struct ShaderProgram* GfxRenderingAPIMetal::CreateAndLoadNewShader(uint64_t shader_id0, uint64_t shader_id1) {
      CCFeatures cc_features;
-@@ -243,6 +265,107 @@
+     gfx_cc_get_features(shader_id0, shader_id1, &cc_features);
+@@ -243,6 +265,143 @@
      MTL::VertexDescriptor* vertex_descriptor =
          gfx_metal_build_shader(buf, numFloats, cc_features, mCurrentFilterMode == FILTER_THREE_POINT);
  
@@ -132,6 +131,42 @@ __IOS__-only; the macOS build keeps the pristine synchronous path.
 +                prg->pipeline_state_variants[msaa_level] = pipeline_state;
 +            }
 +        }
++        // SOH_IOS (overlay 0035 rev2, VR / VR-spec D6): SLOT 0 of the
++        // variant table is the VR ALPHA-COVERAGE pipeline. msaa levels index
++        // 1..8, so slot 0 was always free; the VR eye and HUD framebuffers ask
++        // for it by carrying mMsaaLevel 0 (they are single-sampled either way,
++        // and every msaa_level > 1 branch in UpdateFramebufferParameters treats
++        // 0 exactly like 1).
++        //
++        // WHY: the N64 blender LUS emulates writes colour with
++        // (srcAlpha, 1-srcAlpha) but leaves DESTINATION ALPHA alone
++        // (srcAlphaFactor Zero, dstAlphaFactor One) -- correct for a screen
++        // framebuffer nobody composites, useless for one the visionOS
++        // compositor blends into the room. R1 worked around it by keying the
++        // HUD plane off luminance, which drops pure-black glyph outlines. The
++        // real fix is the standard "over" for the alpha channel:
++        //   dst_a = src_a + dst_a * (1 - src_a)
++        // so alpha accumulates true coverage. RGB blending is untouched, and
++        // no other framebuffer ever selects this variant, so the flat and
++        // 3D-panel paths keep their current state exactly.
++        if (cc_features.opt_alpha) {
++            pipeline_descriptor->colorAttachments()->object(0)->setSourceAlphaBlendFactor(MTL::BlendFactorOne);
++            pipeline_descriptor->colorAttachments()->object(0)->setDestinationAlphaBlendFactor(
++                MTL::BlendFactorOneMinusSourceAlpha);
++        }
++        pipeline_descriptor->setSampleCount(1);
++        {
++            MTL::RenderPipelineState* sohVrPipelineState =
++                mDevice->newRenderPipelineState(pipeline_descriptor, &error);
++            if (!sohVrPipelineState || error != nullptr) {
++                SPDLOG_ERROR("Failed to create VR alpha-coverage pipeline state, error {}",
++                             error != nullptr
++                                 ? error->localizedDescription()->cString(NS::UTF8StringEncoding)
++                                 : "(null)");
++            }
++            std::atomic_thread_fence(std::memory_order_release);
++            prg->pipeline_state_variants[0] = sohVrPipelineState;
++        }
 +        vertexFunc->release();
 +        fragmentFunc->release();
 +        library->release();
@@ -150,7 +185,7 @@ __IOS__-only; the macOS build keeps the pristine synchronous path.
      NS::Error* error = nullptr;
      MTL::Library* library =
          mDevice->newLibrary(NS::String::string(buf.data(), NS::UTF8StringEncoding), nullptr, &error);
-@@ -318,6 +441,7 @@
+@@ -318,6 +477,7 @@
      autorelease_pool->release();
  
      return (struct ShaderProgram*)prg;
@@ -158,7 +193,7 @@ __IOS__-only; the macOS build keeps the pristine synchronous path.
  }
  
  struct ShaderProgram* GfxRenderingAPIMetal::LookupShader(uint64_t shader_id0, uint64_t shader_id1) {
-@@ -773,10 +897,21 @@
+@@ -773,10 +933,21 @@
      }
  
      if (current_framebuffer.mLastShaderProgram != mShaderProgram) {

@@ -1,0 +1,40 @@
+Overlay patch 0049: shell-requested pause (VR-spec D8 / trap C1).
+
+Every VR exit path — the ornament, the Digital Crown, a system dismissal —
+must leave the game PAUSED, because a dismissal is frequently the first half
+of a swipe-kill and swipe-kill is SIGKILL: whatever the player was doing when
+the headset came off should still be there.
+
+The shell cannot pause MK64 by itself. The only pause entry is the START
+handler in race_logic.c, which reads the controller's buttonPressed edge, so
+the shell raises a request flag and the handler synthesises exactly that edge
+on the next tick of the pausing controller. One tick, one pause, self-clearing
+— nothing latches across a mode boundary (trap C2).
+
+Deliberately does NOT force the pause when the game is already paused, and
+does not bypass the L/R guard: it is the same code path the player's own START
+press takes, which is why it cannot desync the pause state machine.
+
+
+--- a/src/racing/race_logic.c
++++ b/src/racing/race_logic.c
+@@ -785,6 +785,19 @@
+                 func_800029B0();
+             }
+         }
++#ifdef __IOS__
++        /* SOH_IOS (overlay 0049): the shell asks for a pause on every VR exit
++         * (VR-spec D8). Synthesising the START edge here — rather than
++         * writing gIsGamePaused behind the state machine's back — means the
++         * pause takes exactly the path the player's own press takes. */
++        {
++            extern volatile int gSohIosPauseReq;
++            if (gSohIosPauseReq && (gIsGamePaused == 0) && (controller == gControllerOne)) {
++                gSohIosPauseReq = 0;
++                controller->buttonPressed |= START_BUTTON;
++            }
++        }
++#endif
+         if ((controller->buttonPressed & START_BUTTON) && (!(controller->button & R_TRIG)) &&
+             (!(controller->button & L_TRIG))) {
+             func_8028DF00();

@@ -16,10 +16,15 @@ Microcode note: this port compiles F3DEX_GBI=1, so game-side G_NOOP is
 0xc0 (not F3DEX2's 0x00); the interpreter routes it to the same noop
 handler whose p-byte convention 0044 hooks (0x5A begin / 0x5B end).
 Emitted via gDisplayListHead (this game's DL cursor). __IOS__-guarded.
+REV3 (VR R15 item 5): a third pair — 0x60/0x61 around DrawFloor, the
+below-horizon ground fill, so the rear-view pane can drop it.
+REV2 (VR R13 item 4): a second, finer pair — 0x5E/0x5F around DrawSkyActors
+— so 0044 can tell the yaw-KEYED sprites from the yaw-INDEPENDENT gradient
+and floor. The rear-view pane keeps the latter and drops the former.
 
 --- a/src/port/Game.cpp
 +++ b/src/port/Game.cpp
-@@ -563,11 +563,28 @@
+@@ -563,11 +563,70 @@
  void CM_RaceDrawSky(ScreenContext* screen, s32 someId) {
      // if (bDrawSkybox) {
      if (CVarGetInteger("gDrawSky", true) == true) {
@@ -33,11 +38,53 @@ Emitted via gDisplayListHead (this game's DL cursor). __IOS__-guarded.
 +        }
 +#endif
          Sky::Instance->Draw(screen);
++#ifdef __IOS__
++        // SOH_IOS (overlay 0046 rev2, VR R13 item 4): SPRITE-SPAN sentinels.
++        // Everything between 0x5A and 0x5B is "the sky", but it is two
++        // structurally different things: Sky::Draw's gradient quads and
++        // DrawFloor's below-horizon quad are SCREEN SPACE and yaw-independent,
++        // while DrawSkyActors' cloud/star texrects are keyed to the camera's
++        // yaw (and re-keyed to the composed eye by 0051). The rear-view pane
++        // needs the first and must not have the second, and R11's shift of the
++        // whole ortho pass moved both — which is why the pane has had no sky.
++        {
++            Gfx* sohTag = gDisplayListHead++;
++            sohTag->words.w0 = (uintptr_t)((G_NOOP << 24) | (0x5E << 16));
++            sohTag->words.w1 = 0;
++        }
++#endif
          if (gGamestate != CREDITS_SEQUENCE) {
              func_80057FC4(screen, someId); // DrawSkyActors
          }
++#ifdef __IOS__
++        {
++            Gfx* sohTag = gDisplayListHead++;
++            sohTag->words.w0 = (uintptr_t)((G_NOOP << 24) | (0x5F << 16));
++            sohTag->words.w1 = 0;
++        }
++#endif
++#ifdef __IOS__
++        // SOH_IOS (overlay 0046 rev3, VR R15 item 5): the GROUND-FILL span.
++        // Sky::DrawFloor paints vtx[4..7] — the BELOW-HORIZON half of the sky,
++        // a full-width screen-space colour ramp from the course's FloorTop down
++        // to FloorBottom — on every course except Rainbow Road. In the eyes it
++        // is harmless (the ground covers it). In the REAR-VIEW PANE it is the
++        // only thing that can produce the user's "grey empty space where the
++        // uphill road behind should be", so 0044 needs to be able to tell it
++        // apart from the sky gradient above the horizon.
++        {
++            Gfx* sohTag = gDisplayListHead++;
++            sohTag->words.w0 = (uintptr_t)((G_NOOP << 24) | (0x60 << 16));
++            sohTag->words.w1 = 0;
++        }
++#endif
          Sky::Instance->DrawFloor(screen);
 +#ifdef __IOS__
++        {
++            Gfx* sohTag = gDisplayListHead++;
++            sohTag->words.w0 = (uintptr_t)((G_NOOP << 24) | (0x61 << 16));
++            sohTag->words.w1 = 0;
++        }
 +        // SOH_IOS (overlay 0046): stereo sky sentinel END.
 +        {
 +            Gfx* sohTag = gDisplayListHead++;

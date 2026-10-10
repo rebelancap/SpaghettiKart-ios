@@ -1,0 +1,393 @@
+Overlay patch 0058: extend MK64's sky gradient beyond the 320x240 ortho
+screen, so the VR pitch re-key (0044 rev7, VR R13 item 3) cannot expose its
+edges.
+
+MK64 draws its sky as two ortho quads in a guOrtho(0,320,0,240) screen: a
+gradient from the top of the screen down to the horizon (screen->cameraHeight)
+and, below the horizon, a floor quad down to y=0. Both END at the screen edge,
+because in the flat game nothing can ever look past it.
+
+0044 rev7 shifts that ortho projection vertically by the pitch difference
+between the composed eye and the game's chase camera, which is what makes the
+sky behave like a dome instead of a sticker. The moment it shifts, the quad's
+own edge comes into view: look up far enough and the blue simply stops, with
+whatever the eye framebuffer was cleared to beyond it.
+
+The fix is a pair of CAP quads — one above the gradient, one below the floor —
+each a flat extension in the colour of the edge it continues, so the gradient
+itself is not stretched or re-ramped in any way. They are drawn between the
+0046 sky sentinels, so they inherit the pitch shift with everything else and,
+being part of the yaw-independent gradient half, they draw in the rear-view
+pane too.
+
+VR-only and __IOS__-guarded: gated on gSohVRWorldActive && gSohVRSkyMode, so
+the flat game, the 3D panel and every non-world VR frame draw exactly what
+they drew before. One shared static is enough — VR renders screen 0 only (no
+split-screen in the headset).
+
+rev2 (VR R14 item 1), two changes, both from the user's 1.0.0.10 device photos:
+
+  * THE EXTENSION WAS FAR TOO SHORT. rev1 extended one screen height (240 ortho
+    px) each way, which is a total sky of three screens. 0044 rev8 clamps the
+    world-lock shift at +/-8 NDC = 960 ortho px, and looking up far enough with
+    rev1's caps ran off the top of the upper cap and exposed the FLOOR quad and
+    then its black lower cap: that is the "blue -> grey -> black" gradient
+    filling the upper half of user-sky-grey-black-when-up.png. 2400 px each
+    way covers the whole clamp with a screen of margin, which is what "the
+    course's top sky colour all the way to the zenith" actually requires.
+  * THE UPPER CAP NOW CONTINUES BOTH TOP CORNERS. rev1 copied vtx[0] (TopRight)
+    onto all four cap vertices, so a course whose TopLeft and TopRight differ
+    got a visible vertical seam where the cap met the gradient. Right-hand cap
+    vertices take vtx[0], left-hand ones take vtx[3], and the floor cap takes
+    vtx[5]/vtx[6] the same way — each cap vertex continues the gradient vertex
+    directly below (or above) it, so the join is exact by construction.
+
+rev4 (VR R17-A item 3) — THE CAPS GO SIDEWAYS, and the reason is trap D20.
+
+the user's 1.0.0.13 rear-pane photograph (work/r17/user-rearpane-1.0.0.13.png)
+has a BLACK VERTICAL STRIP at each edge of the pane, running from the pane's
+top down to the wall/fence line — exactly the region the sky owns — with the
+gradient present in the middle. It is the K = 120*AR - 160 family again:
+
+    vtx[..].v.ob[0] = OTRGetRectDimensionFrom{Left,Right}Edge(...)
+
+puts the gradient's edges at 160 -/+ 120*AR in the sky's guOrtho(0,320,...)
+screen, where AR is `mCurDimensions.aspect_ratio` AT THE MOMENT THE DISPLAY
+LIST IS BUILT. In VR that is the EYE extent's aspect (0044 deliberately leaves
+mCurDimensions at eye size for the whole session), and the Vision Pro's eye is
+5087x4081 = 1.246 — NARROWER than 4:3. So on device the gradient spans
+x = 10.5 .. 309.5 of a 0..320 ortho: it does not reach the edges, and 3.3% of
+the width at each side is left as clear colour. The eyes never showed it
+because those columns land in the far periphery of the lens; the PANE is a
+rectangle displayed edge to edge, so it shows it.
+
+In THIS simulator the same eye is 1.778 (wider than 4:3), the gradient
+OVERHANGS, and the defect is structurally invisible — which is why three rounds
+of pane screenshots never caught it. `vr set skyarfault 1246` forces the
+gradient's lateral extent to be computed at the device's aspect so the
+simulator can photograph both arms of it (D57: the repro is the point).
+
+The fix is the same shape as rev1's vertical caps: LATERAL cap quads that
+continue the gradient's own edge colours outward, never a widening of the
+gradient itself. Widening the quad would stretch its left-to-right colour ramp
+and change the sky in the EYES on every course whose TopLeft and TopRight
+differ; a cap adds pixels only where there were none. Four quads per side —
+gradient, upper cap, floor, lower cap — each taking its colours from the
+gradient vertex whose edge it continues, so every join is exact by
+construction. The floor pair carry DrawFloor's 0x60/0x61 sentinels for the same
+reason rev3's lower cap does. `vr set skywide 0` is the RED CONTROL and
+restores 1.0.0.13 exactly.
+
+It also unblocks R16-B step 4: `gSohVRSkyRoll` ships at 0 because "a 45-degree
+roll pulls the screen corners to a radius of 200 ortho px against a quad 160 px
+wide, so the gradient's left and right edges come into view". They no longer
+do; the lateral extension is the same 2400 px as the vertical one. Turning the
+roll on is still a separate decision and this round does not take it.
+
+rev5 (VR R17-B) — THE SPRITE SPAN'S PROJECTION. Overlay 0051 rev7 turns the
+cloud and star sprites into world-space billboards on a dome; this rev gives
+DrawSkyActors the matrix state that needs, by re-issuing the GAME's own
+perspectiveMatrix/lookAtMatrix pair (the Mtx GameCamera::SetViewProjection
+loaded this frame) for the span and restoring the HUD ortho with the game's own
+set_matrix_hud_screen() on the way out. It also settles R16-B's roll check: the
+rev4 lateral caps mean the gradient now extends 2400 ortho px on ALL FOUR sides,
+so a 45-degree roll -- which pulls a screen corner to a source point at radius
+200 px -- cannot reach an edge, and gSohVRSkyRoll ships at 1.
+
+
+--- a/src/engine/sky/Sky.cpp
++++ b/src/engine/sky/Sky.cpp
+@@ -152,6 +152,125 @@
+     skybox[7].v.cn[2] = prop->FloorTopLeft.b;
+ }
+ 
++#ifdef __IOS__
++#include <math.h>
++// SOH_IOS (overlay 0058, VR R13 item 3): the gradient CAP quads. See the patch
++// header — 0044 rev7 pitches the sky's ortho projection, and without these the
++// quad's own top and bottom edges come into view as soon as it moves.
++extern "C" {
++extern volatile int gSohVRWorldActive;
++extern volatile int gSohVRSkyMode;
++// SOH_IOS (overlay 0058, VR R13 item 3): the game's own horizon, in the sky's
++// 320x240 ortho pixels. It is the ONE pitch quantity MK64 computes (every
++// cloud's Y is derived from it), and nothing exported it, so the sky's
++// vertical placement had no telemetry at all. `vr mode` reports it next to the
++// composed eye's pitch, which is what the shift is the difference of.
++extern volatile int gSohVRSkyCamHeight;
++// SOH_IOS (overlay 0058 rev4, VR R17-A item 3): the LATERAL caps and their
++// controls. gSohVRSkyWide is the A/B (0 = 1.0.0.13, no side caps, the RED
++// CONTROL); gSohVRSkyArFault forces the aspect the gradient's own edges are
++// computed at, in MILLI-units (1246 = the Vision Pro's 1.246), so this
++// simulator -- whose eye is 1.778 and therefore OVERHANGS -- can reproduce the
++// device's black strips at all; 0 = off, which is every shipped configuration.
++// The three telemetry values say where the gradient's edges actually landed
++// and what aspect they were built at, which is the whole diagnosis as numbers.
++extern volatile int gSohVRSkyWide;
++extern volatile int gSohVRSkyArFault;
++extern volatile int gSohVRSkyVtxL, gSohVRSkyVtxR;
++extern volatile float gSohVRSkyBuildAr;
++extern volatile unsigned int gSohVRSkySideQuads;
++// SOH_IOS (overlay 0058 rev5, VR R17-B): the DOME's projection swap. See
++// DrawSkyActors below and overlay 0051 rev7.
++extern volatile int gSohVRSkyDome;
++extern volatile int gSohVREyeKey;
++extern volatile float gSohVRSkyDomeR;
++extern volatile unsigned int gSohVRSkyDomeFrames;
++void set_matrix_hud_screen(void);
++}
++#define SOH_IOS_SKY_CAP_EXT 2400
++static Vtx sSohIosSkyCap[8];
++// Four quads per side (sky, upper cap, floor, lower cap), 4 vertices each,
++// LEFT side first. Index within a quad follows the game's own convention for
++// these screen quads: 0 = top-right, 1 = bottom-right, 2 = bottom-left,
++// 3 = top-left, drawn as gSP2Triangles(0,3,1, 0, 1,3,2).
++#define SOH_IOS_SKY_SIDE_QUADS 8
++static Vtx sSohIosSkySide[SOH_IOS_SKY_SIDE_QUADS * 4];
++static void soh_ios_sky_side_quad(s32 sohQ, const Vtx* sohTopSrc, const Vtx* sohBotSrc, s16 sohXr,
++                                  s16 sohXl, s16 sohYt, s16 sohYb) {
++    Vtx* sohV = &sSohIosSkySide[sohQ * 4];
++    const Vtx* sohSrc[4] = { sohTopSrc, sohBotSrc, sohBotSrc, sohTopSrc };
++    const s16 sohX[4] = { sohXr, sohXr, sohXl, sohXl };
++    const s16 sohY[4] = { sohYt, sohYb, sohYb, sohYt };
++    for (s32 sohI = 0; sohI < 4; sohI++) {
++        sohV[sohI].v.flag = 0;
++        sohV[sohI].v.tc[0] = 0;
++        sohV[sohI].v.tc[1] = 0;
++        sohV[sohI].v.ob[0] = sohX[sohI];
++        sohV[sohI].v.ob[1] = sohY[sohI];
++        sohV[sohI].v.ob[2] = -1;
++        for (s32 sohC = 0; sohC < 4; sohC++) {
++            sohV[sohI].v.cn[sohC] = sohSrc[sohI]->v.cn[sohC];
++        }
++    }
++}
++// vtx layout, from the static initialisers above:
++//   [0] top-right   [1] horizon-right [2] horizon-left [3] top-left
++//   [4] floor-top-r [5] floor-bot-r   [6] floor-bot-l  [7] floor-top-l
++// Quads 0-3 are the LEFT side (x from L-EXT to L), 4-7 the RIGHT (R to R+EXT).
++static void soh_ios_sky_sides(Vtx* vtx, s16 sohCamH) {
++    const s16 sohL = vtx[2].v.ob[0];
++    const s16 sohR = vtx[1].v.ob[0];
++    const s16 sohLo = (s16)(-SOH_IOS_SKY_CAP_EXT);
++    const s16 sohHi = (s16)(SCREEN_HEIGHT + SOH_IOS_SKY_CAP_EXT);
++    const s16 sohXll = (s16)(sohL - SOH_IOS_SKY_CAP_EXT);
++    const s16 sohXrr = (s16)(sohR + SOH_IOS_SKY_CAP_EXT);
++    // LEFT: everything continues the left-hand column of the gradient.
++    soh_ios_sky_side_quad(0, &vtx[3], &vtx[2], sohL, sohXll, SCREEN_HEIGHT, sohCamH);
++    soh_ios_sky_side_quad(1, &vtx[3], &vtx[3], sohL, sohXll, sohHi, SCREEN_HEIGHT);
++    soh_ios_sky_side_quad(2, &vtx[7], &vtx[6], sohL, sohXll, sohCamH, 0);
++    soh_ios_sky_side_quad(3, &vtx[6], &vtx[6], sohL, sohXll, 0, sohLo);
++    // RIGHT: the right-hand column.
++    soh_ios_sky_side_quad(4, &vtx[0], &vtx[1], sohXrr, sohR, SCREEN_HEIGHT, sohCamH);
++    soh_ios_sky_side_quad(5, &vtx[0], &vtx[0], sohXrr, sohR, sohHi, SCREEN_HEIGHT);
++    soh_ios_sky_side_quad(6, &vtx[4], &vtx[5], sohXrr, sohR, sohCamH, 0);
++    soh_ios_sky_side_quad(7, &vtx[5], &vtx[5], sohXrr, sohR, 0, sohLo);
++}
++static void soh_ios_sky_caps(Vtx* vtx) {
++    // Above the gradient: continue the TOP edge upward to the zenith. Below the
++    // floor: continue the floor's far edge downward. Each cap vertex copies the
++    // gradient vertex it sits directly above (right corners from vtx[0]/vtx[5],
++    // left corners from vtx[3]/vtx[6]), so the join carries no seam even on a
++    // course whose TopLeft and TopRight differ. Both keep the
++    // widescreen-corrected x the game just computed, and the same winding as
++    // the quads they extend.
++    const s16 sohL = vtx[2].v.ob[0];
++    const s16 sohR = vtx[1].v.ob[0];
++    const s16 sohTop = SCREEN_HEIGHT;
++    const s16 sohHi = (s16)(SCREEN_HEIGHT + SOH_IOS_SKY_CAP_EXT);
++    const s16 sohLo = (s16)(-SOH_IOS_SKY_CAP_EXT);
++    // cap vertex -> the gradient vertex whose colour it continues.
++    static const s32 sohSrcIdx[8] = { 0, 0, 3, 3, 5, 5, 6, 6 };
++    for (s32 sohI = 0; sohI < 8; sohI++) {
++        const Vtx* sohSrc = &vtx[sohSrcIdx[sohI]];
++        sSohIosSkyCap[sohI].v.flag = 0;
++        sSohIosSkyCap[sohI].v.tc[0] = 0;
++        sSohIosSkyCap[sohI].v.tc[1] = 0;
++        sSohIosSkyCap[sohI].v.ob[2] = -1;
++        for (s32 sohC = 0; sohC < 4; sohC++) {
++            sSohIosSkyCap[sohI].v.cn[sohC] = sohSrc->v.cn[sohC];
++        }
++    }
++    sSohIosSkyCap[0].v.ob[0] = sohR;  sSohIosSkyCap[0].v.ob[1] = sohHi;
++    sSohIosSkyCap[1].v.ob[0] = sohR;  sSohIosSkyCap[1].v.ob[1] = sohTop;
++    sSohIosSkyCap[2].v.ob[0] = sohL;  sSohIosSkyCap[2].v.ob[1] = sohTop;
++    sSohIosSkyCap[3].v.ob[0] = sohL;  sSohIosSkyCap[3].v.ob[1] = sohHi;
++    sSohIosSkyCap[4].v.ob[0] = sohR;  sSohIosSkyCap[4].v.ob[1] = 0;
++    sSohIosSkyCap[5].v.ob[0] = sohR;  sSohIosSkyCap[5].v.ob[1] = sohLo;
++    sSohIosSkyCap[6].v.ob[0] = sohL;  sSohIosSkyCap[6].v.ob[1] = sohLo;
++    sSohIosSkyCap[7].v.ob[0] = sohL;  sSohIosSkyCap[7].v.ob[1] = 0;
++}
++#endif
++
+ void Sky::Draw(ScreenContext* screen) { // func_802A4A0C(Vtx* vtx, ScreenContext* screen)
+     Camera* camera = screen->camera;
+     s16 temp_t5;
+@@ -184,15 +303,35 @@
+     this->SetColours(vtx); //func_802A450C(vtx);
+     // Widescreen skybox
+     // Note that this is the correct fit for each screen due to how the viewport works
+-    vtx[0].v.ob[0] = OTRGetRectDimensionFromRightEdge(SCREEN_WIDTH);
+-    vtx[1].v.ob[0] = OTRGetRectDimensionFromRightEdge(SCREEN_WIDTH);
+-    vtx[2].v.ob[0] = OTRGetRectDimensionFromLeftEdge(0);
+-    vtx[3].v.ob[0] = OTRGetRectDimensionFromLeftEdge(0);
++    s16 sohSkyR = OTRGetRectDimensionFromRightEdge(SCREEN_WIDTH);
++    s16 sohSkyL = OTRGetRectDimensionFromLeftEdge(0);
++#ifdef __IOS__
++    // SOH_IOS (overlay 0058 rev4, VR R17-A item 3): THE FAULT INJECTOR, and
++    // the telemetry that names the defect. These two edges are
++    // 160 -/+ 120*AR, with AR read off mCurDimensions at LIST-BUILD time --
++    // the VR EYE's aspect, 1.246 on the device (narrower than 4:3, so the
++    // gradient does not reach x=0 or x=320) and 1.778 in this simulator (wider,
++    // so it overhangs and the defect cannot be seen). skyarfault forces the
++    // device's number here, in milli-units, so both arms can be photographed on
++    // one binary in the simulator (trap D57).
++    if (gSohVRWorldActive && gSohVRSkyArFault > 0) {
++        const float sohAr = (float)gSohVRSkyArFault / 1000.0f;
++        sohSkyL = (s16)floorf((float)(SCREEN_WIDTH / 2) - (float)(SCREEN_HEIGHT / 2) * sohAr);
++        sohSkyR = (s16)ceilf((float)(SCREEN_WIDTH / 2) + (float)(SCREEN_HEIGHT / 2) * sohAr);
++    }
++    gSohVRSkyVtxL = (int)sohSkyL;
++    gSohVRSkyVtxR = (int)sohSkyR;
++    gSohVRSkyBuildAr = OTRGetAspectRatio();
++#endif
++    vtx[0].v.ob[0] = sohSkyR;
++    vtx[1].v.ob[0] = sohSkyR;
++    vtx[2].v.ob[0] = sohSkyL;
++    vtx[3].v.ob[0] = sohSkyL;
+ 
+-    vtx[4].v.ob[0] = OTRGetRectDimensionFromRightEdge(SCREEN_WIDTH);
+-    vtx[5].v.ob[0] = OTRGetRectDimensionFromRightEdge(SCREEN_WIDTH);
+-    vtx[6].v.ob[0] = OTRGetRectDimensionFromLeftEdge(0);
+-    vtx[7].v.ob[0] = OTRGetRectDimensionFromLeftEdge(0);
++    vtx[4].v.ob[0] = sohSkyR;
++    vtx[5].v.ob[0] = sohSkyR;
++    vtx[6].v.ob[0] = sohSkyL;
++    vtx[7].v.ob[0] = sohSkyL;
+ 
+     sp5C[0] = 0.0f;
+     sp5C[1] = 0.0f;
+@@ -231,6 +370,70 @@
+     gSPMatrix(gDisplayListHead++, (uintptr_t)&mSkyboxMatrix, G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
+     gSPVertex(gDisplayListHead++, (uintptr_t)&vtx[0], 4, 0);
+     gSP2Triangles(gDisplayListHead++, 0, 3, 1, 0, 1, 3, 2, 0);
++#ifdef __IOS__
++    // SOH_IOS (overlay 0058, VR R13 item 3): the caps, VR world frames only.
++    gSohVRSkyCamHeight = (int)screen->cameraHeight;
++    if (gSohVRWorldActive && gSohVRSkyMode) {
++        soh_ios_sky_caps(vtx);
++        gSPVertex(gDisplayListHead++, (uintptr_t)&sSohIosSkyCap[0], 4, 0);
++        gSP2Triangles(gDisplayListHead++, 0, 3, 1, 0, 1, 3, 2, 0);
++        // SOH_IOS (overlay 0058 rev3, VR R15 item 5): the LOWER cap continues
++        // the FLOOR's colour downward, so it is part of the ground fill and
++        // must carry the same 0x60/0x61 sentinels DrawFloor does — otherwise
++        // dropping the fill in the rear-view pane leaves its 2400-pixel
++        // extension behind.
++        {
++            Gfx* sohTag = gDisplayListHead++;
++            sohTag->words.w0 = (uintptr_t)((G_NOOP << 24) | (0x60 << 16));
++            sohTag->words.w1 = 0;
++        }
++        gSPVertex(gDisplayListHead++, (uintptr_t)&sSohIosSkyCap[4], 4, 0);
++        gSP2Triangles(gDisplayListHead++, 0, 3, 1, 0, 1, 3, 2, 0);
++        {
++            Gfx* sohTag = gDisplayListHead++;
++            sohTag->words.w0 = (uintptr_t)((G_NOOP << 24) | (0x61 << 16));
++            sohTag->words.w1 = 0;
++        }
++    }
++    // SOH_IOS (overlay 0058 rev4, VR R17-A item 3): THE LATERAL CAPS. Not
++    // gated on gSohVRSkyMode: the REAR-VIEW PANE draws this gradient whatever
++    // the eyes are doing with theirs (0044 rev8's 0x5A note), and the pane is
++    // where the black strips are visible. In a mode whose eyes park the sky,
++    // 0044 displaces these with everything else between the sentinels.
++    if (gSohVRWorldActive && gSohVRSkyWide) {
++        soh_ios_sky_sides(vtx, (s16)screen->cameraHeight);
++        // The gradient half: the side quad beside the gradient, and the side
++        // quad beside the upper cap. No sentinel — they are sky.
++        {
++            static const s32 sohSkyQ[4] = { 0, 1, 4, 5 };
++            for (s32 sohI = 0; sohI < 4; sohI++) {
++                gSPVertex(gDisplayListHead++, (uintptr_t)&sSohIosSkySide[sohSkyQ[sohI] * 4], 4, 0);
++                gSP2Triangles(gDisplayListHead++, 0, 3, 1, 0, 1, 3, 2, 0);
++            }
++        }
++        // The GROUND-FILL half, inside DrawFloor's own 0x60/0x61 sentinels for
++        // exactly the reason rev3's lower cap is: `vr set rearfloor 0` must be
++        // able to drop the whole fill, sides included.
++        {
++            Gfx* sohTag = gDisplayListHead++;
++            sohTag->words.w0 = (uintptr_t)((G_NOOP << 24) | (0x60 << 16));
++            sohTag->words.w1 = 0;
++        }
++        {
++            static const s32 sohFloorQ[4] = { 2, 3, 6, 7 };
++            for (s32 sohI = 0; sohI < 4; sohI++) {
++                gSPVertex(gDisplayListHead++, (uintptr_t)&sSohIosSkySide[sohFloorQ[sohI] * 4], 4, 0);
++                gSP2Triangles(gDisplayListHead++, 0, 3, 1, 0, 1, 3, 2, 0);
++            }
++        }
++        {
++            Gfx* sohTag = gDisplayListHead++;
++            sohTag->words.w0 = (uintptr_t)((G_NOOP << 24) | (0x61 << 16));
++            sohTag->words.w1 = 0;
++        }
++        gSohVRSkySideQuads = gSohVRSkySideQuads + SOH_IOS_SKY_SIDE_QUADS;
++    }
++#endif
+     if (IsRainbowRoad()) {
+         gSPVertex(gDisplayListHead++, (uintptr_t)&vtx[4], 4, 0);
+         gSP2Triangles(gDisplayListHead++, 0, 3, 1, 0, 1, 3, 2, 0);
+@@ -336,11 +539,52 @@
+         return;
+     }
+ 
++#ifdef __IOS__
++    // SOH_IOS (overlay 0058 rev5, VR R17-B): THE PROJECTION THE SPRITE SPAN IS
++    // DRAWN IN. In the dome arm (overlay 0051 rev7) each cloud and star is
++    // WORLD geometry, so the span needs the world's own world->clip matrix
++    // rather than the sky's guOrtho -- and it must be the GAME's, not a
++    // reconstruction of it: `camera->perspectiveMatrix` and
++    // `camera->lookAtMatrix` are the very Mtx GameCamera::SetViewProjection
++    // loaded this frame (GameCamera.cpp points them at its own members), so
++    // re-issuing the identical LOAD + MUL pair puts the span in exactly the
++    // matrix state the world is drawn in.
++    //
++    // That is the whole trick. 0044's Soh3DStereoP keys off the ORTHO/
++    // PERSPECTIVE verdict of each projection load, so the span is now taken
++    // through the PERSPECTIVE path: the eye walks substitute the composed
++    // per-eye A*V*P (the same one the trees get, trap A7), and the rear-view
++    // pane composes its own rigid transform onto the game's matrix and
++    // therefore gets the clouds for free -- closing R16's "cloud/star sprites
++    // absent from the pane".
++    //
++    // The span is restored to the HUD ortho on the way out with the game's own
++    // set_matrix_hud_screen(), which is what the caller (func_80057FC4) loaded
++    // on the way in. Sky::DrawFloor re-loads its own ortho immediately after,
++    // except on Rainbow Road where it returns early -- which is exactly why
++    // the restore is here and not left to it.
++    const int sohDome = (gSohVRWorldActive && gSohVRSkyMode && gSohVREyeKey && gSohVRSkyDome &&
++                         gSohVRSkyDomeR > 1.0f && screen != NULL && screen->camera != NULL &&
++                         screen->camera->perspectiveMatrix != NULL &&
++                         screen->camera->lookAtMatrix != NULL);
++    if (sohDome) {
++        gSPMatrix(gDisplayListHead++, (uintptr_t)screen->camera->perspectiveMatrix,
++                  G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_PROJECTION);
++        gSPMatrix(gDisplayListHead++, (uintptr_t)screen->camera->lookAtMatrix,
++                  G_MTX_NOPUSH | G_MTX_MUL | G_MTX_PROJECTION);
++        gSohVRSkyDomeFrames = gSohVRSkyDomeFrames + 1;
++    }
++#endif
+     for (auto& cloud : Sky::Instance->GetSkyActors()) {
+         if (cloud->mScreen == screen) {
+             cloud->Draw(screen, arg0);
+         }
+     }
++#ifdef __IOS__
++    if (sohDome) {
++        set_matrix_hud_screen();
++    }
++#endif
+ }
+ 
+ EXTERN_C void TickSkyActors() {

@@ -39,8 +39,11 @@ deltas INSIDE the same three replacement blocks — zero new vendor anchors:
   SohHostViewController.m + SohImmersive.m ride on the app target;
   frameworks CompositorServices/ARKit/AVFAudio (3D needs all three;
   harmless in Phase 01).
+- iOS (D11, 2026-10-08): @SOH_PLIST_EXTRA@ defaults to a single-scene
+  UIApplicationSceneManifest naming SohIosSceneDelegate (iOS 27 SDK launch
+  gate, = Shipwright c8de40b).
 - Info.plist gains @SOH_PLIST_EXTRA@: UIApplicationSceneManifest with
-  UIApplicationSupportsMultipleScenes=true, visionOS-only (the SwiftUI
+  UIApplicationSupportsMultipleScenes=true, visionOS (the SwiftUI
   ImmersiveSpace requires it; top-level placement is silently ignored —
   it must live INSIDE the manifest dict; the key changes UIKit scene
   behavior on iPhone so it stays vision-gated).
@@ -69,7 +72,7 @@ re-flip) for any of these branches to fire on a visionOS configure.
  endif()
  
  ################################################################################
-@@ -320,23 +322,121 @@
+@@ -320,23 +322,145 @@
  list(FILTER ALL_FILES EXCLUDE REGEX "./src/debug/crash_screen_enhancement.c")
  
  if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
@@ -112,6 +115,11 @@ re-flip) for any of these branches to fire on a visionOS configure.
 +      message(FATAL_ERROR "iOS build requires -DSOH_IOS_SHELL_DIR=<dir with SohIosShell.m>")
 +  endif()
 +  target_sources(${PROJECT_NAME} PRIVATE "${SOH_IOS_SHELL_DIR}/SohIosShell.m")
++  # VR R16-E: the std::terminate instrument. Its own C++ TU because the shell
++  # is ObjC and cannot include <exception>/<cxxabi.h>; both platforms need it
++  # (the gate abort was `libc++abi: terminating` with no exception clause, and
++  # only a std::set_terminate handler sees that stack before abort() erases it).
++  target_sources(${PROJECT_NAME} PRIVATE "${SOH_IOS_SHELL_DIR}/SohCrashTerminate.cpp")
 +  target_include_directories(${PROJECT_NAME} PRIVATE "${SOH_IOS_SHELL_DIR}")
 +  target_link_libraries(${PROJECT_NAME} PRIVATE "-framework UniformTypeIdentifiers"
 +                                                "-framework GameController")
@@ -160,11 +168,13 @@ re-flip) for any of these branches to fire on a visionOS configure.
 +        XCODE_ATTRIBUTE_SWIFT_OBJC_BRIDGING_HEADER "${SOH_IOS_SHELL_DIR}/SohVision-Bridging-Header.h")
 +    target_sources(${PROJECT_NAME} PRIVATE
 +        "${SOH_IOS_SHELL_DIR}/SohHostViewController.m"
-+        "${SOH_IOS_SHELL_DIR}/SohImmersive.m")
++        "${SOH_IOS_SHELL_DIR}/SohImmersive.m"
++        "${SOH_IOS_SHELL_DIR}/SohSense.m")
 +    target_link_libraries(${PROJECT_NAME} PRIVATE
 +        "-Wl,-force_load,$<TARGET_FILE:sohvisionswift>"
 +        "-L$(SDKROOT)/usr/lib/swift"
-+        "-framework CompositorServices" "-framework ARKit" "-framework AVFAudio")
++        "-framework CompositorServices" "-framework ARKit" "-framework AVFAudio"
++        "-framework CoreHaptics")
 +    add_dependencies(${PROJECT_NAME} sohvisionswift)
 +  endif()
 +
@@ -183,11 +193,28 @@ re-flip) for any of these branches to fire on a visionOS configure.
 +  set(SOH_IOS_DEVELOPMENT_TEAM "" CACHE STRING "Development team for iOS code signing")
 +  # visionOS: the SwiftUI entry's ImmersiveSpace (stereo 3D) requires
 +  # multiple scenes. The key must sit INSIDE UIApplicationSceneManifest
-+  # (top-level placement is silently ignored) and stays visionOS-only
-+  # (it changes UIKit scene behavior on iPhone).
-+  set(SOH_PLIST_EXTRA "")
++  # (top-level placement is silently ignored); the SOH_VISIONOS branch below
++  # overwrites SOH_PLIST_EXTRA wholesale with that.
++  # iOS (D11, = Shipwright c8de40b): the iOS 27 SDK HARD-REQUIRES the UIScene
++  # life cycle -- a UIKit app built against it with no scene manifest is
++  # killed before main() (SIGTRAP in
++  # ___UIApplicationEvaluateRuntimeIssueForNoSceneLifecycleAdoption). One
++  # window scene, delegate SohIosSceneDelegate (app/ios/SohIosShell.m, which
++  # also grafts the app-delegate scene-config hook onto SDLUIKitDelegate at
++  # +load: the runtime wants BOTH, a manifest alone still traps).
++  set(SOH_PLIST_EXTRA "\n\t<key>UIApplicationSceneManifest</key>\n\t<dict>\n\t\t<key>UIApplicationSupportsMultipleScenes</key>\n\t\t<false/>\n\t\t<key>UISceneConfigurations</key>\n\t\t<dict>\n\t\t\t<key>UIWindowSceneSessionRoleApplication</key>\n\t\t\t<array>\n\t\t\t\t<dict>\n\t\t\t\t\t<key>UISceneConfigurationName</key>\n\t\t\t\t\t<string>Default</string>\n\t\t\t\t\t<key>UISceneDelegateClassName</key>\n\t\t\t\t\t<string>SohIosSceneDelegate</string>\n\t\t\t\t\t<key>UISceneClassName</key>\n\t\t\t\t\t<string>UIWindowScene</string>\n\t\t\t\t</dict>\n\t\t\t</array>\n\t\t</dict>\n\t</dict>")
 +  if(SOH_VISIONOS)
-+    set(SOH_PLIST_EXTRA "\n\t<key>UIApplicationSceneManifest</key>\n\t<dict>\n\t\t<key>UIApplicationSupportsMultipleScenes</key>\n\t\t<true/>\n\t</dict>")
++    # PSVR2 Sense (VR R4, spec D13). GCSupportedGameControllers /
++    # SpatialGamepad is THE key that makes the pair trackable: without it the
++    # system hands the app a compatibility presentation in which the pair
++    # arrives as ONE aggregated MFi gamepad, and an aggregate virtual gamepad is
++    # not a trackable accessory — ar_accessory_load_from_device then fails with
++    # error 1200, which the donor project spent two device rounds mistaking for
++    # "this hardware cannot be tracked". Dict/ProfileName form, not the
++    # array-of-strings variant. NSAccessoryTrackingUsageDescription is what lets
++    # ar_session_request_authorization ask at all — without it the request is
++    # refused without ever prompting. Both are visionOS-only.
++    set(SOH_PLIST_EXTRA "\n\t<key>UIApplicationSceneManifest</key>\n\t<dict>\n\t\t<key>UIApplicationSupportsMultipleScenes</key>\n\t\t<true/>\n\t</dict>\n\t<key>NSAccessoryTrackingUsageDescription</key>\n\t<string>Spaghetti Kart uses your PSVR2 Sense controllers to steer and throw items in VR.</string>\n\t<key>GCSupportedGameControllers</key>\n\t<array>\n\t\t<dict>\n\t\t\t<key>ProfileName</key>\n\t\t\t<string>SpatialGamepad</string>\n\t\t</dict>\n\t</array>")
 +  endif()
 +  configure_file(${CMAKE_CURRENT_SOURCE_DIR}/ios/Info.plist.in ${CMAKE_BINARY_DIR}/ios/Info.plist @ONLY)
 +  set_target_properties(${PROJECT_NAME} PROPERTIES
@@ -205,7 +232,7 @@ re-flip) for any of these branches to fire on a visionOS configure.
  else()
    add_executable(${PROJECT_NAME} ${ALL_FILES})
  endif()
-@@ -520,6 +620,45 @@
+@@ -520,6 +644,45 @@
    target_include_directories(${PROJECT_NAME} PRIVATE
          ${DEVKITPRO}/portlibs/wiiu/include/
      )
@@ -275,7 +302,7 @@ re-flip) for any of these branches to fire on a visionOS configure.
 +	<key>CFBundlePackageType</key>
 +	<string>APPL</string>
 +	<key>CFBundleShortVersionString</key>
-+	<string>1.0.1</string>
++	<string>1.1.0</string>
 +	<key>CFBundleVersion</key>
 +	<string>1</string>
 +	<key>LSRequiresIPhoneOS</key>

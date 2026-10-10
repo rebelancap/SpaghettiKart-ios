@@ -1,0 +1,98 @@
+Overlay patch 0057: a harness hook that hands player one an item (VR R9,
+item 5's artifact).
+
+spec C8, "harness first": R9 needs a screenshot of the player's OWN triple
+shells orbiting in first person, and of a trailing item behind the kart, to
+prove 0056 actually made them visible. There is no cheat, no debug menu and no
+item selector anywhere in this port, and driving 8th place round a GP hoping
+for the right box is not a repeatable test — the suite would flake on the item
+table's RNG rather than on the thing under test.
+
+So: one shell-owned request word, consumed inside `check_player_use_item`.
+`gSohVRDbgGrantItem` is an MK64 item id (defines.h ITEM_*); when it is >= 0 the
+matching item ACTOR is spawned for player one through the game's own
+`use_*_item` helpers — the same ones `player_use_item` calls — and the request
+is cleared, so it fires ONCE per `vr set item <id>`.
+
+Writing `player->currentItemCopy` does NOT work and the first draft of this
+patch found out the hard way: `update_objects.c` re-syncs that field from the
+HUD roulette object (`sp38->currentItemCopy = object->type;`) every single
+frame, so the grant was overwritten before anything could read it. Spawning the
+actor is both simpler and closer to the real thing.
+
+Player one only (gPlayerOne), so it can never touch a CPU racer or a
+split-screen player. -1, the default, does nothing at all, and it is the only
+value that ever exists outside the dev console bridge, which is compiled out of
+public builds (trap C7).
+
+REV2 (VR R17-A item 2a): the MUSHROOMS. the user's 1.0.0.13 report is about what
+he sees while a mushroom is running, and the suite has no way to make one
+happen -- driving a GP hoping for the right item box is exactly the flake this
+patch exists to avoid. MK64 does not spawn an actor for a mushroom: the whole
+of `use item` for the four mushroom ids is `player->triggers |= SHROOM_TRIGGER`
+(actors_extended.c's own switch, a few lines below this hook), which is what
+raises `boostPower` past the 2.0 that gates the boost-flash kart quad. Same
+one-shot, same player-one gate, same helper the game uses.
+
+
+--- a/src/racing/actors_extended.c
++++ b/src/racing/actors_extended.c
+@@ -1,3 +1,9 @@
++#ifdef __IOS__
++// SOH_IOS (overlay 0057, VR R9 harness): an item id to hand player one, or
++// -1 for "do nothing". Consumed (and reset to -1) in check_player_use_item.
++// Declared at the head of the file, outside overlay 0053's hunk context.
++extern volatile int gSohVRDbgGrantItem;
++#endif
+ #include <libultraship.h>
+ #include <macros.h>
+ #include <defines.h>
+@@ -972,6 +978,48 @@
+                 }
+             }
+ 
++#ifdef __IOS__
++            // SOH_IOS (overlay 0057, VR R9 harness): grant player one an item
++            // on request. Placed here rather than at the head of the loop
++            // body because overlay 0053 owns that spot and a patch must never
++            // land inside another patch's hunk context. -1 (the default, and
++            // the only value outside the dev console bridge) does nothing.
++            if ((player == gPlayerOne) && (gSohVRDbgGrantItem >= 0)) {
++                s16 sohItem = (s16) gSohVRDbgGrantItem;
++                gSohVRDbgGrantItem = -1;
++                // Spawn the item ACTOR directly rather than writing
++                // player->currentItemCopy: the item window's update
++                // (update_objects.c) re-syncs that field from the HUD
++                // roulette object EVERY frame, so a write there is gone
++                // before anything can use it. These are the same helpers
++                // player_use_item calls, so the resulting state is the
++                // real thing and not a mock-up.
++                switch (sohItem) {
++                    case ITEM_TRIPLE_GREEN_SHELL:
++                        use_triple_shell_item(player, ACTOR_TRIPLE_GREEN_SHELL);
++                        break;
++                    case ITEM_TRIPLE_RED_SHELL:
++                        use_triple_shell_item(player, ACTOR_TRIPLE_RED_SHELL);
++                        break;
++                    case ITEM_GREEN_SHELL:
++                        use_green_shell_item(player);
++                        break;
++                    case ITEM_BANANA:
++                        use_banana_item(player);
++                        break;
++                    // rev2 (R17-A item 2a): the mushrooms. No actor --
++                    // MK64 raises a trigger and the boost follows.
++                    case ITEM_MUSHROOM:
++                    case ITEM_DOUBLE_MUSHROOM:
++                    case ITEM_TRIPLE_MUSHROOM:
++                    case ITEM_SUPER_MUSHROOM:
++                        player->triggers |= SHROOM_TRIGGER;
++                        break;
++                    default:
++                        break;
++                }
++            }
++#endif
+             if (((player->type & PLAYER_HUMAN) != 0) && (player->currentItemCopy != ITEM_NONE) &&
+                 ((player->type & PLAYER_START_SEQUENCE) == 0)) {
+                 if ((controller->buttonPressed & Z_TRIG) != 0) {

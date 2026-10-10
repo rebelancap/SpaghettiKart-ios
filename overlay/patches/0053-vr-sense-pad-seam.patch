@@ -1,0 +1,106 @@
+Overlay patch 0053: the PSVR2 Sense fixed layout's pad seam, and MK64's armed
+item (VR-spec D13/D9, VR R4).
+
+Two edits, both tiny, both in game code that already had exactly the hook the
+feature needed:
+
+  1. src/main.c — `read_controllers()`. Straight after `osContGetReadData()`
+     fills gControllerPads and BEFORE `update_controller(0)` derives the
+     pressed/depressed edges from it, the shell ORs the Sense pair's fixed
+     kart layout onto player 1's pad. This is the whole reason the layout is
+     "deliberately not a user bind" (spec D9): there is no LUS binding layer
+     between a Sense button and its N64 bit — the bits are written straight into
+     the pad MK64 is about to read, and MK64's own edge detection then runs over
+     the merged state, so a Sense press produces exactly the same buttonPressed /
+     buttonDepressed edges a real N64 controller would (trap C2: ONE edge
+     detector, and it is the game's).
+
+     ORed, never assigned: a gamepad and the Sense pair can drive the same kart
+     at once, which is what makes a headset session recoverable if the Sense
+     layout ever misbehaves (the donor's 1.1.2.22 lesson — never leave the
+     headset with no working input).
+
+  2. src/racing/actors_extended.c — `check_player_use_item()`. Exports player
+     1's armed item as gSohVRItemArmed. That is the state the "item in hand"
+     billboard is gated on, the edge the item-pickup haptic fires from, and the
+     thing that tells the throw gesture whether there is anything to throw. The
+     site runs once per player every frame the item logic ticks, and it is
+     placed at the TOP of the loop body rather than inside the
+     `prevent_item_use` / HUMAN / non-NONE guard, so the export tracks the real
+     state (including "you have nothing") rather than only the frames where a
+     use would have been legal.
+
+The shell entry point is `SohVRSense_WritePad` in SohIosShell.m — the same seam
+discipline patch 0023 rev5's settings rows use: src/main.c is C compiled on
+EVERY target (iPhone, visionOS and the macOS build), SohSense.m is visionOS-only
+(patch 0013's target_sources), so the game calls a forwarder that every target
+compiles and only the visionOS build forwards anything. __IOS__-guarded, so the
+oracle links no shell and is byte-identical to upstream.
+
+
+--- a/src/main.c
++++ b/src/main.c
+@@ -386,6 +386,14 @@
+     controller->stickDepressed = controller->stickDirection & (stick ^ controller->stickDirection);
+     controller->stickDirection = stick;
+ }
++
++#ifdef __IOS__
++// SOH_IOS (overlay 0053, spec D13/D9): the PSVR2 Sense fixed kart
++// layout. Defined in SohIosShell.m on every target; only the visionOS
++// build forwards it to the Sense backend, and with no controllers
++// connected it does nothing at all.
++extern void SohVRSense_WritePad(unsigned short* button, signed char* stickX, signed char* stickY);
++#endif
+ 
+ void read_controllers(void) {
+     OSMesg msg;
+@@ -393,6 +401,14 @@
+     osContStartReadData(&gSIEventMesgQueue);
+     // osRecvMesg(&gSIEventMesgQueue, &msg, OS_MESG_BLOCK);
+     osContGetReadData(gControllerPads);
++#ifdef __IOS__
++    // SOH_IOS (overlay 0053): ORed onto player 1's pad BEFORE
++    // update_controller() derives this frame's edges from it, so a Sense
++    // press produces exactly the pressed/depressed edges an N64 button
++    // would — MK64's own edge detector stays the only one there is.
++    SohVRSense_WritePad((unsigned short*) &gControllerPads[0].button, &gControllerPads[0].stick_x,
++                        &gControllerPads[0].stick_y);
++#endif
+     update_controller(0);
+     update_controller(1);
+     update_controller(2);
+--- a/src/racing/actors_extended.c
++++ b/src/racing/actors_extended.c
+@@ -977,6 +977,14 @@
+     consume_item(playerId);
+ }
+ 
++#ifdef __IOS__
++// SOH_IOS (overlay 0053, spec D13): player 1's armed item, for the VR
++// shell. File scope, not block scope — the project's recurring linkage
++// trap is block-scope externs, and this TU also compiles the two .inc.c
++// item files that will want it next.
++extern volatile int gSohVRItemArmed;
++#endif
++
+ // Check if a player is using an item?
+ void check_player_use_item(void) {
+     Player* player;
+@@ -987,6 +995,16 @@
+     for (player = &gPlayers[0], loopController = &gControllers[0], target = &gControllers[4]; loopController != target;
+          player++, loopController++) {
+         controller = loopController;
++#ifdef __IOS__
++        // SOH_IOS (overlay 0053, spec D13): player 1's armed item, for
++        // the VR shell — the gate on the in-hand billboard, the edge the
++        // pickup haptic fires from, and what tells the throw gesture there
++        // is something to throw. Exported unconditionally (ITEM_NONE
++        // included) so "you are empty-handed" is a state and not a gap.
++        if (player == gPlayerOne) {
++            gSohVRItemArmed = (int) player->currentItemCopy;
++        }
++#endif
+         if (prevent_item_use(player) == false) {
+             if ((player->type & PLAYER_INVISIBLE_OR_BOMB) != 0) {
+                 if ((player - gPlayerTwo) == 0) {

@@ -1,0 +1,246 @@
+Overlay patch 0059: the rear-view pane's OPPOSITE-DIRECTION course section
+list (VR R16-C step 4; docs/vr-r16-diagnosis/rear-pane.md Q2 option A).
+
+MK64 draws its course as ONE DISPLAY LIST PER (SECTION, CARDINAL DIRECTION):
+render_track_sections buckets `camera->rot[1]` into NORTH/EAST/SOUTH/WEST and
+emits `addr[(index - 1) * 4 + direction]`. The VR rear-view pane is a third
+interpreter walk over the SAME command list (trap D32 -- one list, three
+walks), so it inherits the FORWARD camera's yaw quadrant and replays "section
+S as seen looking NORTH" while showing you the view looking SOUTH. The
+geometry genuinely behind the kart was never in the list at all, and R15's
+red control proved that is what the grey band is: drop MK64's below-horizon
+ground fill (`vr set rearfloor 0`) and the same band goes BLACK, because there
+is nothing behind it.
+
+The game already ships the list we want. Its four direction variants of a
+section are in the same table, and the SOUTH one is precisely what MK64 emits
+itself whenever the player holds C-left, because `LookBehindCamera`'s rot[1]
+is the opposite quadrant. So this patch emits it, bracketed:
+
+    G_NOOP 0x62      <- eyes-only span begins
+    gSPDisplayList(addr[(index-1)*4 + direction])          (unchanged)
+    G_NOOP 0x63
+    G_NOOP 0x64      <- rear-only span begins
+    gSPDisplayList(addr[(index-1)*4 + rearDirection])
+    G_NOOP 0x65
+
+0044 rev12 turns the brackets into a suppressed nested G_DL in the walks the
+span does not belong to. The two spans are EXCLUSIVE, never additive: the
+four direction variants share the section's own road surface, so drawing both
+in one walk is a coplanar double submission -- trap A4's "flat patches &
+smears" and stale depth. The eyes run span 1 only and are bit-identical to
+1.0.0.12; the rear walk runs span 2 only.
+
+This is NOT trap A3. It does not widen the section window and it is not
+RaYRoD's whole-course draw: it is the game's own per-track, per-direction
+asset, the one MK64 draws whenever you look behind. No geometry appears that
+the game does not already show from that section.
+
+Every risk from the diagnosis is honoured HERE, at the emit site:
+  * pathCounter / playerDirection are NOT written by the rear emit --
+    draw_transparent_geography and CM_DrawTransparency read both back
+    (render_courses.c:198-237). Water and transparent geography stay
+    forward-keyed in the pane: a known, documented residual.
+  * the already-computed section index is REUSED rather than re-derived, so
+    the three `index == 255` / pathCounter fallbacks above cannot produce a
+    different (or out-of-table) answer for the rear list than for the
+    forward one.
+  * Bowser's Castle's credits-quality statue LOD swap is MIRRORED for the
+    rear index, evaluated against the rear index exactly as the stock branch
+    evaluates it against the forward one.
+  * the span is emitted only from `render_track_sections`, so mods' own
+    `Track::Draw` (engine/tracks/Track.cpp, which emits every section
+    unconditionally) is untouched and cannot double-draw.
+  * the rear span is emitted AFTER the forward span, i.e. after all of its
+    state, so the wrapper's render-mode/combine/fog reset still closes both.
+  * nothing is emitted at all unless the two direction buckets DIFFER, which
+    is most of the point: on a straight the pane's list is already right, and
+    a span that changed no answer would make `rear_dl_swaps` a lie (trap D32's
+    corollary).
+
+`vr set rearsec 0` is the red control (F3).
+
+REV2 (VR R21 item 3, the cinematic cameras): THE SAME HOLE, IN THE EYES. In the
+end-of-race results and the title attract demo MK64 runs camera mode 3 -- a
+scripted trackside camera (func_8001A588) that cuts between presets along the
+path and may follow another kart -- while the VR first-person seat stays in
+player 1's kart. render_track_sections picks the section list from the GAME
+camera: its section (camera->collision, mode != 1 branch) and its yaw bucket.
+So the eyes were handed "section S as seen from the trackside camera, looking
+the camera's way" while looking from the kart, down the kart's heading: the
+road strip (shared by every direction variant) drew and the ground around it
+did not -- the user's results screenshot. Measured in VR-R21-NOTES §3.
+Telemetry (every VR frame, both arms): gSohVRCine* -- camera mode and
+playerId, the camera's and the seat's yaw buckets, the camera's and player 1's
+sections, the index drawn, and how often they disagreed.
+gSohVRCineSec (the fix, `vr set cinesec`, ships 1): in a VR FIRST-PERSON world frame
+whose camera is a cinematic one (mode 3), the eyes' section and direction come
+from player 1's kart -- the seat -- exactly as mode 1 derives them from a
+camera sitting behind that kart. Racing (mode 1), the fly-by (TourCamera),
+third person / Diorama (seated ON the game camera) and the flat game never take
+the branch.
+
+
+--- a/src/racing/render_courses.c
++++ b/src/racing/render_courses.c
+@@ -86,6 +86,44 @@
+     }
+ }
+ 
++#ifdef __IOS__
++/* SOH_IOS (overlay 0059, VR R16-C step 4): the rear-view pane's own
++ * course section list. See the patch header. Shell-owned globals; plain
++ * externs, this is a C TU. */
++extern volatile int gSohVRWorldActive;
++extern volatile int gSohVRMirrorActive;
++extern volatile int gSohVRRearSec;
++extern volatile int gSoh3DInPlay;
++/* rev2 (R21 item 3): the cinematic-camera section list. Shell-owned. */
++extern volatile int gSohVRFpWorld;
++extern volatile int gSohVRCineSec;
++extern volatile int gSohVRCineMode, gSohVRCinePlayer, gSohVRCineCamDir, gSohVRCineSeatDir;
++extern volatile int gSohVRCineCamSec, gSohVRCinePlySec, gSohVRCineIndex, gSohVRCineOwn;
++extern volatile unsigned int gSohVRCineFrames, gSohVRCineDirDiff, gSohVRCineSecDiff, gSohVRCineOverrides;
++extern volatile float gSohVRCineCamKart, gSohVRCineExportErr;
++extern volatile float gSoh3DCamEye[3];
++/* The bucket, lifted out of render_track_sections verbatim so the rear
++ * camera is classified by exactly the code that classifies the forward
++ * one -- including the mirror-mode swap of EAST and WEST. */
++static s16 SohVRTrackDirection(u16 sohRot) {
++    if (sohRot < 0x2000) {
++        return SOUTH;
++    } else if (sohRot < 0x6000) {
++        return gIsMirrorMode ? WEST : EAST;
++    } else if (sohRot < 0xA000) {
++        return NORTH;
++    } else if (sohRot < 0xE000) {
++        return gIsMirrorMode ? EAST : WEST;
++    }
++    return SOUTH;
++}
++static void SohVREmitNoOp(u32 sohTagId) {
++    Gfx* sohTag = gDisplayListHead++;
++    sohTag->words.w0 = (uintptr_t) ((G_NOOP << 24) | (sohTagId << 16));
++    sohTag->words.w1 = 0;
++}
++#endif
++
+ extern u32 isFlycam;
+ 
+ void render_track_sections(const char* addr[], ScreenContext* arg1) {
+@@ -183,7 +221,107 @@
+         }
+     }
+ 
++#ifdef __IOS__
++    /* rev2 (R21 item 3): the section the GAME camera chose, kept for the
++     * rear pane. The pane is the look-behind camera, which in a cinematic is
++     * a trackside preset too (and was correct on 1.0.1.19 there): when the
++     * eyes are moved onto the seat's section below, the pane must keep the
++     * stock answer, not inherit the seat's (measured: green eyes, a ground
++     * hole in the pane, artifacts/vr-r21/3-results-fp-green.png). */
++    s16 sohStockSection = index;
++    {
++        /* SOH_IOS (overlay 0059 rev2, VR R21 item 3): the CINEMATIC camera.
++         * Measured in every VR world frame whatever gSohVRCineSec says (trap
++         * D48: the red arm must read the same quantity). The seat is player
++         * 1's kart (first person); its heading is the camera (atan2s)
++         * convention of 0045 rev3: -rotation[1]. */
++        if (gSohVRWorldActive && gSoh3DInPlay && gPlayerOne != NULL) {
++            const s16 sohSeatDir = SohVRTrackDirection((u16) (s16) (-(s32) (s16) gPlayerOne->rotation[1]));
++            const s16 sohPlySec = get_track_section_id(gPlayerOne->collision.meshIndexZX);
++            const s16 sohCamSec = get_track_section_id(camera->collision.meshIndexZX);
++            const f32 sohKx = camera->pos[0] - gPlayerOne->pos[0];
++            const f32 sohKy = camera->pos[1] - gPlayerOne->pos[1];
++            const f32 sohKz = camera->pos[2] - gPlayerOne->pos[2];
++            const f32 sohEx = camera->pos[0] - gSoh3DCamEye[0];
++            const f32 sohEy = camera->pos[1] - gSoh3DCamEye[1];
++            const f32 sohEz = camera->pos[2] - gSoh3DCamEye[2];
++            gSohVRCineMode = camera->mode;
++            gSohVRCinePlayer = camera->playerId;
++            gSohVRCineOwn = (player == gPlayerOne) ? 1 : 0;
++            gSohVRCineCamDir = direction;
++            gSohVRCineSeatDir = sohSeatDir;
++            gSohVRCineCamSec = sohCamSec;
++            gSohVRCinePlySec = sohPlySec;
++            gSohVRCineCamKart = sqrtf(sohKx * sohKx + sohKy * sohKy + sohKz * sohKz);
++            gSohVRCineExportErr = sqrtf(sohEx * sohEx + sohEy * sohEy + sohEz * sohEz);
++            if (camera->mode == 3) {
++                gSohVRCineFrames = gSohVRCineFrames + 1u;
++                if (gSohVRFpWorld && sohSeatDir != direction) {
++                    gSohVRCineDirDiff = gSohVRCineDirDiff + 1u;
++                }
++                if (gSohVRFpWorld && sohPlySec != 255 && sohPlySec != index) {
++                    gSohVRCineSecDiff = gSohVRCineSecDiff + 1u;
++                }
++                /* THE FIX: the seat's own section and heading. 255 (off the
++                 * collision mesh, airborne) keeps the camera's answer, which
++                 * is what the stock fallbacks would also do. */
++                if (gSohVRCineSec && gSohVRFpWorld && sohPlySec != 255 && sohPlySec >= 1 && sohPlySec < 64) {
++                    index = sohPlySec;
++                    direction = sohSeatDir;
++                    arg1->playerDirection = direction;
++                    gSohVRCineOverrides = gSohVRCineOverrides + 1u;
++                }
++            }
++            gSohVRCineIndex = index;
++        }
++    }
++#endif
+     arg1->pathCounter = index;
++#ifdef __IOS__
++    {
++        /* SOH_IOS (overlay 0059, VR R16-C step 4): decide the rear list
++         * BEFORE the forward emit, so the eyes-only bracket can open in
++         * front of it. Nothing is emitted unless the pane is actually up
++         * AND the rear camera buckets differently -- see the header. */
++        s16 sohSection = sohStockSection; /* rev2: the game camera's section */
++        s16 sohRearDir = -1;
++        s16 sohRearIndex = 0;
++        if (gSohVRWorldActive && gSohVRMirrorActive && gSohVRRearSec && gSoh3DInPlay &&
++            (arg1->lookBehindCamera != NULL) && (arg1->lookBehindCamera != camera) &&
++            (sohSection >= 1) && (sohSection < 64)) {
++            sohRearDir = SohVRTrackDirection((u16) arg1->lookBehindCamera->rot[1]);
++            sohRearIndex = ((sohSection - 1) * 4) + sohRearDir;
++            /* rev2: compared as a LIST, not a bucket -- with the cinematic
++             * override the eyes' section can differ while the bucket agrees. */
++            if (sohRearIndex == ((index - 1) * 4) + direction) {
++                sohRearDir = -1; /* the override would change no answer */
++            }
++        }
++        index = ((index - 1) * 4) + direction;
++        if (sohRearDir >= 0) {
++            SohVREmitNoOp(0x62); /* eyes-only span begins */
++        }
++        gSPDisplayList(gDisplayListHead++, addr[index]);
++
++        if (CVarGetInteger("gDisableLod", 1) == 1 && (IsBowsersCastle()) &&
++            (index < 20 || index > 99)) { // always render higher version of bowser statue
++            gDisplayListHead--;
++            gSPDisplayList(gDisplayListHead++, d_course_bowsers_castle_dl_9148); // use credit version of the track
++        }
++        if (sohRearDir >= 0) {
++            SohVREmitNoOp(0x63);
++            SohVREmitNoOp(0x64); /* rear-only span begins */
++            gSPDisplayList(gDisplayListHead++, addr[sohRearIndex]);
++            /* the same LOD branch, evaluated against the REAR index */
++            if (CVarGetInteger("gDisableLod", 1) == 1 && (IsBowsersCastle()) &&
++                (sohRearIndex < 20 || sohRearIndex > 99)) {
++                gDisplayListHead--;
++                gSPDisplayList(gDisplayListHead++, d_course_bowsers_castle_dl_9148);
++            }
++            SohVREmitNoOp(0x65);
++        }
++    }
++#else
+     index = ((index - 1) * 4) + direction;
+     gSPDisplayList(gDisplayListHead++, addr[index]);
+ 
+@@ -192,6 +330,7 @@
+         gDisplayListHead--;
+         gSPDisplayList(gDisplayListHead++, d_course_bowsers_castle_dl_9148); // use credit version of the track
+     }
++#endif
+ }
+ 
+ void func_80291198(void) {

@@ -1,0 +1,243 @@
+Overlay patch 0066 (VR R19 item 6): THE START-LINE LAKITU, PUSHED BACK TO
+WHERE A CHASE CAMERA SEES HIM, IN VR FIRST PERSON ONLY.
+
+the user on 1.0.0.17: "when you start a race, the cloud guy laikutu, he comes too
+close to you, any way to fix that?"
+
+WHY. The countdown Lakitu (unk_0D8 == 1, update_object_lakitu_starter) is
+placed by OLakitu::func_8007A66C relative to the PLAYER's kart, rotated by the
+game camera's yaw: pos = kart + R(yaw) * (origin_pos + offset), the offset
+running a spline (D_800E67B8). Its size (sizeScaling 0.15) and its distance
+were tuned for MK64's chase camera, which hangs well behind and above the kart.
+In VR first person the eye sits AT the kart (the pinned seat, 3.2 u up), so
+the same world position is several times closer to the eye than it is to any
+flat camera: he hangs in the rider's face.
+
+WHAT. After func_8007A66C places the starter (case 1 of func_8007AA44, and
+ONLY that case -- the checkered-flag, lap-count, retrieval and reverse
+Lakitus are untouched), when gSohVRFpWorld (shell: a VR world frame in
+first person), gSohVRLakituPush and the starter is shown (object flag 0x10),
+he is TRANSLATED by (seat - game camera), seat = kart + the pinned first-
+person height (3.2 u, R18-B). So his offset from the rider's seat is exactly
+his offset from MK64's chase camera: the same distance (~50-58 u through the
+countdown hold, measured), the same bearing against the camera's look
+direction, the same size on screen. The first attempt -- pushing him radially
+out from the kart to the chase camera's distance -- was measured and dropped:
+it kept his bearing FROM THE KART, which is steeply up and to the right
+(az 25-58 deg, el 41-62 deg from the eye), i.e. out of the field of view.
+Anchor = the seat, not the live eye: anchoring on the head would make him
+follow every head movement. Third person, Diorama, 2D/3D-panel and every
+flat frame: gSohVRFpWorld is 0, nothing moves (the flat path computes the
+instrument only).
+
+INSTRUMENT (bridge `vr lakitu`, all targets that link the shell): the
+starter's distance and bearing from the game camera (`cam_d`, `cam_az`,
+`cam_el`: the flat reference, read before any move), to the kart, to the VR eye (gSohVREyePosGame, VR world frames only), the camera-kart
+distance, minima over the visible countdown, and the push count. RED/GREEN on
+one binary: `vr set lakitupush 0` = 1.0.0.17.
+
+Platform: __IOS__ (iPhone + visionOS); the macOS build compiles none of it.
+
+REV2 (VR R20 item 2, 2026-10-09): CLOSER AND HIGHER. the user on 1.0.0.18:
+"lakitu is now a little too far away, he's also too low, so that the racers
+in front of me block him." rev1 put him at the chase camera's whole offset
+(45-60 u, near eye level), where the grid rows ahead stand between him and the
+rider. rev2 keeps the flat AZIMUTH (the offset's horizontal direction), scales
+the offset by gSohVRLakituDistK (default 0.60 -> ~27-35 u through the hold),
+and lifts him by gSohVRLakituUp game units above that point. The lift is
+DERIVED, not tasted (docs/VR-R20-NOTES.md §2): from the rider's eye his lowest
+point (pos.y - 35 * 0.15 = pos.y - 5.25: fixed_common_vtx_lakitu at
+sizeScaling 0.15) must clear the top of the kart + driver sprite of the grid
+row TWO places ahead (gPlayerVtx's quad, 18 u tall at gCharacterSize 0.75 =
+13.5 u) by at least half a sprite height, as an angle:
+    (bottom - eye) / dL >= (top2 + 6.75 - eye) / d2,
+dL his horizontal forward distance from the seat, d2 that kart's. The
+instrument measures d2/top2 on the live grid every countdown tick and reports
+the clearance in sprite heights (`row2_clear_h`, >= 0.5 is the requirement).
+Bridge knobs `vr set lakitudist <k>` and `vr set lakituup <u>`.
+
+
+--- a/src/engine/objects/Lakitu.cpp
++++ b/src/engine/objects/Lakitu.cpp
+@@ -6,7 +6,39 @@
+ 
+ #include "port/Game.h"
+ 
++#ifdef __IOS__
++// SOH_IOS (overlay 0066, VR R19 item 6): the start-line Lakitu in VR first
++// person. See scripts/gen-patch-0066.py.
+ extern "C" {
++extern volatile int gSohVRFpWorld;          // shell: VR world frame, first person
++extern volatile int gSohVRWorldActive;
++extern volatile float gSohVREyePosGame[3];  // the live eye, game units
++volatile int gSohVRLakituPush = 1;          // 0 = 1.0.0.17 (red control)
++volatile int gSohVRLakituLive = 0;          // 1 = the starter is drawn this tick
++volatile float gSohVRLakituCamD = 0.0f, gSohVRLakituKartD = 0.0f, gSohVRLakituEyeD = 0.0f;
++volatile float gSohVRLakituCamKartD = 0.0f;
++volatile float gSohVRLakituCamDMin = 1.0e9f, gSohVRLakituEyeDMin = 1.0e9f, gSohVRLakituKartDMin = 1.0e9f;
++volatile unsigned int gSohVRLakituTicks = 0, gSohVRLakituPushes = 0;
++// where the eye sees him: azimuth (deg, + = right) and elevation (deg, + = up)
++// against the game camera's own look direction (lookAt - pos), from the eye.
++volatile float gSohVRLakituAzDeg = 0.0f, gSohVRLakituElDeg = 0.0f;
++volatile float gSohVRLakituCamAzDeg = 0.0f, gSohVRLakituCamElDeg = 0.0f; // the same, from the game camera
++// rev2 (VR R20 item 2): closer and higher, and the row-two clearance it is
++// derived from. The defaults are the derivation's result (VR-R20-NOTES §2).
++volatile float gSohVRLakituDistK = 0.60f;   // fraction of the chase camera's offset
++volatile float gSohVRLakituUp = 16.5f;      // extra lift above that point, game units (derived: VR-R20-NOTES §2)
++volatile float gSohVRLakituRow2D = 0.0f;    // forward distance of the kart two places ahead, from the seat
++volatile float gSohVRLakituRow2Top = 0.0f;  // its sprite top, relative to the seat height
++volatile float gSohVRLakituRow2Lat = 0.0f;  // its lateral offset (+ = right)
++volatile float gSohVRLakituFwdD = 0.0f;     // Lakitu's forward distance from the seat (dL)
++volatile float gSohVRLakituBottom = 0.0f;   // his lowest point, relative to the seat height
++volatile float gSohVRLakituClearH = 0.0f;   // angular clearance over row two, in sprite heights
++volatile float gSohVRLakituClearHMin = 1.0e9f;
++volatile int gSohVRLakituAhead = 0;         // karts ahead of the rider on the grid
++}
++#endif
++
++extern "C" {
+ #include "macros.h"
+ #include "main.h"
+ #include "code_800029B0.h"
+@@ -846,8 +878,131 @@
+                 gObjectList[objectIndex].unk_0D6 = 0;
+             }
+             break;
++    }
++}
++
++#ifdef __IOS__
++// SOH_IOS (overlay 0066): measure the starter against the camera / kart / eye,
++// and in VR first person move it so the EYE sees it exactly where the flat
++// chase camera does: same offset from the eye as it has from the game camera.
++#define SOHVR_LAKITU_SEAT_UP 3.2f // R18-B's pinned first-person seat height, game units
++// rev2: the two sprite sizes the lift is derived from (game units).
++#define SOHVR_LAKITU_HALF_H (35.0f * 0.15f)  // fixed_common_vtx_lakitu y +-35 at sizeScaling 0.15
++#define SOHVR_KART_SPRITE_Y 18.0f            // gPlayerVtx quad top (y 0..18) before gCharacterSize
++static float SohVRLakituLen(const f32* a, const f32* b) {
++    const float dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
++    return sqrtf(dx * dx + dy * dy + dz * dz);
++}
++// Bearing of `pt` seen from `from`, against the game camera's look direction
++// (lookAt - pos, horizontal): azimuth + = right, elevation + = up, degrees.
++static void SohVRLakituBearing(const Camera* c, const f32* from, const f32* pt, volatile float* az,
++                               volatile float* el) {
++    const float fx = c->lookAt[0] - c->pos[0], fz = c->lookAt[2] - c->pos[2];
++    const float fl = sqrtf(fx * fx + fz * fz);
++    const float rx = pt[0] - from[0], ry = pt[1] - from[1], rz = pt[2] - from[2];
++    if (fl > 1.0e-4f) {
++        const float fwd = (rx * fx + rz * fz) / fl;
++        const float right = (rx * -fz + rz * fx) / fl;
++        *az = atan2f(right, fwd) * 57.29578f;
++        *el = atan2f(ry, sqrtf(rx * rx + rz * rz)) * 57.29578f;
++    }
++}
++static void SohVRLakituStarter(s32 objectIndex, s32 playerId, s32 cameraId) {
++    if (cameraId < 0) {
++        return;
++    }
++    Object* o = &gObjectList[objectIndex];
++    Player* p = &gPlayers[playerId];
++    Camera* c = &cameras[cameraId];
++    const int live = is_obj_flag_status_active(objectIndex, 0x00000010) != 0;
++    gSohVRLakituTicks++;
++    gSohVRLakituLive = live;
++    gSohVRLakituCamKartD = SohVRLakituLen(c->pos, p->pos);
++    // The flat reference: where the game camera has him, BEFORE any move.
++    gSohVRLakituCamD = SohVRLakituLen(o->pos, c->pos);
++    SohVRLakituBearing(c, c->pos, o->pos, &gSohVRLakituCamAzDeg, &gSohVRLakituCamElDeg);
++    if (live && gSohVRLakituCamD < gSohVRLakituCamDMin) {
++        gSohVRLakituCamDMin = gSohVRLakituCamD;
++    }
++    // VR first person, while he is shown: translate him by (seat - camera), so
++    // (Lakitu - seat) == (Lakitu - camera). The seat (kart + the pinned fp
++    // height), not the live eye: anchoring on the head would make him follow
++    // every head movement.
++    const f32 seat[3] = { p->pos[0], p->pos[1] + SOHVR_LAKITU_SEAT_UP, p->pos[2] };
++    if (gSohVRLakituPush && gSohVRFpWorld && live) {
++        // rev2: seat + k * (Lakitu - camera) + lift. k scales the whole
++        // offset, so the flat azimuth (and the near-zero flat elevation) is
++        // kept; the lift then raises him over the grid (see the header).
++        const float k = gSohVRLakituDistK;
++        for (int i = 0; i < 3; i++) {
++            o->pos[i] = seat[i] + k * (o->pos[i] - c->pos[i]);
++        }
++        o->pos[1] += gSohVRLakituUp;
++        gSohVRLakituPushes++;
+     }
++    // rev2: the clearance over the grid row two places ahead, from the seat,
++    // along the game camera's horizontal look direction. Measured in every arm.
++    {
++        const float fx = c->lookAt[0] - c->pos[0], fz = c->lookAt[2] - c->pos[2];
++        const float fl = sqrtf(fx * fx + fz * fz);
++        if (fl > 1.0e-4f) {
++            const float ux = fx / fl, uz = fz / fl;
++            float best[2] = { 1.0e9f, 1.0e9f };
++            int bestI[2] = { -1, -1 };
++            int ahead = 0;
++            for (int i = 0; i < NUM_PLAYERS; i++) {
++                if (i == playerId || (gPlayers[i].type & PLAYER_EXISTS) == 0) {
++                    continue;
++                }
++                const float f = (gPlayers[i].pos[0] - seat[0]) * ux + (gPlayers[i].pos[2] - seat[2]) * uz;
++                if (f <= 1.0f) {
++                    continue;
++                }
++                ahead++;
++                if (f < best[0]) {
++                    best[1] = best[0];
++                    bestI[1] = bestI[0];
++                    best[0] = f;
++                    bestI[0] = i;
++                } else if (f < best[1]) {
++                    best[1] = f;
++                    bestI[1] = i;
++                }
++            }
++            gSohVRLakituAhead = ahead;
++            const float dL = (o->pos[0] - seat[0]) * ux + (o->pos[2] - seat[2]) * uz;
++            gSohVRLakituFwdD = dL;
++            gSohVRLakituBottom = o->pos[1] - SOHVR_LAKITU_HALF_H - seat[1];
++            const int r2 = bestI[1];
++            if (r2 >= 0 && dL > 1.0f) {
++                Player* q = &gPlayers[r2];
++                const float h = SOHVR_KART_SPRITE_Y * gCharacterSize[q->characterId] * q->size;
++                gSohVRLakituRow2D = best[1];
++                gSohVRLakituRow2Top = q->pos[1] - q->boundingBoxSize + h - seat[1];
++                gSohVRLakituRow2Lat = (q->pos[0] - seat[0]) * -uz + (q->pos[2] - seat[2]) * ux;
++                // his bottom, projected to row two's distance, minus that
++                // kart's top: + = he clears it. In sprite heights.
++                gSohVRLakituClearH = (gSohVRLakituBottom * best[1] / dL - gSohVRLakituRow2Top) / h;
++                if (live && gSohVRLakituClearH < gSohVRLakituClearHMin) {
++                    gSohVRLakituClearHMin = gSohVRLakituClearH;
++                }
++            }
++        }
++    }
++    gSohVRLakituKartD = SohVRLakituLen(o->pos, p->pos);
++    if (live && gSohVRLakituKartD < gSohVRLakituKartDMin) {
++        gSohVRLakituKartDMin = gSohVRLakituKartD;
++    }
++    if (gSohVRWorldActive) {
++        const f32 eye[3] = { gSohVREyePosGame[0], gSohVREyePosGame[1], gSohVREyePosGame[2] };
++        gSohVRLakituEyeD = SohVRLakituLen(o->pos, eye);
++        SohVRLakituBearing(c, eye, o->pos, &gSohVRLakituAzDeg, &gSohVRLakituElDeg);
++        if (live && gSohVRLakituEyeD < gSohVRLakituEyeDMin) {
++            gSohVRLakituEyeDMin = gSohVRLakituEyeD;
++        }
++    }
+ }
++#endif
+ 
+ void OLakitu::func_8007A66C(s32 objectIndex) {
+     Player* player = &gPlayers[mPlayerId];
+@@ -918,6 +1073,9 @@
+         case 1:
+             OLakitu::func_80079114(objectIndex, playerId, 2);
+             OLakitu::func_8007A66C(objectIndex);
++#ifdef __IOS__
++            SohVRLakituStarter(objectIndex, mPlayerId, mCameraId); // overlay 0066
++#endif
+             break;
+         case 2:
+             OLakitu::func_80079114(objectIndex, playerId, 0);

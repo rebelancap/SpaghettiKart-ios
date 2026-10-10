@@ -15,20 +15,37 @@ commandBuffer() (reference: Hyrule Field frozen with music playing).
 Uploads push retained textures onto a pending list; EndFrame encodes ONE
 generateMipmaps blit pass on the frame's own command buffer. Mips valid
 next frame; ledger counts +1/3 for chains.
+rev12 (VR R10 item 2): `gSohVRDiagNoMips` — the ONE engine-side row of
+the in-headset device bisect kit, "Texture mipmaps". A texture uploaded
+this frame has UNINITIALISED mip levels until the deferred blit above,
+and sampling those minified is arbitrary memory read as colour — a
+textbook rainbow. rev11 mitigates it with a LOD0 sampler; whether that
+mitigation is complete on a DEVICE driver that does not zero-fill fresh
+allocations is exactly the question the kit exists to answer without a
+rebuild. Raised, the flag (a) stops new uploads being mipmapped at all
+and (b) puts every bound texture on the rev11 LOD0 sampler immediately,
+so the toggle changes the picture on the NEXT frame rather than waiting
+for the texture cache to churn. 0 in every shipping frame, and on every
+target but visionOS it is never written at all.
 
 --- a/libultraship/src/fast/backends/gfx_metal.cpp
 +++ b/libultraship/src/fast/backends/gfx_metal.cpp
-@@ -382,21 +382,121 @@
- void GfxRenderingAPIMetal::SelectTexture(int tile, uint32_t texture_id) {
+@@ -337,20 +337,130 @@
      mCurrentTile = tile;
      mCurrentTextureIds[tile] = texture_id;
-+}
+ }
 +
 +// SOH_IOS (overlay 0021 rev4): textures awaiting a mip-chain build in
 +// EndFrame's single blit pass. Entries are retained on push — the 0022
 +// byte-budget cache may evict (release) a texture before the frame ends.
 +static std::vector<MTL::Texture*> sSohIosPendingMips;
 +
++// SOH_IOS (overlay 0021 rev12, VR R10 item 2): the "Texture mipmaps" row of
++// the in-headset Diagnostics bisect. 0 in every shipping frame; the shell
++// owns the storage (SohIosShell.m) because the engine's externs are strong on
++// every target. See the patch header.
++extern "C" volatile int gSohVRDiagNoMips;
+ 
 +#ifdef __IOS__
 +#include <atomic>
 +#include <chrono>
@@ -42,14 +59,14 @@ next frame; ledger counts +1/3 for chains.
 +extern "C" void SohIos_UploadStats(float* ms, unsigned int* count) {
 +    *ms = (float)(sSohIosUpUs.exchange(0) / 1000.0);
 +    *count = sSohIosUpCount.exchange(0);
- }
++}
 +#endif
- 
++
  void GfxRenderingAPIMetal::UploadTexture(const uint8_t* rgba32_buf, uint32_t width, uint32_t height) {
      if (width == 0 || height == 0) {
          return;
-+    }
-+
+     }
+ 
 +    // SOH_IOS (overlay 0021): Metal aborts the process (no error return) if a
 +    // texture dimension exceeds the device limit. ImportTextureRaw's OOB-load
 +    // fallback flattens over-requested HD-pack loads into a single line
@@ -63,8 +80,8 @@ next frame; ledger counts +1/3 for chains.
 +        SPDLOG_WARN("UploadTexture: clamping oversized texture {}x{} to device max {}", width, height, sohIosMaxDim);
 +        width = width > sohIosMaxDim ? sohIosMaxDim : width;
 +        height = height > sohIosMaxDim ? sohIosMaxDim : height;
-     }
- 
++    }
++
 +    // SOH_IOS (overlay 0021 rev7): the phone panel is 2736x1260 — 4K pack
 +    // textures are ~2x oversampled and their mass cannot fit any affordable
 +    // byte budget (DK 4K churned 10-20 evictions/sec at 1280 MB; the churn
@@ -130,7 +147,11 @@ next frame; ledger counts +1/3 for chains.
 +    // textures. A/B live: gSohIos.MipMinDim 256|512|1024.
 +    const uint32_t sohIosMipMin = (uint32_t)Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(
 +        "gSohIos.MipMinDim", 512); // rev9: 256-capped sprites skip mips — kills the first-frame-no-mips flash on re-upload; tracks (>=1280 after decode-cap) keep the vista win. Device A/B at 1024 showed no visual regression.
-+    const bool sohIosWantMips = (width >= sohIosMipMin || height >= sohIosMipMin);
++    // SOH_IOS (overlay 0021 rev12, VR R10 item 2): the diagnostic row forces
++    // every new upload single-level, so no texture can carry an uninitialised
++    // chain while it is on.
++    const bool sohIosWantMips =
++        (gSohVRDiagNoMips == 0) && (width >= sohIosMipMin || height >= sohIosMipMin);
      MTL::TextureDescriptor* texture_descriptor =
 -        MTL::TextureDescriptor::texture2DDescriptor(MTL::PixelFormatRGBA8Unorm, width, height, true);
 +        MTL::TextureDescriptor::texture2DDescriptor(MTL::PixelFormatRGBA8Unorm, width, height, sohIosWantMips);
@@ -142,7 +163,7 @@ next frame; ledger counts +1/3 for chains.
      texture_descriptor->setSampleCount(1);
      texture_descriptor->setStorageMode(MTL::StorageModeShared);
  
-@@ -404,18 +504,63 @@
+@@ -358,18 +468,63 @@
  
      MTL::Texture* texture = texture_data->texture;
      if (texture_data->texture == nullptr || texture_data->texture->width() != width ||
@@ -209,7 +230,7 @@ next frame; ledger counts +1/3 for chains.
      autorelease_pool->release();
  }
  
-@@ -557,16 +702,52 @@
+@@ -511,16 +666,54 @@
  
      for (int i = 0; i < SHADER_MAX_TEXTURES; i++) {
          if (mShaderProgram->usedTextures[i]) {
@@ -240,7 +261,9 @@ next frame; ledger counts +1/3 for chains.
 -                        mTextures[mCurrentTextureIds[i]].sampler, i);
 +            }
 +            MTL::SamplerState* sohIosWant = mTextures[mCurrentTextureIds[i]].sampler;
-+            if (sohIosPending) {
++            // SOH_IOS (overlay 0021 rev12, VR R10 item 2): the same LOD0 path
++            // also serves the "Texture mipmaps" diagnostic row.
++            if (sohIosPending || gSohVRDiagNoMips) {
 +                static MTL::SamplerState* sSohIosClampedLinear = nullptr;
 +                static MTL::SamplerState* sSohIosClampedNearest = nullptr;
 +                bool sohIosLin = mTextures[mCurrentTextureIds[i]].linear_filtering;
@@ -267,7 +290,7 @@ next frame; ledger counts +1/3 for chains.
          }
  
          if (mCurrentFilterMode == FILTER_THREE_POINT) {
-@@ -636,6 +817,25 @@
+@@ -590,6 +783,25 @@
      if (!screen_framebuffer.mHasEndedEncoding)
          screen_framebuffer.mCommandEncoder->endEncoding();
  

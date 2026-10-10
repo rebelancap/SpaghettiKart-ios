@@ -1,0 +1,75 @@
+Overlay patch 0052: the frame limiter's early wake is thrown away by an
+unsigned comparison, so the engine free-runs ~6% fast wherever nothing else
+throttles it — which on this port is every immersive frame (VR-spec D7,
+trap A1's neighbourhood; VR R3 investigation).
+
+MEASURED (Apple Vision Pro simulator, one warm session, same race, minutes
+apart):
+
+    VR, racing     engine_fps 32.55 .. 33.01   tick_tps 65.10 .. 66.03
+    flat, racing   engine_fps 29.92 .. 30.03   tick_tps 59.84 .. 60.06
+
+R0 saw the same thing in the shipped 3D panel space (31.81 / 63.61), and R2
+recorded it in VR (32.4 / 64.8) and could not attribute it. It is not VR, and
+it is not first person: it is LUS's own frame limiter, and flat mode merely
+hides it.
+
+GfxWindowBackendSDL2::SyncFramerateWithTime computes the next frame deadline,
+sleeps until ~1 ms before it (the deliberate `left -= 10000` macOS scheduler
+margin), then intends to snap the recorded time BACK to the deadline so the
+early wake does not shorten the frame:
+
+    if (left > 0 && t - next < 10000) { t = next; }
+    previous_time = t;
+
+`t` is uint64_t and `next` is int64_t, so `t - next` is evaluated UNSIGNED.
+Waking early makes it negative — which wraps to ~1.8e19, the comparison is
+false, and the snap never happens. previous_time therefore advances by
+(interval - 1 ms) every frame:
+
+    60 Hz target: 16.67 ms - 1 ms = 15.67 ms  ->  63.8 tick/s, 31.9 engine fps
+
+which is exactly the number both immersive modes report. In flat mode the
+window's own vsync blocks the swap and absorbs the slack, so the rate reads a
+clean 60 and the bug is invisible.
+
+The fix is the cast the comparison always wanted: a LATE wake (more than 1 ms
+past the deadline) still refuses to snap, which is the branch's real purpose;
+an EARLY wake now snaps, which is what makes the pacing exact. Windows is
+unaffected either way (its busy-wait loop guarantees t >= next before this
+line). __IOS__-guarded so the macOS build keeps upstream's exact behaviour
+and stays a true comparator.
+
+
+--- a/libultraship/src/fast/backends/gfx_sdl2.cpp
++++ b/libultraship/src/fast/backends/gfx_sdl2.cpp
+@@ -702,12 +702,29 @@
+         t = qpc_to_100ns(SDL_GetPerformanceCounter());
+     }
+ #endif
++#ifdef __IOS__
++    // SOH_IOS (overlay 0052): the comparison below is UNSIGNED upstream — `t`
++    // is uint64_t, `next` is int64_t — so the deliberate ~1 ms early wake on
++    // Apple platforms wraps `t - next` to ~1.8e19, the snap never happens, and
++    // previous_time advances by (interval - 1 ms) every frame. Anywhere the
++    // swap does not block on vsync (every immersive frame on this port: the
++    // window is parked and its render gated) the engine then free-runs ~6%
++    // fast: 63.8 tick/s and 31.9 engine fps against a 60/30 target, which is
++    // exactly what VR and the 3D panel have been reporting since R0.
++    // Signed, a LATE wake still refuses to snap — which is the branch's actual
++    // purpose — and an EARLY one snaps to the deadline, which is what makes
++    // the pacing exact.
++    if (left > 0 && (int64_t)(t - (uint64_t)next) < 10000) {
++        t = next;
++    }
++#else
+     if (left > 0 && t - next < 10000) {
+         // In case it takes some time for the application to wake up after sleep,
+         // or inaccurate mTimer,
+         // don't let that slow down the framerate.
+         t = next;
+     }
++#endif
+     previous_time = t;
+ }
+ 

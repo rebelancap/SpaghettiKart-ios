@@ -32,12 +32,103 @@ NOT replicated in EndFrameOffscreen (upstream-only machinery, dormant in
 3D): the mScreenReadbackRequested fb-0 deferred-readback path — MK64's
 only G_READFB emitter reads a custom fb via the synchronous compute path,
 and fb-0 CopyFrameBuffer sources redirect to mGameFb when mRendersToFb.
+VR additions (R1, VR-spec D2/D6/D7, all gated on gSohVRWorldActive so the
+flat and 3D-panel paths are byte-identical when it is 0):
+- Eye-matrix hook: in VR world frames Soh3DStereoP substitutes the shell's
+  composed A*V*P eye matrix for the game's combined view*projection. The pose
+  is acquired ONCE per host frame (Soh3DSetEye(1) -> SohIosVR_AcquireEyes)
+  and its frame id rides back out with the eye texture (Soh3DPublishOnComplete
+  tag) so the loop submits the anchor the frame was rendered against (B1).
+  This hook lives INSIDE text 0044 inserts, so it lands as a regeneration of
+  0044 rather than a stacked patch (R0 structural finding).
+- Depth handoff: the eye framebuffer's DEPTH texture is published alongside
+  its colour texture, for the loop's forward-Z -> reverse-Z conversion (D2 as
+  amended: the compositor is reverse-Z/infinite-far, the engine is not).
+- HUD framebuffer: MK64's HUD is RDP texrects that never touch MP_matrix (R0
+  finding 2), so the 2D stretch of the display list is redirected into a
+  dedicated framebuffer (Soh3DVRTarget, upstream's own mid-list target-switch
+  recipe) and composited by the shell as a plane in player space. The sky
+  stretch (0046 sentinels) is parked in the same framebuffer and wiped, which
+  is how R1 "skips the sky in VR".
+- Alpha-0 clears: eye + HUD framebuffers clear to alpha 0 while VR world
+  frames are active, so .mixed shows the room around the diorama.
+VR R3 additions (rev3, spec D12 — the rear-view pane):
+- A THIRD interpreter walk, eye index 3, run ONLY while the shell says the
+  pane is visible (gSohVRMirrorActive). It renders into its own small mono
+  framebuffer (gSohVRMirrorW/H, ~half the eye extent per axis) which is
+  published on GPU completion exactly like the eyes and the HUD.
+- The mirror matrix is NOT hand-rolled and needs no shell publish: the pass
+  reuses the GAME's own combined view*projection and pre-multiplies a world
+  transform that rotates 180 degrees about the vertical axis through the KART
+  (camEye + camFwd*camDist, 0045's export). Rotating the world about the kart
+  and keeping the camera is exactly "a camera the same distance in FRONT of
+  the kart, looking back" — with the game's own FOV, near and far, and with a
+  proper rotation, so winding (and therefore backface culling) is untouched.
+  A left-handed "mirrored" basis would have inverted the winding and culled
+  every visible face; the mirror CONVENTION is a U flip in the shell's plane
+  shader instead.
+- 2D output during the mirror pass goes to a small SINK framebuffer that is
+  never published — the HUD framebuffer must not be touched after the eye
+  passes published it, and it is sized to the eye extent, not the mirror's.
+- The mirror pass restores mCurDimensions to the eye extent when it ends, so
+  StartFrame's dims-changed framebuffer-resize sweep never sees the mirror
+  size. Without that, alternating eye/mirror extents would re-resize every
+  game framebuffer twice per host frame (the Ship of Harkinian port "black sky wedge").
+VR R13 additions (rev7 — the four fixes the R13 scout maps named):
+- item 1b: the eye-extent quiesce trigger now reads the extent the pass will
+  ACTUALLY resize to, so a MIRROR extent change quiesces too. It read the eye
+  extent before the eye==3 override reassigned it, which meant `vr set
+  mirror_res` (and any eye change the mirror rounded differently) released the
+  incumbent mirror texture with the compositor holding it raw.
+- item 2a: the gate reservation is released for framebuffers that were gated
+  and then NOT DRAWN — precisely on the no-command-buffer path, and by a
+  per-frame age SWEEP in the shell for the ones that never reached
+  mDrawnFramebuffers at all. One gSohVRWorldActive flip between the gate and
+  Interpreter::Run leaked gate slot 2 permanently, and from the moment that
+  texture became the published HUD every compositor claim was refused: the
+  HUD stopped drawing for the rest of the session, silently.
+- item 3: the sky's PITCH is re-keyed, per pass, by shifting its ortho
+  projection's out[3][1] by the eye-vs-game-camera pitch difference. Only yaw
+  was ever re-keyed; pitch has been open since R2.
+- item 4: the rear pane's sky. R11's whole-ortho x-shift evacuated the
+  yaw-INDEPENDENT gradient and floor along with the sprites; 0046 rev2's finer
+  sentinels let the gradient and floor draw unshifted and the sprites drop.
+REV15 (VR R18-A, ghost drivers round two): (a) THE BASE. The snapshot's eye
+  matrices are composed by the compositor around the pose IT read; walks run on
+  the game thread right after the export, so a walk can latch a matrix built
+  from the PREVIOUS game frame's pose. R17-A's (prev - cur)(1 - t) assumed the
+  base was always `cur`. Soh3DSeatLerp now adds (cur - seatBase), the shell
+  publishing seatBase in new snapshot slots 24-27 (SOHVR_SKY_SLOTS 24 -> 28);
+  `vr set seatrebase 0` is 1.0.0.16 exactly. Soh3DBaseProbe counts, in every
+  arm, the walks whose base was not the current export. (b) THE CLASS PROBE
+  (dev only, gSohVRClassProbe): G_NOOP 0x70/0x71 brackets from 0054 rev6 and
+  0065 name an object class; the first modelview load inside is that class's
+  drawn position, compared per walk with the eye recovered from the composed
+  eye matrix ITSELF (x = y = w = 0) -- the instrument R17-A's probe was not,
+  because it modelled the seat instead of reading it (trap D11).
+REV16 (VR R21 item 2, the ghosts in the REAR-VIEW pane): the pane walk (eye
+  index 3) never ran the seat's interpolation at all. It builds
+  T = V_pane * V_game^-1 from the look-behind camera and the chase camera as
+  0045 exported them for game frame N, and pre-multiplies it onto `in` -- the
+  game's own view*projection, which FrameInterpolation has ALREADY moved to the
+  walk's sub-frame t. So on every non-key walk the game eye inside `in` was not
+  the eye T undid, and the residual went through T's rotation: for a 180-degree
+  mirror it moved the pane camera FORWARD by the game camera's (1-t) step while
+  every object was drawn at t -- D67's trap applied to T (the matrix built
+  around one base, the content drawn at another). Soh3DPaneLerp moves T onto
+  the walk: the look-behind camera to lerp(prev, cur, t) (0045 rev8 exports
+  prev) and the game eye to the one `in` actually carries, read off the matrix
+  itself (x = y = w = 0). It is the SAME correction the seat applies -- one
+  walk weight (Soh3DWalkW) and one world pre-translation (Soh3DPreTranslate),
+  shared, not copied. `vr set panelerp 0` = 1.0.1.19. The class probe gains a
+  pane mode (`vr set classprobe 2`): the same table, sampled on the pane walk,
+  with the eye recovered from the pane's composed matrix.
 All new code is __IOS__-guarded; the shell globals live in SohIosShell.m
 so iPhone links resolve (mode stays 0 there); macOS compiles none of it.
 
 --- a/libultraship/include/fast/backends/gfx_rendering_api.h
 +++ b/libultraship/include/fast/backends/gfx_rendering_api.h
-@@ -53,6 +53,21 @@
+@@ -53,6 +53,56 @@
      virtual void OnResize() = 0;
      virtual void StartFrame() = 0;
      virtual void EndFrame() = 0;
@@ -54,14 +145,49 @@ so iPhone links resolve (mode stays 0 there); macOS compiles none of it.
 +    }
 +    // Request that this framebuffer's texture be published to the
 +    // stereo compositor ON GPU COMPLETION of the frame that renders it.
-+    virtual void Soh3DPublishOnComplete(int fb, int eyeIdx) {
++    // `tag` rides along: in VR it is the pose frame id the eye was
++    // rendered against, so the loop can submit THAT anchor (trap B1).
++    virtual void Soh3DPublishOnComplete(int fb, int eyeIdx, uint32_t tag) {
++    }
++    // SOH_IOS (overlay 0044, VR): mark a framebuffer as clearing to
++    // alpha 0 while VR world frames are active, so the compositor sees
++    // the room around the diorama in .mixed instead of a black slab.
++    virtual void Soh3DMarkTransparentClear(int fb) {
++    }
++    // SOH_IOS (overlay 0044, VR): publish the HUD framebuffer's texture
++    // to the shell's plane compositor, on GPU completion like the eyes.
++    virtual void Soh3DPublishHudOnComplete(int fb) {
++    }
++    // SOH_IOS (overlay 0044 rev3, VR R3 / spec D12): publish the
++    // rear-view pane's framebuffer to the shell's plane compositor.
++    virtual void Soh3DPublishMirrorOnComplete(int fb) {
++    }
++    // SOH_IOS (overlay 0044 rev4, VR R9 item 1): block until this
++    // framebuffer's ping-pong slot is free to re-render -- not in flight
++    // on the GPU, and not the texture the compositor is currently bound
++    // to. Returns 1 if the slot came free, 0 if the bounded wait gave up.
++    // Default "always free": only the Metal backend renders eyes.
++    // rev6: maxSpins <= 0 is a NON-BLOCKING probe ("is this slot free
++    // right now?"), which is what lets the producer CHOOSE a free slot
++    // instead of insisting on the next one in rotation and then starving
++    // out of its own bounded wait onto a slot the consumer still holds.
++    virtual int Soh3DWaitEyeSlot(int fb, int eyeIdx, int maxSpins = 400) {
++        return 1;
++    }
++    // SOH_IOS (overlay 0044 rev5, VR R11 item 2): unpublish every eye,
++    // HUD and rear-view texture, wait (bounded) for the engine's own
++    // command buffers AND the compositor's claims to drain, and release
++    // the retire ring. Called immediately before a resize releases those
++    // attachments; without it the compositor dereferences a freed
++    // texture and the app dies on the spot.
++    virtual void Soh3DQuiesceEyeSlots() {
 +    }
      virtual void FinishRender() = 0;
      virtual int CreateFramebuffer() = 0;
      virtual void UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
 --- a/libultraship/include/fast/backends/gfx_metal.h
 +++ b/libultraship/include/fast/backends/gfx_metal.h
-@@ -153,6 +153,16 @@
+@@ -153,6 +153,23 @@
      void OnResize() override;
      void StartFrame() override;
      void EndFrame() override;
@@ -73,19 +199,24 @@ so iPhone links resolve (mode stays 0 there); macOS compiles none of it.
 +    void EndFrameOffscreen() override;
 +    void Soh3DImGuiPrime(int fb) override;
 +    void Soh3DImGuiRender(int fb, void* drawData) override;
-+    void Soh3DPublishOnComplete(int fb, int eyeIdx) override;
++    void Soh3DPublishOnComplete(int fb, int eyeIdx, uint32_t tag) override;
++    void Soh3DMarkTransparentClear(int fb) override;
++    void Soh3DPublishHudOnComplete(int fb) override;
++    void Soh3DPublishMirrorOnComplete(int fb) override;
++    // SOH_IOS (overlay 0044 rev4, VR R9 item 1): the eye-slot handoff gate.
++    int Soh3DWaitEyeSlot(int fb, int eyeIdx, int maxSpins = 400) override;
++    // SOH_IOS (overlay 0044 rev5, VR R11 item 2): the resize quiesce.
++    void Soh3DQuiesceEyeSlots() override;
 +#endif
      void FinishRender() override;
      int CreateFramebuffer() override;
      void UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
 --- a/libultraship/src/fast/backends/gfx_metal.cpp
 +++ b/libultraship/src/fast/backends/gfx_metal.cpp
-@@ -1066,8 +1066,147 @@
+@@ -1116,6 +1116,731 @@
+ void GfxRenderingAPIMetal::FinishRender() {
  }
  
- void GfxRenderingAPIMetal::FinishRender() {
-+}
-+
 +#ifdef __IOS__
 +// SOH_IOS (overlay 0044): end-of-eye-pass flush for stereoscopic 3D. The
 +// screen framebuffer was never set up this frame (no drawable — a hidden
@@ -96,22 +227,451 @@ so iPhone links resolve (mode stays 0 there); macOS compiles none of it.
 +// here (dormant in 3D — see the patch header).
 +extern "C" {
 +extern void* volatile gSoh3DEyeTexture[2];
++// SOH_IOS (overlay 0044, VR): the eye's DEPTH texture and the pose
++// frame id it was rendered against, published by the same handler and
++// therefore always consistent with the colour texture.
++extern void* volatile gSoh3DEyeDepthTexture[2];
++extern volatile unsigned int gSoh3DEyeTag[2];
++// SOH_IOS (overlay 0044 rev6, VR R12 item 1): the frame-tag probe's
++// STAMP id, which is NOT the pose tag. rev5 stamped the pose tag, and
++// the pose tag only changes when the COMPOSITOR publishes a new pose --
++// so any condition that slows the compositor (which is every condition
++// this bug lives in, and every stress that reproduces it) makes the
++// engine re-render the slot with the SAME byte and the probe reads a
++// perfect match through a real tear. Measured: 150 ms of induced
++// compositor delay, zero misses, on the protocol that is known broken.
++// The stamp is a per-eye publish counter instead: it changes on every
++// single eye pass, so overwriting a slot ALWAYS changes the pixels the
++// probe reads (trap D30 amended -- the value that rides the bytes must
++// change as often as the bytes do).
++extern volatile unsigned int gSoh3DEyeStamp[2];
++extern void* volatile gSoh3DHudTexture;
++extern void* volatile gSoh3DMirrorTexture;
++extern volatile int gSohVRWorldActive;
++extern volatile int gSohVRDbgClearsAll, gSohVRDbgClearsAlpha;
++// SOH_IOS (overlay 0044 rev10, VR R16-A): the eye pair's PUBLICATION.
++//   gSohVREyePubHoldMs -- the producer-gap injection. On device the two
++//     eye passes are separate command buffers executed serially by the
++//     GPU, so eye 1 completes roughly one eye pass (~10 ms) after eye 0
++//     and the compositor spends a large fraction of every host frame
++//     looking at a MISMATCHED pair. In the simulator the passes are
++//     cheap and the gap is microseconds, which is why every split
++//     number this arc has produced was measured in a regime the device
++//     never enters. This holds eye 0's publication back by <ms> so the
++//     simulator can be put in the device's regime on demand.
++//   gSohVREyePubAtomic / gSohVRPubOrphans -- rev10's own fix and its
++//     bound (see the staging block in the publish handler).
++extern volatile int gSohVREyePubHoldMs;
++extern volatile int gSohVREyePubAtomic;
++extern volatile unsigned int gSohVRPubOrphans;
++}
++// SOH_IOS (overlay 0044 rev4, VR R9 item 1): the handoff bookkeeping.
++//   sSoh3DInFlight -- per framebuffer, how many of its own command
++//     buffers are committed and not yet complete. Bumped at commit,
++//     dropped in a completion handler, so it is an honest "the GPU still
++//     owns this texture" rather than a guess from timings.
++//   The counters below are what `vr contract` reports back off the
++//     device at the moment the artefacts appear.
++#define SOH3D_MAX_TRACKED_FB 64
++static std::atomic<int> sSoh3DInFlight[SOH3D_MAX_TRACKED_FB];
++extern "C" {
++volatile unsigned int gSohIosGfxSlotWaits = 0;      // gate engaged
++volatile unsigned int gSohIosGfxSlotStarves = 0;    // gate timed out
++// Split so the gate's COST can be attributed rather than guessed at:
++// (a) the slot's own command buffer is still on the GPU, versus (b) the
++// compositor is still bound to it. They have different fixes.
++volatile unsigned int gSohIosGfxSlotWaitBusy = 0;
++volatile unsigned int gSohIosGfxSlotWaitShown = 0;
++volatile unsigned int gSohIosGfxSlotWaitUs = 0;     // total, microseconds
++// rev6 (R12): did the producer FIND a free slot to write, or did it fall
++// back to rotate-and-wait? A fallback is the only way a starve can
++// happen, and a starve is the producer stomping the consumer.
++volatile unsigned int gSohIosGfxSlotPicks = 0;
++volatile unsigned int gSohIosGfxSlotPickFails = 0;
++volatile unsigned int gSohIosGfxSlotSkips = 0;    // eye passes skipped, not stomped
++volatile unsigned int gSohIosGfxStarveEye[4] = { 0, 0, 0, 0 };
++}
++// SOH_IOS (overlay 0044 rev5, VR R11 item 1): THE LEFT-EYE FIX and its
++// independent instrument. Both symbols are DEFINED IN THE SHELL
++// (SohIosShell.m) because the compositor owns them; the engine only
++// reads them, which is what keeps the assert non-tautological (D11).
++//   SohVR_TexInUse  -- non-zero while a COMPOSITOR command buffer that
++//     has already been encoded still references this texture. The
++//     published-pointer test below cannot see those: the compositor
++//     reads gSoh3DEyeTexture[e] into a local, encodes a pass against it
++//     and commits; that buffer may not execute for tens of ms.
++//   gSohVREyeTagOn / gSohVREyeTagFault -- the corner frame-tag probe and
++//     its deliberate-fault control (D11's discriminating-power clause).
++// SOH_IOS (overlay 0044 rev6, VR R12 item 1): THE OTHER HALF.
++//   SohVR_TexEngineOwn -- the PRODUCER's reservation, the mirror image
++//     of the consumer's claim. rev5 asked the compositor's question at
++//     the moment Soh3DSetEye runs, but that is where the eye pass is
++//     ENCODED, not where it is WRITTEN: every eye framebuffer commits
++//     together at the end of the host frame. Eye 0's gate is therefore
++//     answered a whole host frame before its pixels land and eye 1's
++//     half a frame before -- three compositor frames of exposure versus
++//     one and a half, which is why the survivor of rev5 was still the
++//     LEFT eye (trap D29 one level further out). Marking the slot owned
++//     at the gate and clearing it on completion makes the answer hold
++//     until the write is actually done, for both eyes equally.
++//   SohVR_TexInUseAny -- every outstanding claim, for the quiesce.
++extern "C" {
++int SohVR_TexInUse(void* tex);
++int SohVR_TexInUseAny(void);
++void SohVR_TexEngineOwn(int slot, void* tex);
++void SohVR_TexEngineRelease(void* tex);
++// SOH_IOS (overlay 0044 rev7, VR R13 item 2a): the reservation SWEEP.
++// A reservation is taken at the gate and released only by the drawn
++// framebuffer's completion handler -- so a framebuffer that is gated
++// and then NOT DRAWN (one gSohVRWorldActive flip between the gate and
++// Interpreter::Run is enough) leaks its slot forever, and from the
++// moment that texture becomes the published HUD the compositor's claim
++// is refused on every frame and the HUD never draws again. Called once
++// per host frame; ages each live reservation and drops the stale ones.
++void SohVR_TexEngineSweep(void);
++void SohVR_TexInUseClear(void);
++volatile unsigned int gSohIosGfxQuiesces = 0;   // rev5: resize quiesces
++extern volatile int gSohVREyeTagOn;
++extern volatile int gSohVREyeTagFault;
++}
++// The tag strip is 8 texels of pure black or pure white in the top-left
++// corner of the eye texture, carrying the low 8 bits of the pose tag the
++// eye was rendered against. Black/white because the eye textures are
++// sRGB: 0 and 255 are the only two byte values that survive an sRGB
++// round trip exactly. One immutable 32-byte buffer per possible value
++// (8 KB total, built lazily) so no staging buffer is ever rewritten
++// while the GPU is reading it.
++static MTL::Buffer* sSoh3DTagBuf[256];
++static MTL::Buffer* Soh3DTagBuffer(MTL::Device* dev, unsigned char v) {
++    if (sSoh3DTagBuf[v] == nullptr) {
++        unsigned char px[32];
++        for (int i = 0; i < 8; i++) {
++            unsigned char lvl = ((v >> i) & 1) ? 0xFF : 0x00;
++            px[i * 4 + 0] = lvl;
++            px[i * 4 + 1] = lvl;
++            px[i * 4 + 2] = lvl;
++            px[i * 4 + 3] = 0xFF;
++        }
++        sSoh3DTagBuf[v] = dev->newBuffer(px, sizeof(px), MTL::ResourceStorageModeShared);
++    }
++    return sSoh3DTagBuf[v];
 +}
 +static int sSoh3DPublishFb = -1;
 +static int sSoh3DPublishEye = -1;
++static uint32_t sSoh3DPublishTag = 0;
++static uint32_t sSoh3DStampSeq[2] = { 0, 0 }; // rev6: per-eye publish counter
++static int sSoh3DPublishHudFb = -1;
++static int sSoh3DPublishMirrorFb = -1;
 +static std::mutex sSoh3DPublishMutex;
 +static void* sSoh3DRetired[16];
 +static int sSoh3DRetiredIdx = 0;
++// SOH_IOS (overlay 0044 rev10, VR R16-A / F2): THE PAIR IS PUBLISHED
++// ATOMICALLY. Each eye pass is its own command buffer and its own
++// completion handler, so until rev10 the two eyes' (texture, depth,
++// stamp, tag) triples became visible INDEPENDENTLY -- and on device the
++// gap between them is a whole eye pass (~10 ms out of a ~40 ms host
++// frame), during which every compositor frame sees a mismatched pair
++// and has to take the last-good fallback. R15's pair rule hid that at
++// the consumer; this removes it at the producer, which is where it is.
++// A publication is STAGED here and committed only when its sibling
++// holds the same pose tag; then pair_splits, pair_forced and
++// present_splits are structurally zero rather than merely small.
++static void* sSoh3DPendTex[2] = { nullptr, nullptr };
++static void* sSoh3DPendDepth[2] = { nullptr, nullptr };
++static uint32_t sSoh3DPendStamp[2] = { 0, 0 };
++static uint32_t sSoh3DPendTag[2] = { 0, 0 };
++// Retire a texture the published globals no longer point at. Caller
++// holds sSoh3DPublishMutex.
++static void Soh3DRetireLocked(void* sohT) {
++    if (sohT == nullptr) {
++        return;
++    }
++    void* sohSlot = sSoh3DRetired[sSoh3DRetiredIdx];
++    if (sohSlot != nullptr) {
++        ((MTL::Texture*)sohSlot)->release();
++    }
++    sSoh3DRetired[sSoh3DRetiredIdx] = sohT;
++    sSoh3DRetiredIdx = (sSoh3DRetiredIdx + 1) % 16;
++}
++// Publish one eye. Colour and depth first, stamp next, TAG LAST: the
++// compositor reads the tag before it trusts the rest. Caller holds the
++// mutex.
++static void Soh3DPublishEyeLocked(int sohEye, void* sohTex, void* sohDepth, uint32_t sohStamp,
++                                  uint32_t sohTag) {
++    void* sohOld = (void*)gSoh3DEyeTexture[sohEye];
++    void* sohOldD = (void*)gSoh3DEyeDepthTexture[sohEye];
++    gSoh3DEyeTexture[sohEye] = sohTex;
++    gSoh3DEyeDepthTexture[sohEye] = sohDepth;
++    gSoh3DEyeStamp[sohEye] = sohStamp;
++    gSoh3DEyeTag[sohEye] = sohTag;
++    Soh3DRetireLocked(sohOld);
++    Soh3DRetireLocked(sohOldD);
++}
++static void Soh3DFlushPendLocked(int sohEye) {
++    if (sSoh3DPendTex[sohEye] == nullptr) {
++        return;
++    }
++    Soh3DPublishEyeLocked(sohEye, sSoh3DPendTex[sohEye], sSoh3DPendDepth[sohEye],
++                          sSoh3DPendStamp[sohEye], sSoh3DPendTag[sohEye]);
++    sSoh3DPendTex[sohEye] = nullptr;
++    sSoh3DPendDepth[sohEye] = nullptr;
++    sSoh3DPendStamp[sohEye] = 0;
++    sSoh3DPendTag[sohEye] = 0;
++}
++static std::set<int> sSoh3DTransparentFbs;
 +
-+void GfxRenderingAPIMetal::Soh3DPublishOnComplete(int fb, int eyeIdx) {
++void GfxRenderingAPIMetal::Soh3DPublishOnComplete(int fb, int eyeIdx, uint32_t tag) {
 +    sSoh3DPublishFb = fb;
 +    sSoh3DPublishEye = eyeIdx;
- }
- 
++    sSoh3DPublishTag = tag;
++}
++
++void GfxRenderingAPIMetal::Soh3DMarkTransparentClear(int fb) {
++    sSoh3DTransparentFbs.insert(fb);
++}
++
++void GfxRenderingAPIMetal::Soh3DPublishHudOnComplete(int fb) {
++    sSoh3DPublishHudFb = fb;
++}
++
++void GfxRenderingAPIMetal::Soh3DPublishMirrorOnComplete(int fb) {
++    sSoh3DPublishMirrorFb = fb;
++}
++
++// SOH_IOS (overlay 0044 rev4, VR R9 item 1): THE RAINBOW FIX.
++//
++// A ping-pong slot may not be re-rendered while the compositor can still
++// be reading it. THREE conditions, all load-bearing:
++//
++//   (a) NOT IN FLIGHT -- the engine's own command buffer for this
++//       framebuffer has completed. Without it the engine can be writing
++//       the texture on its queue while the compositor samples it on
++//       another, with no fence between them.
++//   (b) NOT PUBLISHED -- the texture is not the one the shell's loop is
++//       currently binding. With two slots that means the OTHER slot's
++//       publication has landed, i.e. the engine is at most one frame
++//       ahead of what the headset is actually showing.
++//   (c) NOT IN USE BY THE COMPOSITOR (rev5, VR R11) -- no compositor
++//       command buffer that has ALREADY BEEN ENCODED still references
++//       it. This is the condition rev4 was missing, and it is the whole
++//       of the left-eye artefact. (b) tests the CURRENTLY PUBLISHED
++//       pointer; the compositor, running at 90-100 Hz on its own queue,
++//       reads that pointer into a local, encodes a render pass against
++//       it and commits -- and that buffer can sit queued behind the
++//       engine's own 20 Mpix eye pass for tens of milliseconds. By the
++//       time it executes, publication has moved on, (b) reads false,
++//       and the engine is free to scribble on the exact texture the
++//       compositor is about to sample. rev5 makes the compositor keep a
++//       reference from ENCODE to COMPLETION and the gate waits on it.
++//
++// WHY THE LEFT EYE, AND ONLY THE LEFT EYE. rev4 took every slot's gate
++// at Soh3DSetEye(1) -- the head of the host frame. Eye 0 then writes its
++// slot IMMEDIATELY: zero slack between its gate and its first pixel.
++// Eye 1's write starts a whole eye pass later, so any compositor buffer
++// still holding eye 1's slot has had ~16 ms to drain. Every unfenced
++// read therefore lands on eye 0 -- which is cp_drawable view 0, the LEFT
++// eye. The rate scales with render quality because a heavier eye pass
++// makes the compositor's buffers queue longer behind it, and 50% quality
++// kills most of it because the engine gets there before they drain.
++// rev5 also moves each eye's gate to immediately before ITS OWN pass, so
++// neither gate is answering a question about a slot it is not about to
++// touch.
++//
++// In the steady state neither condition is false here, so the gate costs
++// nothing. It engages exactly when the GPU is behind -- a 20.8 Mpix eye
++// pass at 100% render quality, or a system screenshot briefly seizing the
++// GPU -- which is precisely when the user sees the artefacts. The wait is
++// BOUNDED (trap C1: every wait in this port is) at ~40 ms, a little over
++// one engine frame: if the slot never comes
++// free the frame proceeds anyway and the starve is counted, because a
++// render thread blocked forever is a worse bug than a torn frame.
++int GfxRenderingAPIMetal::Soh3DWaitEyeSlot(int fb, int eyeIdx, int maxSpins) {
++    if (fb < 0 || fb >= (int)mFramebuffers.size() || fb >= SOH3D_MAX_TRACKED_FB) {
++        return 1;
++    }
++    MTL::Texture* sohTex = mTextures[mFramebuffers[fb].mTextureId].texture;
++    const struct timespec sohNap = { 0, 100 * 1000 }; // 0.1 ms
++    int sohWaited = 0;
++    for (int sohSpin = 0; sohSpin <= maxSpins; sohSpin++) { // 400 = ~40 ms ceiling
++        bool sohBusy = sSoh3DInFlight[fb].load(std::memory_order_acquire) > 0;
++        bool sohShown = false;
++        // rev5 condition (c). Counted with the 'shown' bucket: both mean
++        // "the consumer still has it", and splitting them further would
++        // add a device number nobody reads.
++        if (sohTex != nullptr && SohVR_TexInUse((void*)sohTex) != 0) {
++            sohShown = true;
++        }
++        if (sohTex != nullptr && !sohShown) {
++            if (eyeIdx >= 0 && eyeIdx <= 1) {
++                sohShown = ((void*)gSoh3DEyeTexture[eyeIdx] == (void*)sohTex);
++            } else if (eyeIdx == 2) {
++                sohShown = ((void*)gSoh3DHudTexture == (void*)sohTex);
++            } else if (eyeIdx == 3) {
++                sohShown = ((void*)gSoh3DMirrorTexture == (void*)sohTex);
++            }
++        }
++        if (!sohBusy && !sohShown) {
++            if (sohWaited) {
++                gSohIosGfxSlotWaits = gSohIosGfxSlotWaits + 1;
++                gSohIosGfxSlotWaitUs = gSohIosGfxSlotWaitUs + (unsigned)(sohWaited * 100);
++            }
++            // rev6: RESERVE the slot. From here until this
++            // framebuffer's command buffer completes, the compositor
++            // refuses to bind it and shows its last coherent frame
++            // instead. Without this the gate's answer expires the
++            // instant it returns.
++            //
++            // A PROBE MUST NOT RESERVE. maxSpins <= 0 means the caller
++            // is only asking whether this slot is free so it can CHOOSE
++            // one; reserving there overwrites the reservation for the
++            // slot actually being written (one entry per gate) and leaves
++            // stale reservations on candidates that were never used --
++            // measured as 1110 starves and a left eye still missing on
++            // every check.
++            if (maxSpins > 0) {
++                SohVR_TexEngineOwn(eyeIdx, (void*)sohTex);
++            }
++            return 1;
++        }
++        // rev6: a PROBE is not a wait, and must not land in the wait
++        // buckets. The free-slot picker probes every candidate once per
++        // host frame, so counting those made `slot_busy` climb into the
++        // thousands and broke the suite line that reads it ("no wait is
++        // ever for the engine's own GPU work") -- a diagnostic breaking
++        // the instrument reading it, trap D33 again.
++        if (sohWaited == 0 && maxSpins > 0) {
++            if (sohBusy) {
++                gSohIosGfxSlotWaitBusy = gSohIosGfxSlotWaitBusy + 1;
++            } else {
++                gSohIosGfxSlotWaitShown = gSohIosGfxSlotWaitShown + 1;
++            }
++        }
++        sohWaited++;
++        nanosleep(&sohNap, nullptr);
++    }
++    if (maxSpins <= 0) {
++        return 0; // a probe, not a wait: no starve, no reservation
++    }
++    gSohIosGfxSlotStarves = gSohIosGfxSlotStarves + 1;
++    if (eyeIdx >= 0 && eyeIdx < 4) {
++        gSohIosGfxStarveEye[eyeIdx] = gSohIosGfxStarveEye[eyeIdx] + 1;
++    }
++    SPDLOG_WARN("Soh3DWaitEyeSlot: slot {} (eye {}) never came free in 40 ms", fb, eyeIdx);
++    // rev6: the gate timed out but the engine writes the slot anyway,
++    // so the reservation is taken anyway. A consumer that keeps binding
++    // a slot the producer has given up waiting for IS the artefact.
++    SohVR_TexEngineOwn(eyeIdx, (void*)sohTex);
++    return 0;
++}
++
++// SOH_IOS (overlay 0044 rev5, VR R11 item 2): THE RESIZE QUIESCE.
++//
++// Ordering matters and each step exists for a named reason:
++//   1. UNPUBLISH under the publish mutex, tags first. The compositor
++//      reads the tag before it trusts colour+depth, so clearing the tag
++//      first means a loop that is mid-read gets a coherent "nothing
++//      published" rather than a torn pair. Its world blit already skips
++//      a null source (it draws the dim wash and the HUD plane), so a
++//      frame or two of unpublished eyes is a black world, not a crash.
++//   2. WAIT for the engine's own in-flight command buffers, so nothing
++//      is still writing the textures we are about to hand back.
++//   3. WAIT for the COMPOSITOR's claims (R11 item 1's count) to fall to
++//      zero, so no already-encoded compositor buffer still references
++//      them. This is the step that actually stops the crash.
++//   4. DRAIN the retire ring. Those are the only remaining references
++//      besides the framebuffers' own, and holding them across a resize
++//      means the peak is the OLD set plus the NEW one -- 1.6 GB plus
++//      another 1.6 GB at 100% on a headset, which is its own way to die.
++// Every wait is bounded (trap C1). If one times out we proceed anyway:
++// a torn frame beats a render thread parked forever.
++void GfxRenderingAPIMetal::Soh3DQuiesceEyeSlots() {
++    {
++        std::lock_guard<std::mutex> sohLock(sSoh3DPublishMutex);
++        gSoh3DEyeTag[0] = 0;
++        gSoh3DEyeTag[1] = 0;
++        gSoh3DEyeStamp[0] = 0;
++        gSoh3DEyeStamp[1] = 0;
++        gSoh3DEyeTexture[0] = nullptr;
++        gSoh3DEyeTexture[1] = nullptr;
++        gSoh3DEyeDepthTexture[0] = nullptr;
++        gSoh3DEyeDepthTexture[1] = nullptr;
++        gSoh3DHudTexture = nullptr;
++        gSoh3DMirrorTexture = nullptr;
++        // rev10 (R16-A): a STAGED publication is a reference to an eye
++        // texture this resize is about to release. Drop both (into the
++        // retire ring, which step 4 drains) rather than leaving the
++        // next completion handler to publish a freed texture.
++        for (int sohE = 0; sohE < 2; sohE++) {
++            Soh3DRetireLocked(sSoh3DPendTex[sohE]);
++            Soh3DRetireLocked(sSoh3DPendDepth[sohE]);
++            sSoh3DPendTex[sohE] = nullptr;
++            sSoh3DPendDepth[sohE] = nullptr;
++            sSoh3DPendStamp[sohE] = 0;
++            sSoh3DPendTag[sohE] = 0;
++        }
++    }
++    const struct timespec sohNap = { 0, 500 * 1000 }; // 0.5 ms
++    for (int sohSpin = 0; sohSpin < 400; sohSpin++) { // ~200 ms ceiling
++        bool sohBusy = false;
++        for (int sohFb = 0; sohFb < SOH3D_MAX_TRACKED_FB; sohFb++) {
++            if (sSoh3DInFlight[sohFb].load(std::memory_order_acquire) > 0) {
++                sohBusy = true;
++                break;
++            }
++        }
++        if (!sohBusy) {
++            break;
++        }
++        nanosleep(&sohNap, nullptr);
++    }
++    // rev6: wait for EVERY outstanding claim, not just the ones that
++    // happen to sit in the retire ring. rev5 scanned the ring only --
++    // which does not contain the textures the compositor is binding
++    // RIGHT NOW, the ones this resize is about to release -- and then
++    // called TexInUseClear anyway, telling the gate that live claims
++    // did not exist. Bounded like every other wait (trap C1).
++    for (int sohSpin = 0; sohSpin < 400; sohSpin++) {
++        if (SohVR_TexInUseAny() == 0) {
++            break;
++        }
++        nanosleep(&sohNap, nullptr);
++    }
++    SohVR_TexInUseClear();
++    {
++        std::lock_guard<std::mutex> sohLock(sSoh3DPublishMutex);
++        for (int sohR = 0; sohR < 16; sohR++) {
++            if (sSoh3DRetired[sohR] != nullptr) {
++                ((MTL::Texture*)sSoh3DRetired[sohR])->release();
++                sSoh3DRetired[sohR] = nullptr;
++            }
++        }
++        sSoh3DRetiredIdx = 0;
++    }
++    gSohIosGfxQuiesces = gSohIosGfxQuiesces + 1;
++    // Log the first few and then shut up. Dragging the render-quality
++    // slider calls this once per notch, and a chatty line here floods
++    // the console bridge's 25-line tail so hard that the suite could no
++    // longer find a single SOH_PERF sample afterwards -- a diagnostic
++    // that breaks the instrument reading it. The COUNTER is the
++    // telemetry (`vr contract` reports quiesces); the log line is only
++    // there to prove the path ran at all.
++    if (gSohIosGfxQuiesces <= 5) {
++        SPDLOG_INFO("Soh3DQuiesceEyeSlots: eye/HUD/mirror attachments unpublished and drained (n={})",
++                    (unsigned)gSohIosGfxQuiesces);
++    }
++}
++
 +void GfxRenderingAPIMetal::EndFrameOffscreen() {
 +    for (int sohFbId : mDrawnFramebuffers) {
 +        auto& sohFb = mFramebuffers[sohFbId];
 +        if (sohFb.mCommandBuffer == nullptr) {
++            // SOH_IOS (overlay 0044 rev7, VR R13 item 2a): a framebuffer
++            // that was gated (and therefore RESERVED) but produced no
++            // command buffer will never reach the completion handler that
++            // releases its reservation. Release it here, precisely; the
++            // sweep below is the safety net for the ones that never even
++            // reached mDrawnFramebuffers.
++            SohVR_TexEngineRelease((void*)mTextures[sohFb.mTextureId].texture);
 +            continue;
 +        }
 +        if (!sohFb.mHasEndedEncoding && sohFb.mCommandEncoder != nullptr) {
@@ -135,15 +695,147 @@ so iPhone links resolve (mode stays 0 there); macOS compiles none of it.
 +        // serializes queues).
 +        if (sohFbId == sSoh3DPublishFb) {
 +            MTL::Texture* sohPubTex = mTextures[sohFb.mTextureId].texture;
++            MTL::Texture* sohPubDepth = sohFb.mDepthTexture;
 +            int sohPubEye = sSoh3DPublishEye;
++            uint32_t sohPubTag = sSoh3DPublishTag;
++            // rev6: a NON-ZERO per-eye publish counter (0 is reserved for
++            // "nothing published", which the quiesce writes).
++            uint32_t sohPubStamp = 0;
++            if (sohPubEye >= 0 && sohPubEye <= 1) {
++                sohPubStamp = ++sSoh3DStampSeq[sohPubEye];
++                if (sohPubStamp == 0u) {
++                    sohPubStamp = sSoh3DStampSeq[sohPubEye] = 1u;
++                }
++            }
 +            sSoh3DPublishFb = -1;
 +            if (sohPubTex != nullptr && sohPubEye >= 0 && sohPubEye <= 1) {
++                // SOH_IOS (overlay 0044 rev5, VR R11 item 1): THE
++                // INDEPENDENT ASSERT. Stamp the pose tag's low byte into
++                // 8 corner texels, IN THE PIXELS, as part of the very
++                // command buffer that renders this eye. The compositor
++                // copies those 8 texels back out at BIND time and compares
++                // them with the tag it read from gSoh3DEyeTag -- two paths
++                // that share nothing (D11): one travels with the image,
++                // one with the CPU-side publication bookkeeping. If the
++                // engine re-enters this slot while the compositor's buffer
++                // is queued, the pixels carry a NEWER tag than the CPU
++                // expected and eye_tag_miss counts up -- on the device,
++                // with no capture tooling and nothing for the user to type.
++                if (gSohVREyeTagOn && sohPubTex->width() >= 8) {
++                    unsigned char sohTagByte = (unsigned char)(sohPubStamp & 0xFFu);
++                    if (gSohVREyeTagFault) {
++                        sohTagByte = (unsigned char)(sohTagByte ^ 0x5Au); // D11 red control
++                    }
++                    MTL::Buffer* sohTagBuf = Soh3DTagBuffer(mDevice, sohTagByte);
++                    if (sohTagBuf != nullptr) {
++                        MTL::BlitCommandEncoder* sohTagBlit =
++                            sohFb.mCommandBuffer->blitCommandEncoder();
++                        sohTagBlit->copyFromBuffer(sohTagBuf, 0, 32, 32, MTL::Size(8, 1, 1),
++                                                   sohPubTex, 0, 0, MTL::Origin(0, 0, 0));
++                        sohTagBlit->endEncoding();
++                    }
++                }
 +                sohPubTex->retain();
++                if (sohPubDepth != nullptr) {
++                    sohPubDepth->retain();
++                }
 +                sohFb.mCommandBuffer->addCompletedHandler(
-+                    MTL::HandlerFunction([sohPubTex, sohPubEye](MTL::CommandBuffer* sohCb) {
++                    MTL::HandlerFunction([sohPubTex, sohPubDepth, sohPubEye,
++                                          sohPubTag, sohPubStamp](MTL::CommandBuffer* sohCb) {
++                        // SOH_IOS (overlay 0044 rev10, VR R16-A): the
++                        // PRODUCER-GAP injection. Dev knob, 0 in every
++                        // shipped configuration (the suite asserts it
++                        // beside staleforce and comphold); eye 0 only,
++                        // because eye 0 is the one that completes first
++                        // and delaying it is what reproduces the
++                        // device's inter-eye publication gap.
++                        if (gSohVREyePubHoldMs > 0 && sohPubEye == 0) {
++                            std::this_thread::sleep_for(
++                                std::chrono::milliseconds(gSohVREyePubHoldMs));
++                        }
 +                        std::lock_guard<std::mutex> sohLock(sSoh3DPublishMutex);
-+                        void* sohOld = (void*)gSoh3DEyeTexture[sohPubEye];
-+                        gSoh3DEyeTexture[sohPubEye] = (void*)sohPubTex;
++                        if (!gSohVREyePubAtomic) {
++                            // The 1.0.0.12 protocol, kept as the red
++                            // control: publish this eye the instant it
++                            // completes, whatever the other one is doing.
++                            Soh3DFlushPendLocked(sohPubEye);
++                            Soh3DPublishEyeLocked(sohPubEye, (void*)sohPubTex,
++                                                  (void*)sohPubDepth, sohPubStamp, sohPubTag);
++                            return;
++                        }
++                        // THE ORPHAN BOUND (diagnosis §6). A pair that
++                        // never completes must not freeze the world, so
++                        // a staged publication that is still sitting
++                        // here when the SAME eye publishes again has
++                        // outlived its sibling by a whole host frame:
++                        // release it alone and count it. In the healthy
++                        // case the slot is always empty here, because
++                        // the sibling committed it.
++                        if (sSoh3DPendTex[sohPubEye] != nullptr) {
++                            Soh3DFlushPendLocked(sohPubEye);
++                            gSohVRPubOrphans = gSohVRPubOrphans + 1;
++                        }
++                        sSoh3DPendTex[sohPubEye] = (void*)sohPubTex;
++                        sSoh3DPendDepth[sohPubEye] = (void*)sohPubDepth;
++                        sSoh3DPendStamp[sohPubEye] = sohPubStamp;
++                        sSoh3DPendTag[sohPubEye] = sohPubTag;
++                        if (sSoh3DPendTex[0] != nullptr && sSoh3DPendTex[1] != nullptr) {
++                            if (sSoh3DPendTag[0] == sSoh3DPendTag[1]) {
++                                // BOTH EYES, ONE MOMENT, ONE COMMIT.
++                                // (Equal includes 0 == 0: outside a VR
++                                // world frame there is no pose tag, and
++                                // the two passes of one host frame are
++                                // still the pair to publish together.)
++                                Soh3DFlushPendLocked(0);
++                                Soh3DFlushPendLocked(1);
++                            } else {
++                                // Two different moments staged at once:
++                                // the older one has lost its sibling.
++                                int sohOldEye =
++                                    ((int)(sSoh3DPendTag[1] - sSoh3DPendTag[0]) > 0) ? 0 : 1;
++                                Soh3DFlushPendLocked(sohOldEye);
++                                gSohVRPubOrphans = gSohVRPubOrphans + 1;
++                            }
++                        }
++                    }));
++            }
++        }
++        if (sohFbId == sSoh3DPublishHudFb) {
++            MTL::Texture* sohHudTex = mTextures[sohFb.mTextureId].texture;
++            sSoh3DPublishHudFb = -1;
++            if (sohHudTex != nullptr) {
++                sohHudTex->retain();
++                sohFb.mCommandBuffer->addCompletedHandler(
++                    MTL::HandlerFunction([sohHudTex](MTL::CommandBuffer* sohCb) {
++                        std::lock_guard<std::mutex> sohLock(sSoh3DPublishMutex);
++                        void* sohOld = (void*)gSoh3DHudTexture;
++                        gSoh3DHudTexture = (void*)sohHudTex;
++                        if (sohOld != nullptr) {
++                            void* sohSlot = sSoh3DRetired[sSoh3DRetiredIdx];
++                            if (sohSlot != nullptr) {
++                                ((MTL::Texture*)sohSlot)->release();
++                            }
++                            sSoh3DRetired[sSoh3DRetiredIdx] = sohOld;
++                            sSoh3DRetiredIdx = (sSoh3DRetiredIdx + 1) % 16;
++                        }
++                    }));
++            }
++        }
++        // SOH_IOS (overlay 0044 rev3, VR R3 / spec D12): the
++        // rear-view pane. Same publish-on-completion contract as the
++        // eyes and the HUD — the compositor blit-copies from its own
++        // queue with no cross-queue fence, so it must never see a
++        // texture whose frame is still mid-GPU.
++        if (sohFbId == sSoh3DPublishMirrorFb) {
++            MTL::Texture* sohMirTex = mTextures[sohFb.mTextureId].texture;
++            sSoh3DPublishMirrorFb = -1;
++            if (sohMirTex != nullptr) {
++                sohMirTex->retain();
++                sohFb.mCommandBuffer->addCompletedHandler(
++                    MTL::HandlerFunction([sohMirTex](MTL::CommandBuffer* sohCb) {
++                        std::lock_guard<std::mutex> sohLock(sSoh3DPublishMutex);
++                        void* sohOld = (void*)gSoh3DMirrorTexture;
++                        gSoh3DMirrorTexture = (void*)sohMirTex;
 +                        if (sohOld != nullptr) {
 +                            void* sohSlot = sSoh3DRetired[sSoh3DRetiredIdx];
 +                            if (sohSlot != nullptr) {
@@ -165,9 +857,34 @@ so iPhone links resolve (mode stays 0 there); macOS compiles none of it.
 +                    gSohIosGpuMs = (float)sohMs;
 +                }
 +            }));
++        // SOH_IOS (overlay 0044 rev4, VR R9 item 1): the in-flight count
++        // the handoff gate reads. Bumped BEFORE commit -- a completion
++        // handler can fire the instant commit returns.
++        if (sohFbId >= 0 && sohFbId < SOH3D_MAX_TRACKED_FB) {
++            sSoh3DInFlight[sohFbId].fetch_add(1, std::memory_order_release);
++            int sohTrackId = sohFbId;
++            // SOH_IOS (overlay 0044 rev6, VR R12 item 1): release the
++            // reservation the gate took. This is the ONLY place it can
++            // be released, because this is the first moment the GPU is
++            // provably finished writing the texture -- which is the
++            // whole point: rev5's answer expired when Soh3DSetEye
++            // returned, a host frame too early for eye 0.
++            MTL::Texture* sohOwnTex = mTextures[sohFb.mTextureId].texture;
++            sohFb.mCommandBuffer->addCompletedHandler(
++                MTL::HandlerFunction([sohTrackId, sohOwnTex](MTL::CommandBuffer* sohCb) {
++                    if (sohOwnTex != nullptr) {
++                        SohVR_TexEngineRelease((void*)sohOwnTex);
++                    }
++                    sSoh3DInFlight[sohTrackId].fetch_sub(1, std::memory_order_release);
++                }));
++        }
 +        sohFb.mCommandBuffer->commit();
 +    }
 +    mDrawnFramebuffers.clear();
++    // SOH_IOS (overlay 0044 rev7, VR R13 item 2a): age the gate
++    // reservations. See the declaration above for why a reservation can
++    // outlive the frame that took it.
++    SohVR_TexEngineSweep();
 +    mCurrentVertexBufferPoolIndex = (mCurrentVertexBufferPoolIndex + 1) % kMaxVertexBufferPoolSize;
 +    for (int fb_id = 0; fb_id < (int)mFramebuffers.size(); fb_id++) {
 +        FramebufferMetal& fb = mFramebuffers[fb_id];
@@ -228,9 +945,35 @@ so iPhone links resolve (mode stays 0 there); macOS compiles none of it.
  int GfxRenderingAPIMetal::CreateFramebuffer() {
      uint32_t texture_id = NewTexture();
      TextureDataMetal& t = mTextures[texture_id];
+@@ -1427,6 +2152,25 @@
+         framebuffer.mRenderPassDescriptor->colorAttachments()->object(0);
+     MTL::LoadAction origLoadAction = srcColorAttachment->loadAction();
+     if (color) {
++#ifdef __IOS__
++        // SOH_IOS (overlay 0044, VR): the eye and HUD framebuffers clear
++        // to alpha 0 while VR world frames are active, so the compositor
++        // blends the diorama into the room instead of over a black slab
++        // (R0 finding 3). Every other framebuffer, and every non-VR
++        // frame, keeps the opaque-black clear the flat/panel paths expect.
++        {
++            bool sohVrClear =
++                gSohVRWorldActive != 0 && sSoh3DTransparentFbs.count(mCurrentFramebuffer) > 0;
++            if (gSohVRWorldActive != 0) {
++                gSohVRDbgClearsAll = gSohVRDbgClearsAll + 1;
++                if (sohVrClear) {
++                    gSohVRDbgClearsAlpha = gSohVRDbgClearsAlpha + 1;
++                }
++            }
++            srcColorAttachment->setClearColor(sohVrClear ? MTL::ClearColor::Make(0.0, 0.0, 0.0, 0.0)
++                                                         : MTL::ClearColor::Make(0.0, 0.0, 0.0, 1.0));
++        }
++#endif
+         srcColorAttachment->setLoadAction(MTL::LoadActionClear);
+     }
+ 
 --- a/libultraship/include/fast/interpreter.h
 +++ b/libultraship/include/fast/interpreter.h
-@@ -385,6 +385,10 @@
+@@ -385,6 +385,23 @@
      void RunGuiOnly();
      void Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements);
      void EndFrame();
@@ -238,10 +981,23 @@ so iPhone links resolve (mode stays 0 there); macOS compiles none of it.
 +    void Soh3DSetEye(int eye);
 +    void Soh3DEndEyePass(int eye);
 +    int Soh3DGetEyeFb(int eye);
++    // SOH_IOS (overlay 0044, VR): HUD framebuffer redirect (spec D6).
++    int Soh3DGetHudFb();
++    void Soh3DVRTarget(bool hud);
++    void Soh3DVRClearHud();
++    // SOH_IOS (overlay 0044 rev3, VR R3 / spec D12): the rear-view
++    // pane's third walk. Eye index 3 through the same Soh3DSetEye /
++    // Soh3DEndEyePass pair the two eyes use.
++    int Soh3DGetMirrorFb();
++    // SOH_IOS (overlay 0044 rev6, VR R12 item 1): is there a ping-pong
++    // slot the compositor is NOT holding? Returns the index, or -1.
++    // Non-blocking, takes no reservation, and remembers its answer for
++    // the Soh3DSetEye(1) that follows.
++    int Soh3DPickSlot();
      void HandleWindowEvents();
      bool IsFrameReady();
      bool ViewportMatchesRendererResolution();
-@@ -532,6 +536,15 @@
+@@ -532,6 +549,47 @@
  
      int mGameFb{};             // game_framebuffer;
      int mGameFbMsaaResolved{}; // game_framebuffer_msaa_resolved;
@@ -249,17 +1005,49 @@ so iPhone links resolve (mode stays 0 there); macOS compiles none of it.
 +    // DOUBLE-BUFFERED per eye — the compositor blit-copies the
 +    // published texture from its own queue with no cross-queue fence, so
 +    // the engine must never re-render the texture it last published.
-+    int mSoh3DEyeFb[2][2] = { { -1, -1 }, { -1, -1 } };
++    // SOH_IOS (overlay 0044 rev4, VR R9 item 1): THREE slots, not two.
++    // Two slots plus the R9 handoff gate is a textbook double-buffering
++    // stall: the engine can only re-enter a slot once the OTHER one has
++    // been published, publication rides GPU completion, and the producer
++    // therefore quantises onto the consumer period (measured: 29.1 ->
++    // 16.5 engine fps, i.e. 60/2 -> 60/3.6). A third slot gives the
++    // pipeline the one frame of slack it needs, and the gate then never
++    // fires at all in the steady state -- it is left in as the assert
++    // that the slack is genuinely sufficient.
++    int mSoh3DEyeFb[2][3] = { { -1, -1, -1 }, { -1, -1, -1 } };
 +    int mSoh3DPing = 0;
++    int mSoh3DPickedSlot = -1; // rev6 (R12): Soh3DPickSlot's answer
 +    int mSoh3DSavedGameFb = -1;
 +    uint32_t mSoh3DSavedW = 0, mSoh3DSavedH = 0;
 +    float mSoh3DSavedAspect = 0.0f;
++    // SOH_IOS (overlay 0044, VR): the HUD framebuffer (spec D6). MK64's
++    // HUD is RDP texrects that never touch MP_matrix (R0 finding 2), so it
++    // cannot be reached through the projection injector: instead the DRAW
++    // TARGET is redirected for the 2D stretch of the display list, and the
++    // shell composites the result as a plane in player space.
++    // SOH_IOS (overlay 0044 rev4, VR R9 item 1): DOUBLE BUFFERED, like
++    // the eyes. Single-buffered it had the eye textures' race in its
++    // purest form -- one framebuffer, rewritten by the engine every host
++    // frame and sampled by the compositor every compositor frame, with no
++    // second slot to alternate with, so no arrangement of fences could
++    // have made it safe.
++    int mSoh3DHudFb[3] = { -1, -1, -1 };
++    bool mSoh3DHudActive = false;
++    // SOH_IOS (overlay 0044 rev3, VR R3 / spec D12): the rear-view
++    // pane's framebuffer (double-buffered for the same unfenced
++    // cross-queue reason as the eyes) and a SINK for the 2D stretch of
++    // the display list during the mirror pass — the HUD framebuffer is
++    // already published by then and is sized to the EYE extent, so
++    // mirror-pass texrects must not land in it.
++    int mSoh3DMirrorFb[3] = { -1, -1, -1 };
++    int mSoh3DMirrorSinkFb = -1;
++    uint32_t mSoh3DEyeDimsW = 0, mSoh3DEyeDimsH = 0;
  
      std::set<std::pair<float, float>> mGetPixelDepthPending; // get_pixel_depth_pending;
      std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff> mGetPixelDepthCached; // get_pixel_depth_cached;
 --- a/libultraship/src/fast/interpreter.cpp
 +++ b/libultraship/src/fast/interpreter.cpp
-@@ -1559,6 +1559,85 @@
+@@ -1559,6 +1559,1836 @@
      res[2] = a[0] * b[2][0] + a[1] * b[2][1] + a[2] * b[2][2];
  }
  
@@ -281,15 +1069,1114 @@ so iPhone links resolve (mode stays 0 there); macOS compiles none of it.
 +extern volatile int gSoh3DInPlay;
 +extern volatile int gSoh3DDbg2DW, gSoh3DDbg2DH;
 +extern volatile int gSoh3DDbgCurW, gSoh3DDbgCurH;
++// SOH_IOS (overlay 0044, VR / spec D2): the shell's per-frame pose
++// rendezvous. gSohVRWorldActive is 1 only for VR WORLD frames (VR mode,
++// gameplay predicate satisfied); SohIosVR_AcquireEyes copies the latest
++// published A*V*P pair under the shell's mutex and returns the pose frame
++// id, which rides back out with the eye texture so the loop submits the
++// anchor the frame was actually rendered against (trap B1).
++extern volatile int gSohVRWorldActive;
++// SOH_IOS (overlay 0044 rev2, VR R2 / spec D6+trap D6): the sky
++// treatment is PER VIEW MODE. 0 = park the whole sky stretch in the HUD
++// framebuffer and wipe it (Diorama over passthrough — R1 behaviour,
++// unchanged). 1 = draw it in the EYE framebuffer at effectively
++// infinite depth, with its yaw-keyed sprites re-keyed to the composed
++// eye by overlay 0051 (first-person, which stares at the sky).
++extern volatile int gSohVRSkyMode;
++// SOH_IOS (overlay 0044 rev3, VR R3 / spec D12): the rear-view pane.
++// gSohVRMirrorActive is 1 ONLY while the shell says the pane is on screen,
++// and it is the only thing that makes the engine pay for a third walk.
++extern volatile int gSohVRMirrorActive;
++extern volatile int gSohVRMirrorW, gSohVRMirrorH;
++// SOH_IOS (overlay 0044 rev5, VR R11 item 3c): the rear pane's sky
++// re-registration and its A/B switch, plus the two quantities the
++// shift is built from (0051 publishes both).
++extern volatile int gSohVRRearSky;
++extern volatile int gSohVRRearFloor;
++extern volatile int gSohVREyeYawBam;
++extern volatile float gSohVREyeFovDeg;
++// SOH_IOS (overlay 0044 rev7, VR R13 item 3): THE SKY'S PITCH. Until now
++// only YAW was re-keyed (0051) -- the gradient's horizon and every cloud
++// sprite derive their screen Y from screen->cameraHeight, which is built
++// from the GAME chase camera, so looking up in the headset walked the
++// world past a sky that stayed put. The composed eye's pitch and the
++// eye's VERTICAL fov are exported by the shell from the very matrix the
++// eyes render with (trap A7: never a second, separately derived facing).
++// gSohVRSkyPitch is the gain: 1 = shipping, 0 = R12 behaviour, -1 flips
++// the sign -- a live A/B for a term whose sign must be read off pixels
++// and not off a derivation (the tautological-assert rule).
++extern volatile float gSohVREyePitchDeg;
++extern volatile float gSohVREyeVFovDeg;
++extern volatile float gSohVRSkyPitch;
++// SOH_IOS (overlay 0044 rev8, VR R14 item 1): the sky's world-lock, as a
++// per-eye NDC y shift computed by the shell instead of a pixel formula
++// computed here. rev7 converted an angle difference into MK64 ortho pixels
++// through the eye's vertical fov and got both the scale and the sign from a
++// derivation nobody could check -- on device it walked the sky UP as the user
++// looked up, until the FLOOR quad and its black lower cap filled the view.
++// The replacement is a difference of two NDC y values in ONE clip space:
++// where the world's horizon lands under the live eye matrix (projected as a
++// DIRECTION, so head HEIGHT cannot enter) minus where MK64 has already put
++// the sky's horizon (2*cameraHeight/240 - 1, pure guOrtho arithmetic). Both
++// are rasterised by the same viewport, so any raster flip cancels and there
++// is no sign left to get backwards.
++extern volatile float gSohVRSkyShift[2];
++extern volatile int gSohVRSkyShiftValid;
++// SOH_IOS (overlay 0044 rev10, VR R16-A / FAL-A2): the sky shift is the
++// ONE per-frame-varying quantity an eye pass reads LIVE. The eye matrices
++// are latched once per host frame and both passes read the engine-local
++// copy; gSohVRSkyShift[e] is read out of a global the compositor rewrites
++// at 90-120 Hz, per eye pass -- so eye 0's sky is placed for head pose T
++// and eye 1's for T+k, inside a frame whose matrices came from T-m. It is
++// stereo-inconsistent, it is motion-correlated, and no pair rule can see
++// it because it is baked into the pixels and both eyes carry the same pose
++// tag. gSohVRSkyShiftId names the compositor frame the live pair belongs
++// to; each pass records the id it consumed into gSohVRSkyShiftTag so the
++// suite can state the skew instead of inferring it.
++extern volatile unsigned int gSohVRSkyShiftId;
++extern volatile unsigned int gSohVRSkyShiftTag[2];
++extern volatile unsigned int gSohVRSkyTagSkew;
++extern volatile int gSohVRSkyLatch;
++// SOH_IOS (overlay 0044 rev5, VR R11 item 3a): 1 while the LOCAL
++// player's kart is being suppressed (first person). 0054 rev3 brackets
++// that kart's SHADOW with G_NOOP sentinels 0x5C/0x5D so the rear-view
++// walk can park it in the sink: the mirror camera looks straight at
++// your own kart's ground shadow, and with the kart itself hidden it
++// reads as a blob of dirt sliding along the road.
++extern volatile int gSohVRHideOwnKart;
++// SOH_IOS (overlay 0044 rev4, VR R9 item 1): the eye-slot handoff gate's
++// A/B control. 1 = gated (shipping), 0 = the 1.0.0.5 free-running behaviour.
++extern volatile int gSohVRSlotGate;
++// rev6 (R12): the free-slot picker's telemetry, defined in gfx_metal.cpp.
++extern volatile unsigned int gSohIosGfxSlotPicks;
++extern volatile unsigned int gSohIosGfxSlotPickFails;
++// SOH_IOS (overlay 0044 rev14, VR R17-B): H5 -- the sky sprites are WORLD
++// GEOMETRY now (overlay 0051 rev7 + 0058 rev5), so the span arrives here
++// as a PERSPECTIVE load and takes the same substitution the trees take.
++// The ortho per-eye affine below is BYPASSED for it, and gSohVRSkyAffine
++// must read 0 for both eye slots with the dome on.
++extern volatile int gSohVRSkyDome;
++extern volatile int gSohVRSkyProbeValid;
++extern volatile int gSohVRSkyProbeOrtho;
++extern volatile float gSohVRSkyProbeDir[3];
++extern volatile float gSohVRSkyProbePos[3];
++extern volatile float gSohVRSkyProbeUp[3];
++extern volatile float gSohVRSkyWalkNdc[2][2];
++extern volatile float gSohVRSkyRefNdc[2][2];
++extern volatile float gSohVRSkyDomeErr[2];
++extern volatile float gSohVRSkyDomeErrMax[2];
++extern volatile float gSohVRSkyDomeJit[2];
++extern volatile unsigned int gSohVRSkyDomeJitN[2];
++extern volatile float gSohVRSkyUpDot[2];
++extern volatile float gSohVRSkyStereoNdc;
++extern volatile unsigned int gSohVRSkyWalks[3];
++extern unsigned int SohIosVR_AcquireEyes(float out[32]);
++// SOH_IOS (overlay 0044 rev10, VR R16-A / F4): the WHOLE frame, not just
++// the matrices. Everything an eye pass draws with must come from one copy
++// of one moment; the sky shift was the last thing that did not.
++// SOH_IOS (overlay 0044 rev11, VR R16-B): the sky payload widened from the
++// two vertical shifts to the whole per-eye placement. The slot names below
++// MUST match app/ios/SohIosShell.h — they are the contract between the
++// compositor that fills the snapshot and the eye pass that draws with it,
++// and the suite asserts the values that come back through it.
++// rev13 (R17-A item 1) widened this to 24 and added the SEAT slots. The
++// names and indices MUST match app/ios/SohIosShell.h.
++// rev15 (R18-A) widened it to 28: SEAT_B* is the base the seat was built from.
++#define SOHVR_SKY_SLOTS      28
++#define SOHVR_SEAT_DX0      16
++#define SOHVR_SEAT_DX1      17
++#define SOHVR_SEAT_DX2      18
++#define SOHVR_SEAT_SRC      19
++#define SOHVR_SEAT_X        20
++#define SOHVR_SEAT_Y        21
++#define SOHVR_SEAT_Z        22
++#define SOHVR_SEAT_BX       24
++#define SOHVR_SEAT_BY       25
++#define SOHVR_SEAT_BZ       26
++#define SOHVR_SEAT_BF       27
++#define SOHVR_SKY_SHIFT0     0
++#define SOHVR_SKY_SHIFT1     1
++#define SOHVR_SKY_DX0        2
++#define SOHVR_SKY_SX0        4
++#define SOHVR_SKY_ROLL0      6
++#define SOHVR_SKY_TANSUM     8
++#define SOHVR_SKY_SPAN       9
++#define SOHVR_SKY_YAWBAM    10
++#define SOHVR_SKY_TANLO     11
++#define SOHVR_SKY_TANHI     12
++#define SOHVR_SKY_SPANY     13
++extern unsigned int SohIosVR_AcquireFrame(float outM[32], float outSky[SOHVR_SKY_SLOTS]);
++// SOH_IOS (overlay 0044 rev11, VR R16-B): the clouds. gSohVRSkyTan is the
++// A/B (0 = the 1.0.0.12 one-layout-both-eyes behaviour); gSohVRSkyRoll is
++// step 4's gain and ships at 0; gSohVRSkyBuiltYawBam is the yaw 0051 built
++// THIS layout with, which this pass differences against the frame it is
++// actually drawing.
++extern volatile int gSohVRSkyTan;
++extern volatile float gSohVRSkyRoll;
++extern volatile int gSohVRSkyBuiltYawBam;
++extern volatile float gSohVRSkyLagDeg;
++extern volatile float gSohVRSkyLagMaxDeg;
++extern volatile unsigned int gSohVRSkyAffine[3];
++extern volatile unsigned int gSohVRSkyLagCorr;
++// SOH_IOS (overlay 0044 rev12, VR R16-C): THE REAR-VIEW PANE'S CAMERA.
++// The pane pivoted its 180-degree world rotation about
++// `camEye + camFwd*camDist`, which is the chase camera's LOOK-AT POINT --
++// and MK64 aims its racing camera 70 units AHEAD of the kart, so the pane
++// camera sat 140 units in front of where a mirror belongs. gSohVRRearPivot
++// picks the replacement: 2 = MK64's own look-behind camera (0045 rev5),
++// 1 = the analytic mirror about the KART (0045 rev2), 0 = the 1.0.0.12
++// look-at pivot, kept as the red control.
++extern volatile int gSohVRRearPivot;
++extern volatile float gSohVRRearPos[3], gSohVRRearAt[3], gSohVRRearUp[3];
++extern volatile int gSohVRRearValid;
++extern volatile unsigned int gSohVRRearSeq, gSohVRRearFrame;
++// The kart snapshot, read here the way the shell reads it (0045 rev4):
++// seqlock plus a staleness bound, never the raw validity flag (trap D40).
++extern volatile float gSohVRKartPos[3];
++extern volatile int gSohVRKartValid;
++extern volatile unsigned int gSohVRKartSeq, gSohVRKartFrame, gSohVRGameFrame;
++// rev12 step 4: the OPPOSITE-DIRECTION course section list (overlay 0059).
++// gSohVRRearSec is the A/B; gSohVRRearDlSwaps counts the rear walk's list
++// swaps and is incremented ONLY where the game found the two direction
++// buckets differed (trap D32's corollary).
++extern volatile int gSohVRRearSec;
++extern volatile unsigned int gSohVRRearDlSwaps;
++// rev12 step 5: the local kart, drawn in the PANE only (overlay 0054 rev4).
++extern volatile int gSohVROwnKartRear;
++// SOH_IOS (overlay 0044 rev13, VR R17-A item 1): THE GHOST DRIVERS.
++// gSohVRWalkT is this walk's interpolation factor (overlay 0014 rev2);
++// gSohVRSeatInterp is the A/B (0 = 1.0.0.13, the RED CONTROL); the
++// gSohVRGhost* family is the probe, which measures in BOTH arms.
++extern volatile float gSohVRWalkT;
++extern volatile int gSohVRSeatInterp;
++extern volatile unsigned int gSohVRGhostN;
++extern volatile float gSohVRGhostJitter, gSohVRGhostJitterMax, gSohVRGhostStep;
++extern volatile float gSohVRGhostTMin, gSohVRGhostTMax;
++extern volatile float gSohVRGhostKeyErr;
++extern volatile unsigned int gSohVRGhostKeyN;
++extern volatile float gSohVRSeatDx[3];
++extern volatile unsigned int gSohVRSeatLerps;
++extern volatile unsigned int gSohVRSeatJumps;
++// rev14 (R17-C): the WATERMARKS. The ghost probe is an average over walks
++// and cannot state a bound on ONE walk; these two can. seat_delta_max is
++// the longest segment the seat was ever asked to interpolate along, read
++// BEFORE the 400-unit teleport guard so the guard's own action is visible;
++// seat_dx_max is the largest world-space translation the correction ever
++// actually applied to an eye matrix. Both are cleared by Soh3DGhostReset(),
++// which is what `vr set seatinterp` and `vr set seatseedfault` call.
++extern volatile float gSohVRSeatDeltaMax, gSohVRSeatDxMax;
++extern volatile float gSohVRKartPosPrev[3];
++extern volatile float gSoh3DCamEyePrev[3];
++// SOH_IOS (overlay 0044 rev15, VR R18-A): ONE CLOCK FOR THE SEAT. The
++// matrices in the snapshot were composed around the pose the COMPOSITOR read
++// (the SEAT_B* slots); the walks run on the game thread right after the
++// export, so a walk can latch a matrix composed from the PREVIOUS game
++// frame's pose. gSohVRSeatRebase is the A/B (0 = 1.0.0.16, the RED CONTROL);
++// gSohVRBase* is the cause-side telemetry, measured in every arm (D48);
++// gSohVRClassProbe gates the per-object-class probe (dev only).
++extern volatile int gSohVRSeatRebase;
++extern volatile int gSohVRClassProbe;
++extern volatile unsigned int gSohVRBaseWalks, gSohVRBaseStale, gSohVRSeatRebases;
++extern volatile float gSohVRBaseErrMax, gSohVRBaseErrAcc;
++// SOH_IOS (overlay 0044 rev16, VR R21 item 2): the pane on the walk's clock.
++// gSohVRRearPosPrev is 0045 rev8's previous look-behind eye (same seqlock);
++// gSohVRPaneLerp is the A/B (0 = 1.0.1.19, the RED CONTROL).
++extern volatile float gSohVRRearPosPrev[3];
++extern volatile int gSohVRPaneLerp;
++extern volatile unsigned int gSohVRPaneLerps;
++extern volatile float gSohVRPaneDxMax;
 +}
 +static int sSoh3DEye = 0;
++// VR eye matrices for THIS host frame (both eye passes share one pose) and
++// the pose frame id they came from.
++static float sSohVREyeM[2][4][4];
++static unsigned int sSohVRTag = 0;
++// rev10 (R16-A F4): this host frame's sky placement, latched with the
++// matrices it belongs to. Both eye passes read this; neither reads a live
++// global unless `vr set skylatch 0` asks for the old behaviour back.
++// rev11 (R16-B): widened from the two vertical shifts to the whole payload
++// — the per-eye horizontal affine, the reference frustum, the roll and the
++// yaw. Everything the sky is placed with now arrives together or not at all.
++static float sSohVRSnapSky[SOHVR_SKY_SLOTS] = { 0.0f };
++static int sSohVRHaveEyes = 0;
 +static float sSoh3DSep = 3.0f;
 +static float sSoh3DConv = 300.0f;
 +static float sSoh3DConvSmooth = 300.0f;
 +static float sSoh3DPauseMix = 1.0f; // 1 = full stereo, 0 = flat (paused)
 +static float sSoh3DAimMix = 0.0f;   // 1 = aiming (unused on MK64 — no export)
 +static int sSoh3DSkybox = 0;        // inside sky draw (0046 sentinels)
++// SOH_IOS (overlay 0044 rev7, VR R13 item 4): 1 exactly inside
++// DrawSkyActors (0046 rev2 sentinels 0x5E/0x5F) -- the yaw-keyed cloud and
++// star SPRITES, as opposed to the gradient quads and the floor, which are
++// pure screen space and yaw-INDEPENDENT. R11 shifted the whole ortho pass
++// for the rear pane and therefore evacuated the gradient too, by 1.8 screen
++// widths: that is why the pane has had no sky at all since 1.0.0.8.
++static int sSoh3DSkySprites = 0;
++// SOH_IOS (overlay 0044 rev9, VR R15 item 5): 1 exactly inside the
++// BELOW-HORIZON ground fill -- Sky::DrawFloor plus 0058's lower cap
++// (0046 rev3 / 0058 rev3 sentinels 0x60/0x61). It is a full-width
++// screen-space colour ramp from the course's FloorTop down to FloorBottom,
++// drawn on every course but Rainbow Road. In the eyes the ground covers
++// it; in the REAR-VIEW PANE it is a grey wall across the lower half.
++static int sSoh3DSkyFloor = 0;
++// SOH_IOS (overlay 0044 rev5, VR R11 item 3a): inside the LOCAL
++// player's shadow draw (0054 rev3 sentinels 0x5C/0x5D).
++static int sSoh3DOwnShadow = 0;
++// 1 exactly while the rear-view walk must dump what it is drawing
++// into the sink framebuffer nobody reads.
++static int Soh3DOwnShadowSink() {
++    return gSohVRWorldActive && sSoh3DEye == 3 && sSoh3DOwnShadow;
++}
++// SOH_IOS (overlay 0044 rev12, VR R16-C step 5): 1 exactly inside the
++// LOCAL kart's quad when 0054 rev4 has emitted it FOR THE PANE (sentinels
++// 0x66/0x67). A mirror with no image of the thing it is bolted to has no
++// anchor, and MK64 skips that quad outright in first person. It is the
++// EYES that must not see it, so this span diverts them -- into the mirror
++// SINK, not the HUD framebuffer, because the HUD is composited.
++static int sSoh3DOwnKartSpan = 0;
++static int Soh3DOwnKartSink() {
++    return gSohVRWorldActive && sSoh3DEye != 3 && sSoh3DOwnKartSpan;
++}
++// SOH_IOS (overlay 0044 rev12, VR R16-C step 4): 1 while a bracketed span
++// belongs to a walk this is not. The ONLY thing it suppresses is the
++// nested G_DL call in gfx_dl_handler_common -- every other command in the
++// span still executes, which is what keeps RSP state identical across the
++// three walks. Set by 0x62/0x64 and cleared by 0x63/0x65.
++static int sSoh3DDlSkip = 0;
++// The kart snapshot (0045 rev4's seqlock + the 3-game-frame staleness
++// bound). Same discipline as the shell's sohvr_kart_pose: the flag alone
++// is trap D40, and the three position floats are written non-atomically.
++static int Soh3DReadKartXZ(float* sohOutX, float* sohOutZ) {
++    if (!gSohVRKartValid) {
++        return 0;
++    }
++    float sohKx = 0.0f, sohKz = 0.0f;
++    unsigned int sohKf = 0;
++    int sohGot = 0;
++    for (int sohT = 0; sohT < 4; sohT++) {
++        const unsigned int sohS0 = gSohVRKartSeq;
++        if (sohS0 & 1u) {
++            continue;
++        }
++        __sync_synchronize();
++        sohKx = gSohVRKartPos[0];
++        sohKz = gSohVRKartPos[2];
++        sohKf = gSohVRKartFrame;
++        __sync_synchronize();
++        if (gSohVRKartSeq == sohS0) {
++            sohGot = 1;
++            break;
++        }
++    }
++    if (!sohGot || (unsigned int)(gSohVRGameFrame - sohKf) > 3u) {
++        return 0;
++    }
++    *sohOutX = sohKx;
++    *sohOutZ = sohKz;
++    return 1;
++}
++// MK64's OWN look-behind camera (0045 rev5), same seqlock discipline.
++// rev16 (R21): and its previous game frame's eye (0045 rev8), in the SAME read.
++static int Soh3DReadRearCam(float sohP[3], float sohA[3], float sohU[3], float sohPv[3]) {
++    if (!gSohVRRearValid) {
++        return 0;
++    }
++    float sohPp[3] = { 0, 0, 0 }, sohAa[3] = { 0, 0, 0 }, sohUu[3] = { 0, 1, 0 };
++    float sohVv[3] = { 0, 0, 0 };
++    unsigned int sohF = 0;
++    int sohGot = 0;
++    for (int sohT = 0; sohT < 4; sohT++) {
++        const unsigned int sohS0 = gSohVRRearSeq;
++        if (sohS0 & 1u) {
++            continue;
++        }
++        __sync_synchronize();
++        for (int sohI = 0; sohI < 3; sohI++) {
++            sohPp[sohI] = gSohVRRearPos[sohI];
++            sohAa[sohI] = gSohVRRearAt[sohI];
++            sohUu[sohI] = gSohVRRearUp[sohI];
++            sohVv[sohI] = gSohVRRearPosPrev[sohI];
++        }
++        sohF = gSohVRRearFrame;
++        __sync_synchronize();
++        if (gSohVRRearSeq == sohS0) {
++            sohGot = 1;
++            break;
++        }
++    }
++    if (!sohGot || (unsigned int)(gSohVRGameFrame - sohF) > 3u) {
++        return 0;
++    }
++    for (int sohI = 0; sohI < 3; sohI++) {
++        sohP[sohI] = sohPp[sohI];
++        sohA[sohI] = sohAa[sohI];
++        sohU[sohI] = sohUu[sohI];
++        sohPv[sohI] = sohVv[sohI];
++    }
++    return 1;
++}
++// T = V_pane * V_game^-1, the rigid transform that takes the GAME's view
++// to the PANE's. Trap D32: correct in the MATRIX, never in the list. It
++// generalises the 180-degree mirror the pane used to pre-multiply -- with
++// V_pane = M * V_game this returns exactly M -- and it carries no
++// handedness assumption: if the game's real lookAt matrix is V_mine * S
++// for any fixed S (a flipped third axis, say), the S cancels, because both
++// sides of the product are built from the same construction.
++static int Soh3DBuildPaneT(float sohT[4][4], const float sohP[3], const float sohA[3],
++                           const float sohUp[3]) {
++    const float sohGR[3] = { gSoh3DCamRight[0], gSoh3DCamRight[1], gSoh3DCamRight[2] };
++    const float sohGF[3] = { gSoh3DCamFwd[0], gSoh3DCamFwd[1], gSoh3DCamFwd[2] };
++    const float sohGE[3] = { gSoh3DCamEye[0], gSoh3DCamEye[1], gSoh3DCamEye[2] };
++    const float sohFl = sohGF[0] * sohGF[0] + sohGF[1] * sohGF[1] + sohGF[2] * sohGF[2];
++    const float sohRl = sohGR[0] * sohGR[0] + sohGR[1] * sohGR[1] + sohGR[2] * sohGR[2];
++    if (sohFl < 0.9f || sohFl > 1.1f || sohRl < 0.9f || sohRl > 1.1f) {
++        return 0; // no usable game basis this frame
++    }
++    const float sohGU[3] = { sohGR[1] * sohGF[2] - sohGR[2] * sohGF[1],
++                             sohGR[2] * sohGF[0] - sohGR[0] * sohGF[2],
++                             sohGR[0] * sohGF[1] - sohGR[1] * sohGF[0] };
++    float sohPF[3] = { sohA[0] - sohP[0], sohA[1] - sohP[1], sohA[2] - sohP[2] };
++    const float sohPd = sqrtf(sohPF[0] * sohPF[0] + sohPF[1] * sohPF[1] + sohPF[2] * sohPF[2]);
++    if (sohPd <= 1e-3f) {
++        return 0;
++    }
++    sohPF[0] /= sohPd;
++    sohPF[1] /= sohPd;
++    sohPF[2] /= sohPd;
++    float sohPR[3] = { sohPF[1] * sohUp[2] - sohPF[2] * sohUp[1],
++                       sohPF[2] * sohUp[0] - sohPF[0] * sohUp[2],
++                       sohPF[0] * sohUp[1] - sohPF[1] * sohUp[0] };
++    const float sohPrl = sqrtf(sohPR[0] * sohPR[0] + sohPR[1] * sohPR[1] + sohPR[2] * sohPR[2]);
++    if (sohPrl <= 1e-4f) {
++        return 0;
++    }
++    sohPR[0] /= sohPrl;
++    sohPR[1] /= sohPrl;
++    sohPR[2] /= sohPrl;
++    const float sohPU[3] = { sohPR[1] * sohPF[2] - sohPR[2] * sohPF[1],
++                             sohPR[2] * sohPF[0] - sohPR[0] * sohPF[2],
++                             sohPR[0] * sohPF[1] - sohPR[1] * sohPF[0] };
++    // V_pane: row-vector world->view, columns (right, up, forward).
++    float sohVp[4][4];
++    for (int sohI = 0; sohI < 3; sohI++) {
++        sohVp[sohI][0] = sohPR[sohI];
++        sohVp[sohI][1] = sohPU[sohI];
++        sohVp[sohI][2] = sohPF[sohI];
++        sohVp[sohI][3] = 0.0f;
++    }
++    sohVp[3][0] = -(sohP[0] * sohPR[0] + sohP[1] * sohPR[1] + sohP[2] * sohPR[2]);
++    sohVp[3][1] = -(sohP[0] * sohPU[0] + sohP[1] * sohPU[1] + sohP[2] * sohPU[2]);
++    sohVp[3][2] = -(sohP[0] * sohPF[0] + sohP[1] * sohPF[1] + sohP[2] * sohPF[2]);
++    sohVp[3][3] = 1.0f;
++    // V_game^-1: rows are the game's basis, translation is the game eye.
++    float sohVi[4][4];
++    for (int sohJ = 0; sohJ < 3; sohJ++) {
++        sohVi[0][sohJ] = sohGR[sohJ];
++        sohVi[1][sohJ] = sohGU[sohJ];
++        sohVi[2][sohJ] = sohGF[sohJ];
++        sohVi[3][sohJ] = sohGE[sohJ];
++    }
++    sohVi[0][3] = sohVi[1][3] = sohVi[2][3] = 0.0f;
++    sohVi[3][3] = 1.0f;
++    for (int sohI = 0; sohI < 4; sohI++) {
++        for (int sohJ = 0; sohJ < 4; sohJ++) {
++            sohT[sohI][sohJ] = sohVp[sohI][0] * sohVi[0][sohJ] + sohVp[sohI][1] * sohVi[1][sohJ] +
++                               sohVp[sohI][2] * sohVi[2][sohJ] + sohVp[sohI][3] * sohVi[3][sohJ];
++        }
++    }
++    return 1;
++}
 +static float sSoh3DP[4][4];
++// SOH_IOS (overlay 0044 rev13, VR R17-A item 1) ---------------------------
++//
++// THE SEAT IS TICK-QUANTISED AND THE WORLD IS INTERPOLATED. Every walk of
++// the display list draws its objects through FrameInterpolation_Interpolate
++// (t = 0.5 then 1.0 in VR), and until this revision the eye matrices came
++// from a kart pose exported once per GAME frame. Relative to the seat a
++// nearby kart therefore alternated between on-time and half a game frame
++// ahead on every present: a monocular, un-screenshottable, speed- and
++// parallax-proportional double image -- the user's shaking ghost duplicate.
++//
++// The correction is a world-space TRANSLATION, pre-multiplied onto the eye
++// matrix exactly the way the rear pane pre-multiplies its own rigid
++// transform (trap D32: in the matrix, never in the list). Fast3D is
++// row-vector, so translating the world by -delta is a single row:
++//   out[3][j] = M[3][j] - delta . (M[0][j], M[1][j], M[2][j])
++// and delta = seatPrevDelta * (1 - t), which is 0 on the key-frame walk and
++// half a game frame back on the intermediate one. ONLY the position is
++// corrected: the seat's YAW is the shell's first-order follower, which
++// already runs at compositor rate and is continuous (see SohImmersive.m).
++// THE SEAT'S BASE AND THE SEGMENT IT MOVES ALONG, READ ON THE GAME
++// THREAD. The shell publishes both in the frame snapshot too, and a first
++// cut used that -- but the snapshot is written by the COMPOSITOR at 60-90
++// Hz and the walks run on the GAME thread immediately after the export
++// they belong to, so which game frame's kart pose a given walk found in
++// the snapshot depended on a race, and it flipped part-way through the
++// walks of one frame. Measured: the correction made the ghost metric
++// WORSE than the fault it was fixing (0.98 game-frame steps against
++// 0.58). Here there is no race at all: 0045 exports these from this very
++// thread, a few hundred instructions earlier in the same game frame.
++// Only the SOURCE comes from the snapshot -- which base the shell seated
++// the player on -- and that changes at most once per mode switch.
++static int Soh3DSeatBase(float sohBase[3], float sohDelta[3]) {
++    sohBase[0] = sohBase[1] = sohBase[2] = 0.0f;
++    sohDelta[0] = sohDelta[1] = sohDelta[2] = 0.0f;
++    if (sSohVRSnapSky[SOHVR_SEAT_SRC] > 0.5f) {
++        // The kart, through 0045 rev4's seqlock and rev6's pair.
++        if (!gSohVRKartValid) {
++            return 0;
++        }
++        float sohC[3] = { 0.0f, 0.0f, 0.0f }, sohP[3] = { 0.0f, 0.0f, 0.0f };
++        unsigned int sohF = 0;
++        int sohGot = 0;
++        for (int sohT = 0; sohT < 4; sohT++) {
++            const unsigned int sohS0 = gSohVRKartSeq;
++            if (sohS0 & 1u) {
++                continue;
++            }
++            __sync_synchronize();
++            for (int sohI = 0; sohI < 3; sohI++) {
++                sohC[sohI] = gSohVRKartPos[sohI];
++                sohP[sohI] = gSohVRKartPosPrev[sohI];
++            }
++            sohF = gSohVRKartFrame;
++            __sync_synchronize();
++            if (gSohVRKartSeq == sohS0) {
++                sohGot = 1;
++                break;
++            }
++        }
++        if (!sohGot || (unsigned int)(gSohVRGameFrame - sohF) > 3u) {
++            return 0;
++        }
++        for (int sohI = 0; sohI < 3; sohI++) {
++            sohBase[sohI] = sohC[sohI];
++            sohDelta[sohI] = sohP[sohI] - sohC[sohI];
++        }
++    } else {
++        for (int sohI = 0; sohI < 3; sohI++) {
++            sohBase[sohI] = gSoh3DCamEye[sohI];
++            sohDelta[sohI] = gSoh3DCamEyePrev[sohI] - gSoh3DCamEye[sohI];
++        }
++    }
++    // A course change, a respawn or a Lakitu pickup teleports the base;
++    // interpolating across that would smear the world for one game frame.
++    // 400 units is far past anything a frame of racing produces and far
++    // short of any teleport.
++    const float sohL2 = sohDelta[0] * sohDelta[0] + sohDelta[1] * sohDelta[1] +
++                        sohDelta[2] * sohDelta[2];
++    // rev14 (R17-C): the segment, watermarked BEFORE the guard below. A
++    // frame of racing is 5-10 units here; 0045 rev6 could hand this a
++    // whole race away, and anything under 400 got spent on the seat.
++    {
++        const float sohLen = sqrtf(sohL2);
++        if (sohLen > gSohVRSeatDeltaMax) { gSohVRSeatDeltaMax = sohLen; }
++    }
++    if (sohL2 > 400.0f * 400.0f) {
++        sohDelta[0] = sohDelta[1] = sohDelta[2] = 0.0f;
++        gSohVRSeatJumps = gSohVRSeatJumps + 1;
++    }
++    return 1;
++}
++// rev15 (R18-A): THE BASE THE MATRIX WAS ACTUALLY BUILT AROUND. R17-A's
++// correction is (prev - cur)(1 - t), which is only right if the snapshot's
++// matrix was composed at `cur` -- the export this walk belongs to. It is
++// not, whenever the compositor composed its latest frame BEFORE the game
++// thread's export for the frame being walked: the snapshot then carries the
++// previous game frame's pose and every object in the walk is drawn a whole
++// seat step AHEAD of the eye. The shell now publishes the raw base it read
++// (SEAT_B*); this returns (cur - that base), the translation that moves the
++// matrix onto the export the walk belongs to. 0 when there is nothing to
++// correct, when the snapshot predates the slots, when the snapshot's seat
++// source disagrees with ours, or across a teleport.
++static int Soh3DSeatRebaseErr(const float sohBase[3], float sohRb[3]) {
++    sohRb[0] = sohRb[1] = sohRb[2] = 0.0f;
++    const float sohBx = sSohVRSnapSky[SOHVR_SEAT_BX];
++    const float sohBy = sSohVRSnapSky[SOHVR_SEAT_BY];
++    const float sohBz = sSohVRSnapSky[SOHVR_SEAT_BZ];
++    if (sohBx == 0.0f && sohBy == 0.0f && sohBz == 0.0f) {
++        return 0;
++    }
++    sohRb[0] = sohBase[0] - sohBx;
++    sohRb[1] = sohBase[1] - sohBy;
++    sohRb[2] = sohBase[2] - sohBz;
++    const float sohL2 = sohRb[0] * sohRb[0] + sohRb[1] * sohRb[1] + sohRb[2] * sohRb[2];
++    if (sohL2 > 400.0f * 400.0f) {
++        sohRb[0] = sohRb[1] = sohRb[2] = 0.0f;
++        return 0;
++    }
++    return 1;
++}
++// Once per eye-1 walk, in EVERY arm: how far the base the snapshot's
++// matrices were composed around is from the export this walk belongs to.
++static void Soh3DBaseProbe(void) {
++    float sohBase[3], sohDelta[3], sohRb[3];
++    if (!Soh3DSeatBase(sohBase, sohDelta)) {
++        return;
++    }
++    if (!Soh3DSeatRebaseErr(sohBase, sohRb)) {
++        return;
++    }
++    const float sohL = sqrtf(sohRb[0] * sohRb[0] + sohRb[1] * sohRb[1] + sohRb[2] * sohRb[2]);
++    gSohVRBaseWalks = gSohVRBaseWalks + 1;
++    gSohVRBaseErrAcc = gSohVRBaseErrAcc + sohL;
++    if (sohL > gSohVRBaseErrMax) {
++        gSohVRBaseErrMax = sohL;
++    }
++    if (sohL > 1.0e-3f) {
++        gSohVRBaseStale = gSohVRBaseStale + 1;
++    }
++}
++// rev16 (R21 item 2): the two halves of the seat's correction that the rear
++// pane now shares with it, so both walks run on ONE clock. The weight is the
++// walk's own (1 - t), clamped exactly as R17-A always clamped it; the
++// translation moves the world by -d in front of `m` (row-vector Fast3D: one
++// row), which is the same as moving the camera by +d.
++static float Soh3DWalkW(void) {
++    float sohT = gSohVRWalkT;
++    if (!(sohT > 0.0f && sohT <= 1.0f)) {
++        sohT = 1.0f;
++    }
++    return 1.0f - sohT;
++}
++static void Soh3DPreTranslate(float m[4][4], const float sohD[3]) {
++    for (int sohJ = 0; sohJ < 4; sohJ++) {
++        m[3][sohJ] -= sohD[0] * m[0][sohJ] + sohD[1] * m[1][sohJ] + sohD[2] * m[2][sohJ];
++    }
++}
++static void Soh3DSeatLerp(float m[4][4]) {
++    if (!gSohVRSeatInterp) {
++        return; // the RED CONTROL: 1.0.0.13, bit for bit
++    }
++    float sohBase[3], sohDelta[3];
++    if (!Soh3DSeatBase(sohBase, sohDelta)) {
++        return;
++    }
++    // rev15 (R18-A): plus the move from the base the snapshot's matrix was
++    // composed around onto the export this walk belongs to.
++    float sohRb[3] = { 0.0f, 0.0f, 0.0f };
++    const int sohRebased = gSohVRSeatRebase ? Soh3DSeatRebaseErr(sohBase, sohRb) : 0;
++    const float sohW = Soh3DWalkW();
++    const float sohDx = sohRb[0] + sohDelta[0] * sohW;
++    const float sohDy = sohRb[1] + sohDelta[1] * sohW;
++    const float sohDz = sohRb[2] + sohDelta[2] * sohW;
++    if (sohRebased && (sohRb[0] != 0.0f || sohRb[1] != 0.0f || sohRb[2] != 0.0f)) {
++        gSohVRSeatRebases = gSohVRSeatRebases + 1;
++    }
++    gSohVRSeatDx[0] = sohDx;
++    gSohVRSeatDx[1] = sohDy;
++    gSohVRSeatDx[2] = sohDz;
++    {
++        const float sohLen = sqrtf(sohDx * sohDx + sohDy * sohDy + sohDz * sohDz);
++        if (sohLen > gSohVRSeatDxMax) { gSohVRSeatDxMax = sohLen; } // rev14
++    }
++    if (sohDx == 0.0f && sohDy == 0.0f && sohDz == 0.0f) {
++        return;
++    }
++    {
++        const float sohD[3] = { sohDx, sohDy, sohDz };
++        Soh3DPreTranslate(m, sohD);
++    }
++    gSohVRSeatLerps = gSohVRSeatLerps + 1;
++}
++// THE PROBE, and it shares nothing with the seat. `in` is the GAME's own
++// combined guPerspective*guLookAt for THIS walk -- i.e. the matrix
++// FrameInterpolation just lerped -- so the camera position recovered from
++// it is the world's own interpolated motion, measured through a path that
++// contains no kart export, no seat, no head pose and no angle (trap D11:
++// the ground truth must not share a convention with the thing under test).
++// M[i][3] = s*fwd_i and M[3][3] = -s*dot(e,fwd); M[i][0] = p00*right_i and
++// M[3][0] = -p00*dot(e,right); likewise column 1. Normalising each column
++// gives an orthonormal basis and the three dot products, and e is their
++// linear combination -- no matrix inverse, no assumption about the near or
++// far planes.
++static int Soh3DRecoverCamEye(const float in[4][4], float sohOut[3]) {
++    float sohAx[3][3];
++    float sohD[3];
++    const int sohCol[3] = { 0, 1, 3 };
++    for (int sohC = 0; sohC < 3; sohC++) {
++        const int sohJ = sohCol[sohC];
++        float sohV[3] = { in[0][sohJ], in[1][sohJ], in[2][sohJ] };
++        const float sohL = sqrtf(sohV[0] * sohV[0] + sohV[1] * sohV[1] + sohV[2] * sohV[2]);
++        if (sohL < 1.0e-4f) {
++            return 0;
++        }
++        for (int sohI = 0; sohI < 3; sohI++) {
++            sohAx[sohC][sohI] = sohV[sohI] / sohL;
++        }
++        sohD[sohC] = -in[3][sohJ] / sohL;
++    }
++    for (int sohI = 0; sohI < 3; sohI++) {
++        sohOut[sohI] = sohD[0] * sohAx[0][sohI] + sohD[1] * sohAx[1][sohI] + sohD[2] * sohAx[2][sohI];
++    }
++    return 1;
++}
++// The walk loads the projection TWICE: guPerspective alone (G_MTX_LOAD)
++// and then guLookAt multiplied onto it (G_MTX_MUL). Both are perspective
++// matrices and this function sees both, so the FIRST one is the bare
++// frustum with the camera at the origin -- which is what a first cut of
++// this probe sampled, and it read key_err = 163.77 = |camEye| exactly.
++// So every perspective load of the walk goes into a PENDING slot and the
++// last one wins, committed at the head of the next walk.
++static int sSohVRGhostPending = 0;
++static float sSohVRGhostPendRel[3] = { 0.0f, 0.0f, 0.0f };
++static float sSohVRGhostPendT = 1.0f;
++static float sSohVRGhostPendKey = -1.0f;
++static float sSohVRGhostRel[3] = { 0.0f, 0.0f, 0.0f };
++static float sSohVRGhostD[3] = { 0.0f, 0.0f, 0.0f };
++static int sSohVRGhostHave = 0;
++static double sSohVRGhostJAcc = 0.0, sSohVRGhostSAcc = 0.0;
++static unsigned int sSohVRGhostCount = 0;
++// extern "C": this TU is inside namespace Fast, and the shell calls it.
++extern "C" void Soh3DGhostReset(void) {
++    sSohVRGhostHave = 0;
++    sSohVRGhostPending = 0;
++    sSohVRGhostJAcc = sSohVRGhostSAcc = 0.0;
++    sSohVRGhostCount = 0;
++    gSohVRGhostN = 0;
++    gSohVRGhostJitter = gSohVRGhostJitterMax = gSohVRGhostStep = 0.0f;
++    gSohVRGhostTMin = 9.0f;
++    gSohVRGhostTMax = -9.0f;
++    gSohVRGhostKeyErr = -1.0f;
++    gSohVRGhostKeyN = 0;
++    gSohVRSeatDeltaMax = 0.0f; // rev14
++    gSohVRSeatDxMax = 0.0f;
++}
++static void Soh3DGhostSample(const float in[4][4]) {
++    float sohE[3];
++    if (!Soh3DRecoverCamEye(in, sohE)) {
++        return;
++    }
++    float sohT = gSohVRWalkT;
++    if (!(sohT > 0.0f && sohT <= 1.0f)) {
++        sohT = 1.0f;
++    }
++    // The key-frame walk must recover the very camera position 0045
++    // exported this game frame. If it does not, either t is not what this
++    // code thinks it is or the recovery is wrong -- and the whole
++    // measurement is void. It is reported, not assumed.
++    if (sohT > 0.999f) {
++        const float sohKx = sohE[0] - gSoh3DCamEye[0];
++        const float sohKy = sohE[1] - gSoh3DCamEye[1];
++        const float sohKz = sohE[2] - gSoh3DCamEye[2];
++        sSohVRGhostPendKey = sqrtf(sohKx * sohKx + sohKy * sohKy + sohKz * sohKz);
++    }
++    // The SEAT'S BASE as this walk actually used it: 0045's live export
++    // plus whatever correction Soh3DSeatLerp applied (0 in the red arm).
++    // The seat's constant offsets do not appear because a constant cannot
++    // contribute to a difference, let alone a second one.
++    float sohBase[3], sohDelta[3];
++    if (!Soh3DSeatBase(sohBase, sohDelta)) {
++        return;
++    }
++    const float sohW = 1.0f - sohT;
++    const float sohSeat[3] = {
++        sohBase[0] + (gSohVRSeatInterp ? sohDelta[0] * sohW : 0.0f),
++        sohBase[1] + (gSohVRSeatInterp ? sohDelta[1] * sohW : 0.0f),
++        sohBase[2] + (gSohVRSeatInterp ? sohDelta[2] * sohW : 0.0f),
++    };
++    for (int sohI = 0; sohI < 3; sohI++) {
++        sSohVRGhostPendRel[sohI] = sohE[sohI] - sohSeat[sohI];
++    }
++    sSohVRGhostPendT = sohT;
++    sSohVRGhostPending = 1;
++}
++// Commit the walk that just finished: its LAST perspective load is the
++// combined view*projection, and that is the one the world was drawn with.
++static void Soh3DGhostCommit(void) {
++    if (!sSohVRGhostPending) {
++        return;
++    }
++    sSohVRGhostPending = 0;
++    const float* sohRel = sSohVRGhostPendRel;
++    const float sohT = sSohVRGhostPendT;
++    if (sohT < gSohVRGhostTMin) {
++        gSohVRGhostTMin = sohT;
++    }
++    if (sohT > gSohVRGhostTMax) {
++        gSohVRGhostTMax = sohT;
++    }
++    if (sSohVRGhostPendKey >= 0.0f) {
++        gSohVRGhostKeyErr = sSohVRGhostPendKey;
++        gSohVRGhostKeyN = gSohVRGhostKeyN + 1;
++        sSohVRGhostPendKey = -1.0f;
++    }
++    if (sSohVRGhostHave >= 1) {
++        float sohDd[3];
++        double sohStep = 0.0;
++        for (int sohI = 0; sohI < 3; sohI++) {
++            sohDd[sohI] = sohRel[sohI] - sSohVRGhostRel[sohI];
++            sohStep += (double)sohDd[sohI] * (double)sohDd[sohI];
++        }
++        sohStep = sqrt(sohStep);
++        if (sSohVRGhostHave >= 2) {
++            double sohJ = 0.0;
++            for (int sohI = 0; sohI < 3; sohI++) {
++                const double sohJi = (double)sohDd[sohI] - (double)sSohVRGhostD[sohI];
++                sohJ += sohJi * sohJi;
++            }
++            sohJ = sqrt(sohJ);
++            sSohVRGhostJAcc += sohJ;
++            sSohVRGhostSAcc += sohStep;
++            sSohVRGhostCount = sSohVRGhostCount + 1;
++            if ((float)sohJ > gSohVRGhostJitterMax) {
++                gSohVRGhostJitterMax = (float)sohJ;
++            }
++            gSohVRGhostN = sSohVRGhostCount;
++            gSohVRGhostJitter = (float)(sSohVRGhostJAcc / (double)sSohVRGhostCount);
++            gSohVRGhostStep = (float)(sSohVRGhostSAcc / (double)sSohVRGhostCount);
++        }
++        for (int sohI = 0; sohI < 3; sohI++) {
++            sSohVRGhostD[sohI] = sohDd[sohI];
++        }
++        sSohVRGhostHave = 2;
++    } else {
++        sSohVRGhostHave = 1;
++    }
++    for (int sohI = 0; sohI < 3; sohI++) {
++        sSohVRGhostRel[sohI] = sohRel[sohI];
++    }
++}
++// ---------------------------------------------------------------------------
++// SOH_IOS (overlay 0044 rev15, VR R18-A): THE CLASS PROBE (dev only).
++//
++// R17-A's ghost probe compares the interpolated GAME camera with a MODEL of
++// the seat (the game-thread export plus the correction) -- it never looks at
++// the eye matrix the walk was actually drawn with, so a matrix composed
++// around a different base than the model assumes is invisible to it (trap
++// D11: the instrument shared the assumption under test). This one reads
++// both ends off what the renderer is handed:
++//   * the EYE position recovered from the composed eye matrix itself (eye 1,
++//     after every correction) -- the point that maps to x = y = w = 0, a
++//     3x3 solve that holds for any perspective matrix, off-axis included;
++//   * each object CLASS's drawn world translation: row 3 of the modelview
++//     the interpreter actually loaded (FrameInterpolation's replacement
++//     included), for the first load inside a G_NOOP 0x70 ... 0x71 bracket
++//     the game emits only while gSohVRClassProbe is set (0054 rev6, 0065).
++// Per class it reports
++//   jit/jitmax  |second difference| of (drawn - eye) across consecutive walks:
++//               zero for anything moving at constant velocity relative to the
++//               eye, one seat step for something on a different clock.
++//   dev/devmax  |drawn - lerp(prev key, cur key, t)| on the non-key walks:
++//               is the class on its OWN interpolation clock? For the eye this
++//               is the stale-base detector.
++//   interp/tick loads that found / did not find a FrameInterpolation
++//               replacement on a non-key walk.
++//   dup         a second load for the same key inside one walk (a DUPLICATE).
++//   back        walks on which a kart quad's local +z faced AWAY from the eye
++//               (G_CULL_BACK territory -- a flash OFF, trap D19), and facemin
++//               the smallest cosine seen.
++#define SOHVR_CP_NCLS 8
++#define SOHVR_CP_NENT 160
++#define SOHVR_CP_NBUF 8
++static const char* const kSohCpName[SOHVR_CP_NCLS] = {
++    "eye", "ownshadow", "ownkart", "ownboost", "ownpart", "kart", "shadow", "part",
++};
++struct SohCpEnt {
++    int used, cls, key;
++    int seen, hit;
++    float d[3], n[3];
++    int relN;
++    float rel[3], d1[3];
++    unsigned int lastWalk;
++    int bufN;
++    float bufT[SOHVR_CP_NBUF];
++    float bufD[SOHVR_CP_NBUF][3];
++    int haveKey;
++    unsigned int keyIdx;
++    float keyP[3];
++};
++struct SohCpStat {
++    unsigned int n, devN, stepN, interp, tick, dup, back, loads;
++    double jAcc, devAcc, stepAcc;
++    float jMax, devMax, faceMin, faceMax;
++};
++static SohCpEnt sSohCp[SOHVR_CP_NENT];
++static SohCpStat sSohCpStat[SOHVR_CP_NCLS];
++static int sSohCpPendCls = -1, sSohCpPendKey = 0;
++static int sSohCpEyeHave = 0;
++static float sSohCpEye[3] = { 0.0f, 0.0f, 0.0f };
++static float sSohCpT = 1.0f;
++static unsigned int sSohCpWalk = 0, sSohCpKeyIdx = 0, sSohCpFull = 0;
++static float sSohCpTMin = 9.0f, sSohCpTMax = -9.0f;
++// rev16 (R21 item 2): classprobe 1 samples eye 1 (R18-A); classprobe 2 samples
++// the REAR PANE's walk (eye index 3) instead, with the eye recovered from the
++// pane's own composed matrix. One table, one walk at a time.
++static int Soh3DCpEyeIdx(void) {
++    return (gSohVRClassProbe == 2) ? 3 : 1;
++}
++extern "C" void Soh3DClassReset(void) {
++    memset(sSohCp, 0, sizeof(sSohCp));
++    memset(sSohCpStat, 0, sizeof(sSohCpStat));
++    for (int sohC = 0; sohC < SOHVR_CP_NCLS; sohC++) {
++        sSohCpStat[sohC].faceMin = 2.0f;
++        sSohCpStat[sohC].faceMax = -2.0f;
++    }
++    sSohCpPendCls = -1;
++    sSohCpEyeHave = 0;
++    sSohCpWalk = sSohCpKeyIdx = sSohCpFull = 0;
++    sSohCpTMin = 9.0f;
++    sSohCpTMax = -9.0f;
++    gSohVRBaseWalks = gSohVRBaseStale = gSohVRSeatRebases = 0;
++    gSohVRBaseErrMax = gSohVRBaseErrAcc = 0.0f;
++}
++static SohCpEnt* Soh3DClassFind(int sohCls, int sohKey) {
++    SohCpEnt* sohFree = nullptr;
++    for (int sohI = 0; sohI < SOHVR_CP_NENT; sohI++) {
++        SohCpEnt* sohE = &sSohCp[sohI];
++        if (sohE->used) {
++            if (sohE->cls == sohCls && sohE->key == sohKey) {
++                return sohE;
++            }
++        } else if (sohFree == nullptr) {
++            sohFree = sohE;
++        }
++    }
++    if (sohFree == nullptr) {
++        sSohCpFull = sSohCpFull + 1;
++        return nullptr;
++    }
++    memset(sohFree, 0, sizeof(*sohFree));
++    sohFree->used = 1;
++    sohFree->cls = sohCls;
++    sohFree->key = sohKey;
++    return sohFree;
++}
++// The eye of a projective matrix (row vectors, clip = p*M): the one world
++// point with clip x = y = w = 0.
++static int Soh3DEyeFromMatrix(const float m[4][4], float sohE[3]) {
++    const int sohCol[3] = { 0, 1, 3 };
++    double sohA[3][3], sohB[3];
++    for (int sohR = 0; sohR < 3; sohR++) {
++        for (int sohI = 0; sohI < 3; sohI++) {
++            sohA[sohR][sohI] = m[sohI][sohCol[sohR]];
++        }
++        sohB[sohR] = -(double)m[3][sohCol[sohR]];
++    }
++    const double sohDet = sohA[0][0] * (sohA[1][1] * sohA[2][2] - sohA[1][2] * sohA[2][1]) -
++                          sohA[0][1] * (sohA[1][0] * sohA[2][2] - sohA[1][2] * sohA[2][0]) +
++                          sohA[0][2] * (sohA[1][0] * sohA[2][1] - sohA[1][1] * sohA[2][0]);
++    if (fabs(sohDet) < 1.0e-12) {
++        return 0;
++    }
++    for (int sohK = 0; sohK < 3; sohK++) {
++        double sohM[3][3];
++        for (int sohR = 0; sohR < 3; sohR++) {
++            for (int sohI = 0; sohI < 3; sohI++) {
++                sohM[sohR][sohI] = (sohI == sohK) ? sohB[sohR] : sohA[sohR][sohI];
++            }
++        }
++        const double sohDk = sohM[0][0] * (sohM[1][1] * sohM[2][2] - sohM[1][2] * sohM[2][1]) -
++                             sohM[0][1] * (sohM[1][0] * sohM[2][2] - sohM[1][2] * sohM[2][0]) +
++                             sohM[0][2] * (sohM[1][0] * sohM[2][1] - sohM[1][1] * sohM[2][0]);
++        sohE[sohK] = (float)(sohDk / sohDet);
++    }
++    return 1;
++}
++// Eye 1's composed matrix, after every correction this pass applies.
++static void Soh3DClassEye(const float out[4][4]) {
++    float sohE[3];
++    if (!Soh3DEyeFromMatrix(out, sohE)) {
++        return;
++    }
++    float sohT = gSohVRWalkT;
++    if (!(sohT > 0.0f && sohT <= 1.0f)) {
++        sohT = 1.0f;
++    }
++    sSohCpEye[0] = sohE[0];
++    sSohCpEye[1] = sohE[1];
++    sSohCpEye[2] = sohE[2];
++    sSohCpT = sohT;
++    sSohCpEyeHave = 1;
++}
++// The first modelview load inside a class bracket.
++static void Soh3DClassSample(const float mv[4][4], int sohHit) {
++    const int sohCls = sSohCpPendCls;
++    const int sohKey = sSohCpPendKey;
++    sSohCpPendCls = -1;
++    if (sohCls < 0 || sohCls >= SOHVR_CP_NCLS) {
++        return;
++    }
++    SohCpEnt* sohE = Soh3DClassFind(sohCls, sohKey);
++    if (sohE == nullptr) {
++        return;
++    }
++    SohCpStat* sohS = &sSohCpStat[sohCls];
++    sohS->loads = sohS->loads + 1;
++    sohE->seen = sohE->seen + 1;
++    if (sohE->seen > 1) {
++        sohS->dup = sohS->dup + 1;
++        return;
++    }
++    for (int sohI = 0; sohI < 3; sohI++) {
++        sohE->d[sohI] = mv[3][sohI];
++        sohE->n[sohI] = mv[2][sohI];
++    }
++    sohE->hit = sohHit;
++}
++// Commit the walk that just ended (called with Soh3DGhostCommit, at the head
++// of the next walk's eye 1, before the new snapshot is latched).
++static void Soh3DClassCommit(void) {
++    if (!sSohCpEyeHave) {
++        for (int sohI = 0; sohI < SOHVR_CP_NENT; sohI++) {
++            sSohCp[sohI].seen = 0;
++        }
++        return;
++    }
++    sSohCpEyeHave = 0;
++    const float sohT = sSohCpT;
++    const int sohIsKey = (sohT > 0.999f);
++    const unsigned int sohWalk = ++sSohCpWalk;
++    const unsigned int sohKeyNow = sohIsKey ? ++sSohCpKeyIdx : sSohCpKeyIdx;
++    if (sohT < sSohCpTMin) {
++        sSohCpTMin = sohT;
++    }
++    if (sohT > sSohCpTMax) {
++        sSohCpTMax = sohT;
++    }
++    SohCpEnt* sohEye = Soh3DClassFind(0, 0);
++    if (sohEye != nullptr) {
++        sohEye->seen = 1;
++        sohEye->hit = 0;
++        for (int sohI = 0; sohI < 3; sohI++) {
++            sohEye->d[sohI] = sSohCpEye[sohI];
++            sohEye->n[sohI] = 0.0f;
++        }
++    }
++    for (int sohX = 0; sohX < SOHVR_CP_NENT; sohX++) {
++        SohCpEnt* sohE = &sSohCp[sohX];
++        if (!sohE->used) {
++            continue;
++        }
++        if (sohE->seen == 0) {
++            sohE->relN = 0; // a missed walk breaks the difference chain
++            continue;
++        }
++        SohCpStat* sohS = &sSohCpStat[sohE->cls];
++        if (sohE->cls != 0) {
++            if (!sohIsKey) {
++                if (sohE->hit) {
++                    sohS->interp = sohS->interp + 1;
++                } else {
++                    sohS->tick = sohS->tick + 1;
++                }
++            }
++            float sohRel[3];
++            for (int sohI = 0; sohI < 3; sohI++) {
++                sohRel[sohI] = sohE->d[sohI] - sSohCpEye[sohI];
++            }
++            if (sohE->relN >= 1 && sohE->lastWalk + 1 == sohWalk) {
++                float sohD1[3];
++                for (int sohI = 0; sohI < 3; sohI++) {
++                    sohD1[sohI] = sohRel[sohI] - sohE->rel[sohI];
++                }
++                if (sohE->relN >= 2) {
++                    double sohJ = 0.0;
++                    for (int sohI = 0; sohI < 3; sohI++) {
++                        const double sohJi = (double)sohD1[sohI] - (double)sohE->d1[sohI];
++                        sohJ += sohJi * sohJi;
++                    }
++                    sohJ = sqrt(sohJ);
++                    sohS->jAcc += sohJ;
++                    sohS->n = sohS->n + 1;
++                    if ((float)sohJ > sohS->jMax) {
++                        sohS->jMax = (float)sohJ;
++                    }
++                }
++                for (int sohI = 0; sohI < 3; sohI++) {
++                    sohE->d1[sohI] = sohD1[sohI];
++                }
++                sohE->relN = sohE->relN + 1;
++            } else {
++                sohE->relN = 1;
++            }
++            for (int sohI = 0; sohI < 3; sohI++) {
++                sohE->rel[sohI] = sohRel[sohI];
++            }
++            if (sohE->cls == 2 || sohE->cls == 5) {
++                // The kart quad's local +z against the direction to the eye.
++                const float sohNl = sqrtf(sohE->n[0] * sohE->n[0] + sohE->n[1] * sohE->n[1] +
++                                          sohE->n[2] * sohE->n[2]);
++                const float sohDl = sqrtf(sohRel[0] * sohRel[0] + sohRel[1] * sohRel[1] +
++                                          sohRel[2] * sohRel[2]);
++                if (sohNl > 1.0e-4f && sohDl > 1.0e-4f) {
++                    const float sohF = -(sohE->n[0] * sohRel[0] + sohE->n[1] * sohRel[1] +
++                                         sohE->n[2] * sohRel[2]) / (sohNl * sohDl);
++                    if (sohF < sohS->faceMin) {
++                        sohS->faceMin = sohF;
++                    }
++                    if (sohF > sohS->faceMax) {
++                        sohS->faceMax = sohF;
++                    }
++                    if (sohF < 0.0f) {
++                        sohS->back = sohS->back + 1;
++                    }
++                }
++            }
++        }
++        // expected(t): the class's own lerp between its key-walk positions.
++        if (!sohIsKey) {
++            if (sohE->bufN < SOHVR_CP_NBUF) {
++                sohE->bufT[sohE->bufN] = sohT;
++                for (int sohI = 0; sohI < 3; sohI++) {
++                    sohE->bufD[sohE->bufN][sohI] = sohE->d[sohI];
++                }
++                sohE->bufN = sohE->bufN + 1;
++            }
++        } else {
++            if (sohE->haveKey && sohE->keyIdx + 1 == sohKeyNow) {
++                double sohStep = 0.0;
++                for (int sohI = 0; sohI < 3; sohI++) {
++                    const double sohSi = (double)sohE->d[sohI] - (double)sohE->keyP[sohI];
++                    sohStep += sohSi * sohSi;
++                }
++                sohS->stepAcc += sqrt(sohStep);
++                sohS->stepN = sohS->stepN + 1;
++                for (int sohB = 0; sohB < sohE->bufN; sohB++) {
++                    const float sohBt = sohE->bufT[sohB];
++                    double sohDev = 0.0;
++                    for (int sohI = 0; sohI < 3; sohI++) {
++                        const double sohX = (double)sohE->keyP[sohI] +
++                                            ((double)sohE->d[sohI] - (double)sohE->keyP[sohI]) * sohBt;
++                        const double sohDi = (double)sohE->bufD[sohB][sohI] - sohX;
++                        sohDev += sohDi * sohDi;
++                    }
++                    sohDev = sqrt(sohDev);
++                    sohS->devAcc += sohDev;
++                    sohS->devN = sohS->devN + 1;
++                    if ((float)sohDev > sohS->devMax) {
++                        sohS->devMax = (float)sohDev;
++                    }
++                }
++            }
++            for (int sohI = 0; sohI < 3; sohI++) {
++                sohE->keyP[sohI] = sohE->d[sohI];
++            }
++            sohE->keyIdx = sohKeyNow;
++            sohE->haveKey = 1;
++            sohE->bufN = 0;
++        }
++        sohE->lastWalk = sohWalk;
++        sohE->seen = 0;
++    }
++}
++// `vr classes`: name=n,jit,jitmax,dev,devmax,step,interp,tick,dup,back,facemin,facemax
++static char sSohCpLine[1536];
++extern "C" const char* Soh3DClassDump(void) {
++    int sohN = snprintf(sSohCpLine, sizeof(sSohCpLine), "cp_walks=%u cp_keys=%u cp_t=%.3f,%.3f cp_full=%u",
++                        sSohCpWalk, sSohCpKeyIdx, sSohCpTMin, sSohCpTMax, sSohCpFull);
++    for (int sohC = 0; sohC < SOHVR_CP_NCLS && sohN > 0 && sohN < (int)sizeof(sSohCpLine); sohC++) {
++        const SohCpStat* sohS = &sSohCpStat[sohC];
++        sohN += snprintf(sSohCpLine + sohN, sizeof(sSohCpLine) - (size_t)sohN,
++                         " %s=%u,%.4f,%.4f,%.4f,%.4f,%.4f,%u,%u,%u,%u,%.3f,%.3f", kSohCpName[sohC], sohS->n,
++                         sohS->n ? sohS->jAcc / (double)sohS->n : 0.0, sohS->jMax,
++                         sohS->devN ? sohS->devAcc / (double)sohS->devN : 0.0, sohS->devMax,
++                         sohS->stepN ? sohS->stepAcc / (double)sohS->stepN : 0.0, sohS->interp, sohS->tick,
++                         sohS->dup, sohS->back, (sohS->faceMin > 1.5f) ? 9.0f : sohS->faceMin,
++                         (sohS->faceMax < -1.5f) ? -9.0f : sohS->faceMax);
++    }
++    return sSohCpLine;
++}
 +// Off-axis stereo for the COMBINED viewing*projection matrix (MK64 composes
 +// guPerspective*guLookAt in the projection slot, same as OoT). The camera
 +// axes cannot be derived from the combined matrix, so the game exports its
@@ -298,10 +2185,661 @@ so iPhone links resolve (mode stays 0 there); macOS compiles none of it.
 +// view_z = dot(v,fwd) - dot(eye,fwd) and s = e*P00/C so parallax is zero
 +// exactly at the focus distance. Perspective detect: the combined matrix's
 +// w-column top-3 is (+/-)forward (unit) — ortho has (0,0,0).
-+static void Soh3DStereoP(float out[4][4], const float in[4][4]) {
++// Returns 1 when the matrix just written is ORTHOGRAPHIC (2D), which is the
++// signal the VR HUD redirect keys off.
++// SOH_IOS (overlay 0044 rev14, VR R17-B) -- THE DOME'S FALSIFIER, and it
++// measures in BOTH arms (trap D48).
++//
++//   walk = where THIS PASS actually put the probe sprite, projected through
++//          `out` -- the matrix after every substitution the pass makes:
++//          ortho or perspective, seat lerp, per-eye affine, roll and all.
++//   ref  = where the WORLD puts the probe's DIRECTION, projected through
++//          the composed eye matrix with w = 0. 0051 derives that direction
++//          from the authored rotY/posY alone -- no head pose, no eye
++//          matrix, no sprite path -- so it is the same ground truth in the
++//          red arm as in the green one, and the two sides share no code
++//          below the eye matrix.
++//
++// err is |walk - ref|. jit is the mean |SECOND DIFFERENCE| of the SIGNED
++// error across consecutive walks of the same eye: a constant offset and a
++// constant RATE both differentiate to zero, so it isolates the game-rate
++// staircase and nothing else -- which is the user's "they shake in place as i
++// look left and right", as a number.
++static float sSohVRSkyErrP1[2][2];
++static float sSohVRSkyErrP2[2][2];
++static int sSohVRSkyErrN[2] = { 0, 0 };
++// One record per WALK per eye: Soh3DStereoP runs on every gSPMatrix, so
++// without this latch a fifty-sprite span would contribute fifty identical
++// samples and the second difference would read zero for the wrong reason.
++static int sSohVRSkyProbeDone = 0;
++static int Soh3DSkyProject(const float m[4][4], const float v[4], float* x, float* y) {
++    float c[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
++    for (int sohC = 0; sohC < 4; sohC++) {
++        float sohS = 0.0f;
++        for (int sohR = 0; sohR < 4; sohR++) {
++            sohS += v[sohR] * m[sohR][sohC];
++        }
++        c[sohC] = sohS;
++    }
++    if (!(c[3] > 1.0e-6f) || !isfinite(c[0]) || !isfinite(c[1]) || !isfinite(c[3])) {
++        return 0;
++    }
++    *x = c[0] / c[3];
++    *y = c[1] / c[3];
++    return 1;
++}
++static void Soh3DSkyProbeRecord(const float m[4][4], int sohSlot) {
++    if (sohSlot < 0 || sohSlot > 2) {
++        return;
++    }
++    gSohVRSkyWalks[sohSlot] = gSohVRSkyWalks[sohSlot] + 1;
++    // The one frame after `vr set skydome` flips, 0051 has published the
++    // OTHER arm's Pos -- an ortho vertex, or a 30000-unit world point --
++    // while this pass is already the new one. Projecting one through the
++    // other's matrix is a number with no meaning, and it lands in errmax
++    // where it looks like a finding: it read 77 to 153 NDC in the first
++    // falsifier run.
++    if (gSohVRSkyProbeOrtho == (gSohVRSkyDome ? 1 : 0)) {
++        return;
++    }
++    if (sohSlot > 1 || !gSohVRSkyProbeValid || !sSohVRHaveEyes) {
++        return;  // slot 2 is the rear pane: counted, never asserted on
++    }
++    const float sohP[4] = { gSohVRSkyProbePos[0], gSohVRSkyProbePos[1],
++                            gSohVRSkyProbePos[2], 1.0f };
++    const float sohU[4] = { gSohVRSkyProbeUp[0], gSohVRSkyProbeUp[1],
++                            gSohVRSkyProbeUp[2], 1.0f };
++    float sohWx = 0.0f, sohWy = 0.0f, sohUx = 0.0f, sohUy = 0.0f;
++    if (!Soh3DSkyProject(m, sohP, &sohWx, &sohWy) ||
++        !Soh3DSkyProject(m, sohU, &sohUx, &sohUy)) {
++        return;
++    }
++    const float sohD[4] = { gSohVRSkyProbeDir[0], gSohVRSkyProbeDir[1],
++                            gSohVRSkyProbeDir[2], 0.0f };
++    const float sohDu[4] = { gSohVRSkyProbeDir[0], gSohVRSkyProbeDir[1] + 0.02f,
++                             gSohVRSkyProbeDir[2], 0.0f };
++    float sohRx = 0.0f, sohRy = 0.0f, sohRux = 0.0f, sohRuy = 0.0f;
++    if (!Soh3DSkyProject(sSohVREyeM[sohSlot], sohD, &sohRx, &sohRy) ||
++        !Soh3DSkyProject(sSohVREyeM[sohSlot], sohDu, &sohRux, &sohRuy)) {
++        return;
++    }
++    gSohVRSkyWalkNdc[sohSlot][0] = sohWx;
++    gSohVRSkyWalkNdc[sohSlot][1] = sohWy;
++    gSohVRSkyRefNdc[sohSlot][0] = sohRx;
++    gSohVRSkyRefNdc[sohSlot][1] = sohRy;
++    if (sohSlot == 1) {
++        gSohVRSkyStereoNdc = gSohVRSkyWalkNdc[0][0] - sohWx;
++    }
++    const float sohEx = sohWx - sohRx, sohEy = sohWy - sohRy;
++    const float sohErr = sqrtf(sohEx * sohEx + sohEy * sohEy);
++    gSohVRSkyDomeErr[sohSlot] = sohErr;
++    if (sohErr > gSohVRSkyDomeErrMax[sohSlot]) {
++        gSohVRSkyDomeErrMax[sohSlot] = sohErr;
++    }
++    // THE UPRIGHTNESS OF THE IMAGE. The quad's own up edge, in NDC, against
++    // the direction world UP projects to at the same place. 1.0 = upright;
++    // with a rolled head and no roll handling anywhere it is cos(roll).
++    {
++        const float sohQx = sohUx - sohWx, sohQy = sohUy - sohWy;
++        const float sohVx = sohRux - sohRx, sohVy = sohRuy - sohRy;
++        const float sohQl = sqrtf(sohQx * sohQx + sohQy * sohQy);
++        const float sohVl = sqrtf(sohVx * sohVx + sohVy * sohVy);
++        if (sohQl > 1.0e-7f && sohVl > 1.0e-7f) {
++            gSohVRSkyUpDot[sohSlot] = (sohQx * sohVx + sohQy * sohVy) / (sohQl * sohVl);
++        }
++    }
++    if (sSohVRSkyErrN[sohSlot] >= 2) {
++        const float sohD2 = sohEx - 2.0f * sSohVRSkyErrP1[sohSlot][0] +
++                            sSohVRSkyErrP2[sohSlot][0];
++        const float sohA = fabsf(sohD2);
++        const unsigned int sohN = gSohVRSkyDomeJitN[sohSlot];
++        gSohVRSkyDomeJit[sohSlot] =
++            (gSohVRSkyDomeJit[sohSlot] * (float)sohN + sohA) / (float)(sohN + 1u);
++        gSohVRSkyDomeJitN[sohSlot] = sohN + 1u;
++    }
++    sSohVRSkyErrP2[sohSlot][0] = sSohVRSkyErrP1[sohSlot][0];
++    sSohVRSkyErrP2[sohSlot][1] = sSohVRSkyErrP1[sohSlot][1];
++    sSohVRSkyErrP1[sohSlot][0] = sohEx;
++    sSohVRSkyErrP1[sohSlot][1] = sohEy;
++    if (sSohVRSkyErrN[sohSlot] < 2) {
++        sSohVRSkyErrN[sohSlot] = sSohVRSkyErrN[sohSlot] + 1;
++    }
++}
++// SOH_IOS (overlay 0044 rev16, VR R21 item 2): THE PANE ON THE WALK'S CLOCK.
++// `out` = T * in, T = V_pane(P) * V_game(e)^-1 built from game frame N's
++// exports. `in` was already moved by FrameInterpolation to this walk's t, so
++// the right T is V_pane(P') * V_game(e')^-1 with
++//   P' = the look-behind eye at t = P + (prev - P)(1 - t)   (Soh3DWalkW: the
++//        seat's own weight -- one clock for both walks)
++//   e' = the game eye `in` actually carries, read off `in` itself (the point
++//        with clip x = y = w = 0; trap D67: read the artefact, do not model it)
++// T = Tr(-P) R Tr(e) with R = T's rigid 3x3, and T * Tr(x) = Tr(x R^-1) * T,
++// so T' = Tr(-d) * T with  d = (P' - P) - (e' - e) R^-1 : ONE world
++// pre-translation, the same row the seat uses (Soh3DPreTranslate). Rotation
++// is untouched: `in` carries the game camera's interpolated rotation and T
++// passes the same view-space delta to the pane, which is what a rear camera
++// bolted to the same kart does. Both terms are bounded by the seat's 400-unit
++// teleport guard. Returns 1 when a correction was applied.
++static int Soh3DPaneLerp(float out[4][4], const float in[4][4], const float sohT[4][4],
++                         const float sohPc[3], const float sohPv[3]) {
++    const float sohW = Soh3DWalkW();
++    float sohDp[3], sohDe[3] = { 0.0f, 0.0f, 0.0f }, sohE[3];
++    float sohL2 = 0.0f;
++    for (int sohI = 0; sohI < 3; sohI++) {
++        sohDp[sohI] = (sohPv[sohI] - sohPc[sohI]) * sohW;
++        sohL2 += (sohPv[sohI] - sohPc[sohI]) * (sohPv[sohI] - sohPc[sohI]);
++    }
++    if (sohL2 > 400.0f * 400.0f) {
++        sohDp[0] = sohDp[1] = sohDp[2] = 0.0f; // a teleport: no segment
++    }
++    if (Soh3DEyeFromMatrix(in, sohE)) {
++        float sohE2 = 0.0f;
++        for (int sohI = 0; sohI < 3; sohI++) {
++            sohDe[sohI] = sohE[sohI] - gSoh3DCamEye[sohI];
++            sohE2 += sohDe[sohI] * sohDe[sohI];
++        }
++        if (sohE2 > 400.0f * 400.0f) {
++            sohDe[0] = sohDe[1] = sohDe[2] = 0.0f;
++        }
++    }
++    float sohD[3];
++    for (int sohJ = 0; sohJ < 3; sohJ++) {
++        sohD[sohJ] = sohDp[sohJ] -
++                     (sohDe[0] * sohT[sohJ][0] + sohDe[1] * sohT[sohJ][1] + sohDe[2] * sohT[sohJ][2]);
++    }
++    if (sohD[0] == 0.0f && sohD[1] == 0.0f && sohD[2] == 0.0f) {
++        return 0;
++    }
++    Soh3DPreTranslate(out, sohD);
++    const float sohLen = sqrtf(sohD[0] * sohD[0] + sohD[1] * sohD[1] + sohD[2] * sohD[2]);
++    if (sohLen > gSohVRPaneDxMax) {
++        gSohVRPaneDxMax = sohLen;
++    }
++    gSohVRPaneLerps = gSohVRPaneLerps + 1;
++    return 1;
++}
++static int Soh3DStereoP(float out[4][4], const float in[4][4]) {
 +    memcpy(out, in, sizeof(sSoh3DP));
 +    float sohWx = in[0][3], sohWy = in[1][3], sohWz = in[2][3];
-+    if (sohWx * sohWx + sohWy * sohWy + sohWz * sohWz < 0.25f) {
++    const int sohIsOrtho = (sohWx * sohWx + sohWy * sohWy + sohWz * sohWz < 0.25f);
++    // ---- VR world frames (spec D2/D6): the composed A*V*P eye matrix
++    // replaces the game's combined view*projection outright. MK64 keeps
++    // world->clip in the projection slot (0045), so the modelview stack is
++    // object->world and the substitution is exact.
++    //   * PERSPECTIVE -> substitute EyeVP.
++    //   * ORTHO between the 0046 sky sentinels -> displaced far outside the
++    //     frustum: R1 skips the sky in VR (spec D6/trap D6 — MK64's sky
++    //     sprites are keyed to the GAME camera's yaw and would swim).
++    //   * ORTHO elsewhere -> the HUD: left EXACTLY as the game built it and
++    //     redirected into its own framebuffer by the caller.
++    // ---- The REAR-VIEW PANE's walk (eye index 3, spec D12). It does
++    // not use the shell's eye matrices at all: it reuses the GAME's own
++    // combined view*projection and pre-multiplies a world transform that
++    // rotates 180 degrees about the vertical axis through the KART. The
++    // kart is camEye + camFwd*camDist (0045); a point t behind it maps to t
++    // in front of it, so the camera — unmoved, with the game's own FOV,
++    // near and far — sees exactly what is behind the kart. It is a proper
++    // rotation (determinant +1), so winding and backface culling are
++    // untouched; the MIRROR convention is a U flip in the shell's plane
++    // shader, where it costs nothing and cannot invert a face.
++    //   Fast3D is ROW-vector (clip = v * MP), so the composition is
++    //   out = T * in with T's rows: (-1,0,0,0) (0,1,0,0) (0,0,-1,0)
++    //   (2Kx, 0, 2Kz, 1).
++    if (gSohVRWorldActive && sSoh3DEye == 3) {
++        if (sohIsOrtho) {
++            // Same sky treatment as the eyes: pinned just inside the far
++            // plane when the mode draws the sky in-target, otherwise the
++            // sentinels have already parked the stretch in the sink.
++            if (sSoh3DSkybox) {
++                // rev8 (R14 item 3): NOT gated on gSohVRSkyMode -- see the
++                // 0x5A sentinel. The pane's sky is the yaw-independent
++                // gradient and floor, which are correct for a rear-facing
++                // camera whatever the eyes are doing with theirs.
++                out[0][2] = 0.0f;
++                out[1][2] = 0.0f;
++                out[2][2] = 0.0f;
++                out[3][2] = 0.9995f * out[3][3];
++                // SOH_IOS (overlay 0044 rev7, VR R13 item 4): THE REAR
++                // PANE'S SKY, DONE PROPERLY. R11 rev5's answer (kept below
++                // as the historical note) shifted the ortho projection by
++                // the yaw difference between the composed eye and the
++                // kart's rear. With cockpit lock and gaze forward that
++                // difference is 180 degrees, which on MK64's own
++                // 1.7578125/fov px-per-bam mapping is ~576 px on a 320 px
++                // screen -- 1.8 SCREEN WIDTHS. It did not re-register the
++                // sky; it evacuated it, and it took the gradient quads and
++                // the floor with it, which are screen-space and
++                // yaw-INDEPENDENT and had no business moving at all. That
++                // is the user's "rear-view sky was REMOVED, not fixed".
++                //
++                // The correct split needs the finer sentinels 0046 rev2
++                // adds: the GRADIENT and the FLOOR are drawn UNSHIFTED (they
++                // are correct as-is for any camera direction, and being
++                // screen-space they cannot follow your head -- which was the
++                // original complaint), and the SPRITES are dropped out of
++                // the frustum. Shifting the sprites cannot be made to work:
++                // the required correction is ~180 degrees, any sprite
++                // correctly re-registered lands ~576 px off the pane, and
++                // the sprites that WOULD be behind you were culled out of
++                // the list by SkyCloud::Tick's eye-keyed bounds test before
++                // this walk ever ran. Drawing them unshifted is worse than
++                // dropping them: they are the one part of the sky that IS
++                // keyed to head yaw, so they would slide across the pane as
++                // you looked around -- exactly the bug R11 set out to fix.
++                //
++                // gSohVRRearSky 0 restores 1.0.0.7: no sky in the pane.
++                // SOH_IOS (overlay 0044 rev9, VR R15 item 5): the GROUND
++                // FILL, separable at last. the user's 1.0.0.11 photo of the
++                // pane inside Luigi Raceway's tunnel has the road behind
++                // him ending at a hard horizontal line with that course's
++                // FloorTop {216,232,248} fading to black below it, and this
++                // is the only full-width screen-space thing the pane draws.
++                // gSohVRRearFloor 0 drops it, and that is the RED CONTROL
++                // that settled what it is doing: with it dropped the same
++                // band goes BLACK, so the fill is not covering the road, it
++                // is filling the hole the section-culled display list left
++                // (trap D32). It therefore SHIPS AT 1, unchanged.
++                if (!gSohVRRearSky || sSoh3DSkySprites ||
++                    (!gSohVRRearFloor && sSoh3DSkyFloor)) {
++                    out[3][0] += 1.0e6f * out[3][3];
++                }
++                // rev14 (R17-B): slot 2 is the PANE. With the dome ON the
++                // sprite span is PERSPECTIVE and never reaches this branch
++                // at all, which is how the pane gets the clouds for free;
++                // with it off, the span is dropped here as it has been
++                // since rev7. Counted either way, asserted never -- the
++                // pane is not a place a stereo claim can be made.
++                if (sSoh3DSkySprites && !gSohVRSkyDome) {
++                    gSohVRSkyWalks[2] = gSohVRSkyWalks[2] + 1;
++                }
++                // Historical, kept for the record (rev5, VR R11 item 3c):
++                // THE REAR PANE'S SKY MUST NOT FOLLOW YOUR HEAD. The pane is a
++                // fixed rear-facing camera bolted to the kart, but MK64
++                // builds its cloud/star sprites ONCE per game frame as
++                // screen-space texrects, and 0051 re-keys that build to the
++                // COMPOSED EYE yaw (trap D6) — so the one display list the
++                // mirror walk replays already has the sky placed for wherever
++                // the user happened to be looking. Rebuilding it per pass is
++                // not available (one list, three walks), but the mapping is
++                // linear and known: SkyCloud::Tick puts a sprite at
++                // x = 160 + (1.7578125 / fovDeg) * (skyYaw + rotY) pixels.
++                // So shifting the sky's ORTHO projection by exactly the yaw
++                // difference between the composed eye and the kart's rear
++                // re-registers every sprite where the rear camera would have
++                // drawn it — clouds hold still against the kart, which is
++                // what a mirror shows. (Sprites the EYE culled are still
++                // absent; the pane is 40 deg wide and they are at its rim.)
++                // shift was  out[3][0] += (2 * -(1.7578125/fov) *
++                //   (short)(gSohVREyeYawBam - (camYaw + 0x8000)) / 320) * w
++                // and the arithmetic above is why it could never work.
++            }
++            return sohIsOrtho;
++        }
++        // rev14 (R17-B): with the dome on, the sprite span arrives here as
++        // PERSPECTIVE and is composed with the pane's own rigid transform
++        // like any other world geometry -- which is how the pane gets the
++        // clouds it has never had. Counted in the same slot the ortho drop
++        // used to be counted in, so walks[2] means "the pane's walk saw the
++        // sprite span" in either arm.
++        if (sSoh3DSkySprites && gSohVRSkyDome) {
++            gSohVRSkyWalks[2] = gSohVRSkyWalks[2] + 1;
++        }
++        {
++            // SOH_IOS (overlay 0044 rev12, VR R16-C): THE PANE'S CAMERA.
++            // Until 1.0.0.12 this was hard-wired to a 180-degree rotation
++            // about `camEye + camFwd*camDist`, described in this file as
++            // 'the vertical axis through the KART'. It is not the kart:
++            // gSoh3DCamDist is |lookAt - pos| and MK64 aims its racing
++            // camera at `player->pos + R(yaw)*(0,0,70)`, a target 70 units
++            // AHEAD of the machine (0045 rev2's own header says so). So the
++            // pane camera stood 140 units in front of where a mirror
++            // belongs -- the bottom 54% of the pane was road AHEAD of the
++            // kart drawn backwards, everything genuinely behind was crushed
++            // into the few per cent under the horizon, and your own kart
++            // would have appeared 46% down the pane instead of 65%.
++            //
++            // The generalisation is the same shape: pre-multiply the rigid
++            // transform that takes the game's view to the pane's. Three
++            // sources, in order of preference, all falling back downwards:
++            //   2  MK64's OWN look-behind camera (0045 rev5). Exact C-left
++            //      parity: its smoothing, and its WALL PUSHOUT, which no
++            //      analytic mirror has (in Toad's Turnpike's tunnel the
++            //      mirror can put the pane camera inside the wall).
++            //   1  the analytic mirror about the KART (0045 rev2/rev4).
++            //   0  the 1.0.0.12 look-at pivot -- the RED CONTROL.
++            // NOTE the pane's PITCH and FOV are deliberately untouched:
++            // MK64's sky gradient and ground fill are screen-space quads
++            // whose horizon row is computed through the GAME camera, so
++            // moving the geometry horizon without them re-opens the seam
++            // R15 closed. A horizontal translation of the rig leaves that
++            // row invariant, which is the whole reason this fix is safe.
++            float sohT[4][4];
++            int sohPivot = gSohVRRearPivot;
++            int sohHaveT = 0;
++            // rev16 (R21): kept in scope for the walk-clock correction below.
++            float sohRp[3] = { 0, 0, 0 }, sohRa[3] = { 0, 0, 0 }, sohRu[3] = { 0, 1, 0 };
++            float sohRv[3] = { 0, 0, 0 };
++            if (sohPivot >= 2) {
++                if (Soh3DReadRearCam(sohRp, sohRa, sohRu, sohRv)) {
++                    sohHaveT = Soh3DBuildPaneT(sohT, sohRp, sohRa, sohRu);
++                }
++                if (!sohHaveT) {
++                    sohPivot = 1; // no look-behind camera: analytic mirror
++                }
++            }
++            if (!sohHaveT) {
++                float sohKx = 0.0f, sohKz = 0.0f;
++                if (!(sohPivot >= 1 && Soh3DReadKartXZ(&sohKx, &sohKz))) {
++                    float sohKd = gSoh3DCamDist;
++                    if (!(sohKd > 1.0f && sohKd < 5000.0f)) {
++                        sohKd = 200.0f;
++                    }
++                    sohKx = gSoh3DCamEye[0] + gSoh3DCamFwd[0] * sohKd;
++                    sohKz = gSoh3DCamEye[2] + gSoh3DCamFwd[2] * sohKd;
++                }
++                memset(sohT, 0, sizeof(sohT));
++                sohT[0][0] = -1.0f;
++                sohT[1][1] = 1.0f;
++                sohT[2][2] = -1.0f;
++                sohT[3][0] = 2.0f * sohKx;
++                sohT[3][2] = 2.0f * sohKz;
++                sohT[3][3] = 1.0f;
++            }
++            for (int i = 0; i < 4; i++) {
++                for (int j = 0; j < 4; j++) {
++                    out[i][j] = sohT[i][0] * in[0][j] + sohT[i][1] * in[1][j] +
++                                sohT[i][2] * in[2][j] + sohT[i][3] * in[3][j];
++                }
++            }
++            // rev16 (R21 item 2): onto the walk's clock. Only the look-behind
++            // camera (pivot 2, the shipping source) has a prev to lerp along;
++            // the analytic and look-at fallbacks are red controls and stay as
++            // they were. The bare guPerspective load (trap D63: MK64 loads the
++            // projection twice, the first is the frustum with the camera at
++            // the origin) carries no camera and is left alone.
++            const int sohBare = (in[3][0] == 0.0f && in[3][1] == 0.0f && in[3][3] == 0.0f);
++            if (gSohVRPaneLerp && sohPivot >= 2 && sohHaveT && !sohBare) {
++                Soh3DPaneLerp(out, in, sohT, sohRp, sohRv);
++            }
++            // rev16: the class probe's PANE mode reads the eye off the matrix
++            // this walk will actually draw with (the last combined load wins,
++            // as it does for eye 1), in BOTH arms.
++            if (gSohVRClassProbe == 2 && !sSoh3DSkySprites && !sohBare) {
++                Soh3DClassEye(out);
++            }
++        }
++        return sohIsOrtho;
++    }
++    if (gSohVRWorldActive && sSoh3DEye != 0 && sSohVRHaveEyes) {
++        if (sohIsOrtho) {
++            if (sSoh3DSkybox && gSohVRSkyMode == 0) {
++                out[3][0] += 1.0e6f * out[3][3];
++            } else if (sSoh3DSkybox) {
++                // R2 sky, the real treatment: keep the game's own
++                // screen-space x/y mapping (the gradient quads and the
++                // yaw-keyed sprites are both built in it) and force the
++                // clip Z to sit just inside the far plane, so the sky is
++                // BEHIND every piece of world geometry and carries zero
++                // disparity — which is exactly right for something at
++                // infinity. Ortho has w == 1 (out[j][3] == 0 for j < 3),
++                // so zeroing the Z column and setting the translate term
++                // pins depth for every sky vertex.
++                out[0][2] = 0.0f;
++                out[1][2] = 0.0f;
++                out[2][2] = 0.0f;
++                out[3][2] = 0.9995f * out[3][3];
++                // SOH_IOS (overlay 0044 rev7, VR R13 item 3): THE SKY'S
++                // PITCH, the other half of R2's yaw re-key. MK64 puts the
++                // horizon at screen->cameraHeight, projected through the
++                // GAME chase camera, and every cloud sprite's Y is derived
++                // from that same number -- so the whole sky sits at a fixed
++                // screen Y while the world pitches with the eye matrix. Look
++                // up in the headset and the gradient does not move: the sky
++                // is head-locked in pitch (docs/VR-R2-NOTES.md:307, open
++                // since R2, and Moo Moo Farm's CLOUDS-type sky with its hard
++                // blue-to-white horizon is where it finally became obvious).
++                //
++                // Shift the sky's ORTHO projection vertically by the pitch
++                // difference between the composed eye and the game camera --
++                // the same shape as the existing out[3][0] yaw terms, on the
++                // other axis, and PER PASS so the rear walk is unaffected
++                // (trap D32: one whole-frame value would be wrong for it).
++                // MK64's sky ortho is guOrtho(0,320,0,240), so a dy in
++                // pixels is 2*dy/240 in NDC, and the eye's own VERTICAL fov
++                // gives the px-per-degree. 0058 extends the gradient beyond
++                // 0..240 so pitching cannot expose its edges.
++                if (gSohVRSkyPitch != 0.0f && gSohVRSkyShiftValid) {
++                    // rev10 (R16-A / FAL-A2): record WHICH compositor
++                    // frame's shift this pass consumed. Eye 1 (index 0)
++                    // runs a whole eye pass before eye 2, so live reads
++                    // give two different ids inside one host frame.
++                    // rev10 (R16-A F4): the LATCHED shift, and the id it
++                    // came from. skylatch 0 restores the live read, which
++                    // is the red control: with it the two eye passes
++                    // record two different ids inside one host frame,
++                    // because eye 1 runs a whole eye pass after eye 0 and
++                    // the compositor has rewritten the global in between.
++                    unsigned int sohSkyId = gSohVRSkyLatch ? sSohVRTag : gSohVRSkyShiftId;
++                    if (sSoh3DEye >= 1 && sSoh3DEye <= 2) {
++                        gSohVRSkyShiftTag[sSoh3DEye - 1] = sohSkyId;
++                        if (sSoh3DEye == 2 && gSohVRSkyShiftTag[0] != sohSkyId) {
++                            gSohVRSkyTagSkew = gSohVRSkyTagSkew + 1;
++                        }
++                    }
++                    // rev8 (R14 item 1). gSohVRSkyPitch survives only as a
++                    // gain: 1 = shipping, 0 = the R12 head-locked sky, and
++                    // larger values exaggerate the effect for a photograph.
++                    float sohS = (gSohVRSkyLatch ? sSohVRSnapSky[SOHVR_SKY_SHIFT0 + sSoh3DEye - 1]
++                                                 : gSohVRSkyShift[sSoh3DEye - 1]) *
++                                 gSohVRSkyPitch;
++                    if (sohS > 8.0f) {
++                        sohS = 8.0f;
++                    } else if (sohS < -8.0f) {
++                        sohS = -8.0f;
++                    }
++                    out[3][1] += sohS * out[3][3];
++                }
++                // SOH_IOS (overlay 0044 rev11, VR R16-B / clouds.md M2+M3):
++                // THE PER-EYE TERM THE SKY HAS NEVER HAD, and the pose gap.
++                //
++                // rev2 through rev10 all said the same thing here: the sky
++                // "carries zero disparity — which is exactly right for
++                // something at infinity". That sentence is true for a
++                // SYMMETRIC pair of frustums and false for this device's.
++                // The Vision Pro's eyes are parallel with OFF-AXIS frustums
++                // (60 degrees outward, 45 inward, mirror-imaged), so a
++                // direction at infinity MUST land 0.536 NDC apart in the two
++                // eyes — that separation IS the outward extension. Drawing
++                // it at equal NDC asks the eyes to fuse at a point BEHIND
++                // the viewer, which they cannot: they switch dominance
++                // instead, and which eye wins flips with gaze and content.
++                // That is read as motion, and R15 made it worse rather than
++                // better — it published eye 0's exact centre, so eye 0 became
++                // exact and eye 1 wrong by the full 0.536 instead of each
++                // being wrong by half of it.
++                //
++                // There is ONE sprite layout per game frame and two eyes to
++                // draw it in, so the remap belongs here, in the pass. Both
++                // eyes share the span on this device, so it is an offset;
++                // the scale is applied anyway because "they happen to be
++                // equal here" is not a thing to bake into a matrix.
++                //
++                // SPRITES ONLY. The gradient and the floor are full-width
++                // yaw-INDEPENDENT screen-space fills; moving them is what
++                // R11 did to the rear pane, and it evacuated the sky rather
++                // than re-registering it. sSoh3DSkySprites is 0046 rev2's
++                // 0x5E/0x5F pair, which brackets DrawSkyActors exactly.
++                // rev14 (R17-B): BYPASSED when the dome is on. The sprites
++                // are no longer in this projection at all, and an affine
++                // left applying to world-space vertices would be a
++                // correction of something that no longer needs correcting.
++                // gSohVRSkyAffine[0..1] therefore read 0 with the dome on,
++                // which is the assert that says the bypass is real.
++                if (sSoh3DSkySprites && gSohVRSkyTan && !gSohVRSkyDome && sSoh3DEye >= 1 &&
++                    sSoh3DEye <= 2 && sSohVRSnapSky[SOHVR_SKY_SPAN] > 1.0e-4f) {
++                    const int sohSkyE = sSoh3DEye - 1;
++                    const float sohSx = sSohVRSnapSky[SOHVR_SKY_SX0 + sohSkyE];
++                    float sohDx = sSohVRSnapSky[SOHVR_SKY_DX0 + sohSkyE];
++                    // clouds.md M3, the residual. 0051 builds the layout in
++                    // the GAME update from the most recently latched
++                    // snapshot; this pass draws it from a LATER one, and the
++                    // gap is a whole game frame of head motion (33-45 ms on
++                    // device, 3-9 degrees at a casual turn rate). The layout
++                    // recorded the yaw it was built with, so the correction
++                    // is a translation of (2/span)*dtheta in the reference
++                    // NDC, applied through the same per-eye scale. It is
++                    // first-order: exact at the frame centre, and second
++                    // order in dtheta at the rim, which is a great deal
++                    // smaller than the dtheta it removes.
++                    // The gap is MEASURED in both modes and CORRECTED in
++                    // one. Gating the measurement on the fix would have made
++                    // the red control read 0.00 because nothing looked,
++                    // which is trap D11 wearing the fix as a disguise.
++                    {
++                        const short sohDBam =
++                            (short)((int)sSohVRSnapSky[SOHVR_SKY_YAWBAM] - gSohVRSkyBuiltYawBam);
++                        const float sohLagDeg = (float)sohDBam * (180.0f / 32768.0f);
++                        gSohVRSkyLagDeg = sohLagDeg;
++                        if (fabsf(sohLagDeg) > gSohVRSkyLagMaxDeg) {
++                            gSohVRSkyLagMaxDeg = fabsf(sohLagDeg);
++                        }
++                        if (gSohVRSkyLatch) {
++                            sohDx += sohSx * (2.0f / sSohVRSnapSky[SOHVR_SKY_SPAN]) *
++                                     ((float)sohDBam * (float)(M_PI / 32768.0));
++                            gSohVRSkyLagCorr = gSohVRSkyLagCorr + 1;
++                        }
++                    }
++                    // ndc' = sx*ndc + dx. Ortho puts no x in the y/z rows,
++                    // but the whole x column is scaled anyway so the term is
++                    // the affine it claims to be and not an assumption about
++                    // what guOrtho happens to emit.
++                    out[0][0] *= sohSx;
++                    out[1][0] *= sohSx;
++                    out[2][0] *= sohSx;
++                    out[3][0] = out[3][0] * sohSx + sohDx * out[3][3];
++                    gSohVRSkyAffine[sohSkyE] = gSohVRSkyAffine[sohSkyE] + 1;
++                }
++                // SOH_IOS (overlay 0044 rev11, VR R16-B step 4 / clouds.md
++                // M5): HEAD ROLL, which nothing in the sky path has ever
++                // handled. Tilt your head and the world rolls while the
++                // gradient, the caps and every cloud stay bolted to the
++                // screen axes. MK64's sky sprites are real vertices through
++                // the matrix stack (gSPVertex + common_rectangle_display),
++                // NOT gDPTextureRectangle — the 0x5A comment below said
++                // texrect for six revisions and it was wrong; a texrect
++                // would bypass the projection and this whole block would
++                // silently do nothing.
++                //
++                // Composed in TANGENT space so the anisotropic NDC scales do
++                // not shear it: M = S*R(roll)*S^-1 with S = diag(2/spanX,
++                // 2/spanY), i.e. M = [[c, -k*s],[s/k, c]] with k = spanY/spanX.
++                // gSohVRSkyRoll SHIPS AT 0: 0058's caps extend the gradient
++                // VERTICALLY only, and a 45-degree roll pulls the screen
++                // corners to a radius of 200 ortho px against a quad 160 px
++                // wide, so the gradient's left and right edges come into
++                // view. Widening the caps laterally is R17's; the knob is
++                // here so the mechanism can be photographed now.
++                if (gSohVRSkyRoll != 0.0f && sSoh3DEye >= 1 && sSoh3DEye <= 2 &&
++                    sSohVRSnapSky[SOHVR_SKY_SPAN] > 1.0e-4f &&
++                    sSohVRSnapSky[SOHVR_SKY_SPANY] > 1.0e-4f) {
++                    // rev14 (R17-B): THE SIGN, MEASURED. R16-B shipped this
++                    // rotation at gain 0 and therefore never took it at a
++                    // non-zero roll -- nothing in this port could tilt a
++                    // head until `vr inject` grew a sixth argument. Taken
++                    // at last, it read BACKWARDS: the probe's up_dot
++                    // (the sprite's own up edge against the projected world
++                    // up, in NDC) went 0.9511 -> 0.8092 at 30 degrees of
++                    // roll and 0.8716 -> 0.5193 at 45, i.e. applying the
++                    // correction doubled the error instead of removing it.
++                    // Negated, and the assert is that up_dot goes to 1.
++                    const float sohRoll =
++                        -sSohVRSnapSky[SOHVR_SKY_ROLL0 + sSoh3DEye - 1] * gSohVRSkyRoll;
++                    const float sohC = cosf(sohRoll), sohSn = sinf(sohRoll);
++                    const float sohK =
++                        sSohVRSnapSky[SOHVR_SKY_SPANY] / sSohVRSnapSky[SOHVR_SKY_SPAN];
++                    // rev14 (R17-B): ABOUT THE FRUSTUM'S OWN CENTRE, not
++                    // about NDC (0,0). On an asymmetric frustum the eye's
++                    // forward lands at ndc x = -(tL+tR)/span -- +0.268 on
++                    // this device -- and rolling about the wrong point is
++                    // M2 wearing a rotation: the sky would orbit the screen
++                    // centre instead of turning about the gaze. The centre
++                    // is recovered from the same published tangents the
++                    // affine is built from.
++                    const float sohCx =
++                        -sSohVRSnapSky[SOHVR_SKY_TANSUM] / sSohVRSnapSky[SOHVR_SKY_SPAN];
++                    const float sohCy = 0.0f;
++                    for (int sohR = 0; sohR < 4; sohR++) {
++                        const float sohX = out[sohR][0] - sohCx * out[sohR][3];
++                        const float sohY = out[sohR][1] - sohCy * out[sohR][3];
++                        out[sohR][0] = sohC * sohX - (sohK * sohSn) * sohY + sohCx * out[sohR][3];
++                        out[sohR][1] = (sohSn / sohK) * sohX + sohC * sohY + sohCy * out[sohR][3];
++                    }
++                }
++                // rev14 (R17-B): the falsifier's RED arm. With the dome off
++                // the sprites are still here, and this is where they end
++                // up -- so the same probe reads the same quantity in both
++                // arms, which is what makes them a pair (trap D48).
++                // ...and ONLY when the dome is off. With it on, the first
++                // matrix inside the 0x5E span is still an ORTHO one --
++                // func_80057FC4 calls set_matrix_hud_screen() before it
++                // reaches DrawSkyActors -- and recording there would
++                // project a 30000-unit world point through the sky's
++                // guOrtho and latch the garbage before the perspective
++                // load ever arrives. (It did, on the first run: ndc x read
++                // -2.12 against a `vr worldproject` of the very same point
++                // at -0.0008.)
++                if (sSoh3DSkySprites && !gSohVRSkyDome && !sSohVRSkyProbeDone) {
++                    sSohVRSkyProbeDone = 1;
++                    Soh3DSkyProbeRecord(out, sSoh3DEye - 1);
++                }
++            }
++            return sohIsOrtho;
++        }
++        memcpy(out, sSohVREyeM[sSoh3DEye - 1], sizeof(sSoh3DP));
++        // rev13 (R17-A item 1): the probe FIRST, on the untouched game
++        // matrix, once per walk (armed at Soh3DSetEye(1)); then the seat
++        // correction. The probe runs in BOTH arms -- gating a measurement
++        // on the same flag as the fix makes the red control read zero,
++        // which is trap D48.
++        // rev14 (R17-B): the sky-sprite span is WORLD GEOMETRY now, and it
++        // is not a walk of the world -- the ghost probe stays off it. Trap
++        // D63's lesson in its general form: sample the load you mean.
++        if (sSoh3DEye == 1 && !sSoh3DSkySprites) {
++            Soh3DGhostSample(in);
++        }
++        Soh3DSeatLerp(out);
++        // rev15 (R18-A): the class probe's eye -- read off the matrix this
++        // eye will actually draw with, after every correction above.
++        if (gSohVRClassProbe && sSoh3DEye == Soh3DCpEyeIdx() && !sSoh3DSkySprites) {
++            Soh3DClassEye(out);
++        }
++        if (sSoh3DSkySprites && gSohVRSkyDome) {
++            // SOH_IOS (overlay 0044 rev14, VR R17-B): THE DOME'S DEPTH. It
++            // sits at gSohVRSkyDomeR game units, deliberately outside the
++            // far plane this eye renders with -- that radius is what makes
++            // one metre of head translation 0.034 degrees of parallax.
++            // Rather than move the far plane (which would spend the world's
++            // depth precision on the sky), pin the span's clip z to
++            // 0.9995*w by making the z COLUMN proportional to the w column:
++            // the ratio survives the perspective divide, so every sky
++            // vertex lands just inside the far end of the depth range
++            // whatever its distance and can never be far-clipped. It is the
++            // same trick the ortho sky has used since rev2, written as a
++            // proportion instead of a constant. Depth WRITES are off for
++            // the whole sky pass and the world draws after it, so a
++            // mountain still covers a cloud and the sky never covers a
++            // mountain.
++            for (int sohR = 0; sohR < 4; sohR++) {
++                out[sohR][2] = 0.9995f * out[sohR][3];
++            }
++            if (!sSohVRSkyProbeDone) {
++                sSohVRSkyProbeDone = 1;
++                Soh3DSkyProbeRecord(out, sSoh3DEye - 1);
++            }
++        }
++        return sohIsOrtho;
++    }
++    if (sohIsOrtho) {
 +        // Orthographic. MK64's SKY is ortho (gradient quads + yaw-mapped
 +        // cloud sprites under guOrtho — structurally unlike OoT's
 +        // perspective skybox): zero disparity puts it ON the panel,
@@ -315,11 +2853,11 @@ so iPhone links resolve (mode stays 0 there); macOS compiles none of it.
 +                out[3][0] += (sohE * gSoh3DCamP00 / sSoh3DConv) * out[3][3];
 +            }
 +        }
-+        return;
++        return sohIsOrtho;
 +    }
 +    const float e = (sSoh3DEye == 2 ? 1.0f : -1.0f) * 0.5f * sSoh3DSep * sSoh3DPauseMix;
 +    if (e == 0.0f) {
-+        return;
++        return sohIsOrtho;
 +    }
 +    // Perspective sky draws between the sentinels (belt-and-braces; MK64's
 +    // sky is ortho, but any course drawing a perspective backdrop gets the
@@ -339,32 +2877,44 @@ so iPhone links resolve (mode stays 0 there); macOS compiles none of it.
 +    out[1][0] += s * gSoh3DCamFwd[1];
 +    out[2][0] += s * gSoh3DCamFwd[2];
 +    out[3][0] += s * -sohEyeF;
++    return sohIsOrtho;
 +}
 +#endif
 +
  void Interpreter::MatrixMul(float res[4][4], const float a[4][4], const float b[4][4]) {
      float tmp[4][4];
      for (int i = 0; i < 4; i++) {
-@@ -1631,6 +1710,12 @@
+@@ -1631,6 +3461,23 @@
          }
          mRsp->lights_changed = 1;
      }
 +#ifdef __IOS__
 +    if (sSoh3DEye != 0) {
-+        Soh3DStereoP(sSoh3DP, mRsp->P_matrix);
++        // SOH_IOS (overlay 0044, VR): the ortho/perspective verdict of this
++        // projection load is the ONLY discriminator MK64 gives us for the
++        // 2D stretch of the display list (R0 finding 2) — redirect the draw
++        // target on the transition, before the new matrix takes effect.
++        Soh3DVRTarget((Soh3DStereoP(sSoh3DP, mRsp->P_matrix) && !sSoh3DSkybox) || Soh3DOwnShadowSink() || Soh3DOwnKartSink());
++        // rev15 (R18-A): a class bracket's first MODELVIEW load is that
++        // object's drawn position (row 3 = its origin in the world), and
++        // whether FrameInterpolation had a replacement for it this walk.
++        if (sSoh3DEye == Soh3DCpEyeIdx() && sSohCpPendCls >= 0 && !(parameters & mtx_projection)) {
++            Soh3DClassSample(mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1],
++                             (mCurMtxReplacements->find((Mtx*)addr) != mCurMtxReplacements->end()) ? 1 : 0);
++        }
 +        MatrixMul(mRsp->MP_matrix, mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1], sSoh3DP);
 +    } else
 +#endif
      MatrixMul(mRsp->MP_matrix, mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1], mRsp->P_matrix);
  }
  
-@@ -1639,6 +1724,13 @@
+@@ -1639,6 +3486,13 @@
          if (mRsp->modelview_matrix_stack_size > 0) {
              --mRsp->modelview_matrix_stack_size;
              if (mRsp->modelview_matrix_stack_size > 0) {
 +#ifdef __IOS__
 +                if (sSoh3DEye != 0) {
-+                    Soh3DStereoP(sSoh3DP, mRsp->P_matrix);
++                    Soh3DVRTarget((Soh3DStereoP(sSoh3DP, mRsp->P_matrix) && !sSoh3DSkybox) || Soh3DOwnShadowSink() || Soh3DOwnKartSink());
 +                    MatrixMul(mRsp->MP_matrix, mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1],
 +                              sSoh3DP);
 +                } else
@@ -372,7 +2922,7 @@ so iPhone links resolve (mode stays 0 there); macOS compiles none of it.
                  MatrixMul(mRsp->MP_matrix, mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1],
                            mRsp->P_matrix);
              }
-@@ -3410,6 +3502,14 @@
+@@ -3410,6 +5264,115 @@
      const char* filename = (const char*)(cmd)->words.w1;
      uint32_t p = C0(16, 8);
      uint32_t l = C0(0, 16);
@@ -380,14 +2930,146 @@ so iPhone links resolve (mode stays 0 there); macOS compiles none of it.
 +    // SOH_IOS (overlay 0044): 0046's sky stereo sentinels.
 +    if (p == 0x5A) {
 +        sSoh3DSkybox = 1;
++        // SOH_IOS (overlay 0044 rev8, VR R14 item 3): the park-and-wipe is
++        // for the EYES ONLY. gSohVRSkyMode is a per-compositor-frame value
++        // and the rear pane inherits it, so any frame where the shell had
++        // the sky off -- a wantWorld flap, a diag row, the R1 fallback --
++        // wiped the sky out of the PANE as well, which is the user's "sky
++        // sometimes missing entirely" in the rear view. The pane's sky is
++        // yaw-INDEPENDENT gradient and floor (rev7 drops only the sprites),
++        // so it is correct for the pane in every sky mode there is: it has
++        // no business being conditional at all.
++        if (gSohVRWorldActive && sSoh3DEye != 0 && sSoh3DEye != 3 && gSohVRSkyMode == 0) {
++            // VR: park the whole sky stretch in the HUD
++            // framebuffer and wipe it at the END sentinel — nothing of the
++            // sky survives into either composited target (spec D6).
++            // rev11 (R16-B) CORRECTS THIS COMMENT: it used to say MK64's
++            // sky sprites are screen-space TEXRECTS carrying no matrix of
++            // their own, so the ortho projection could not reach them. That
++            // is false — SkyCloud::Draw emits gSPVertex plus
++            // common_rectangle_display, i.e. real vertices through the
++            // matrix stack — and the belief is why the sprites went six
++            // revisions without the per-eye term rev11 adds above. The
++            // park-and-wipe here is still right for sky mode 0; it is the
++            // REASON given for it that was wrong.
++            mInstance.lock()->Soh3DVRTarget(true);
++        }
 +    } else if (p == 0x5B) {
 +        sSoh3DSkybox = 0;
++        if (gSohVRWorldActive && sSoh3DEye != 0 && sSoh3DEye != 3 && gSohVRSkyMode == 0) {
++            mInstance.lock()->Soh3DVRClearHud();
++            mInstance.lock()->Soh3DVRTarget(false);
++        }
++    } else if (p == 0x5E) {
++        // SOH_IOS (overlay 0046 rev2, VR R13 item 4): DrawSkyActors begins
++        // — the yaw-keyed cloud/star sprites, as distinct from the
++        // gradient quads and the floor around them.
++        sSoh3DSkySprites = 1;
++    } else if (p == 0x5F) {
++        sSoh3DSkySprites = 0;
++    } else if (p == 0x60) {
++        // SOH_IOS (overlay 0046 rev3, VR R15 item 5): the ground fill.
++        sSoh3DSkyFloor = 1;
++    } else if (p == 0x61) {
++        sSoh3DSkyFloor = 0;
++    } else if (p == 0x5C) {
++        // SOH_IOS (overlay 0044 rev5, VR R11 item 3a): the local
++        // kart's shadow. The eyes keep it — it is what grounds the
++        // kart under you — but the rear-view pane looks straight at
++        // it with the kart itself hidden, so the pane dumps it in
++        // the sink. Same recipe 0046 uses for the sky: retarget,
++        // never edit the display list.
++        sSoh3DOwnShadow = 1;
++        if (Soh3DOwnShadowSink()) {
++            mInstance.lock()->Soh3DVRTarget(true);
++        }
++    } else if (p == 0x5D) {
++        if (Soh3DOwnShadowSink()) {
++            mInstance.lock()->Soh3DVRTarget(false);
++        }
++        sSoh3DOwnShadow = 0;
++    } else if (p == 0x62) {
++        // SOH_IOS (overlay 0044 rev12, VR R16-C step 4): overlay 0059's
++        // EYES-ONLY span -- the course section list MK64 built for the
++        // FORWARD camera's yaw quadrant. The two spans are EXCLUSIVE, not
++        // additive (trap A4: the four direction variants of a section share
++        // the section's own road surface, so drawing both in one walk is a
++        // coplanar double submission).
++        sSoh3DDlSkip = (gSohVRWorldActive && sSoh3DEye == 3) ? 1 : 0;
++    } else if (p == 0x63) {
++        sSoh3DDlSkip = 0;
++    } else if (p == 0x64) {
++        // ... and the REAR-ONLY span, the same section's OPPOSITE-direction
++        // variant. 0059 emits this pair only where the rear camera's bucket
++        // actually differs, so the counter here is already 'the override
++        // changed an answer' (trap D32's corollary).
++        sSoh3DDlSkip = (gSohVRWorldActive && sSoh3DEye != 3) ? 1 : 0;
++        if (gSohVRWorldActive && sSoh3DEye == 3) {
++            gSohVRRearDlSwaps = gSohVRRearDlSwaps + 1;
++        }
++    } else if (p == 0x65) {
++        sSoh3DDlSkip = 0;
++    } else if (p == 0x66) {
++        // SOH_IOS (overlay 0044 rev12, VR R16-C step 5): the LOCAL kart's
++        // quad, emitted by 0054 rev4 for the PANE. The eyes divert it into
++        // the mirror sink (Soh3DVRHudFbFor picks the sink, not the HUD --
++        // the HUD is composited and parking a kart in it would draw the
++        // kart over the HUD instead of hiding it).
++        sSoh3DOwnKartSpan = 1;
++        if (Soh3DOwnKartSink()) {
++            mInstance.lock()->Soh3DVRTarget(true);
++        }
++    } else if (p == 0x67) {
++        if (Soh3DOwnKartSink()) {
++            mInstance.lock()->Soh3DVRTarget(false);
++        }
++        sSoh3DOwnKartSpan = 0;
++    } else if (p == 0x70) {
++        // SOH_IOS (overlay 0044 rev15, VR R18-A): a class bracket opens.
++        // l = (class << 12) | key; emitted only while gSohVRClassProbe is set.
++        if (gSohVRClassProbe && sSoh3DEye == Soh3DCpEyeIdx()) {
++            sSohCpPendCls = (int)((l >> 12) & 0xFu);
++            sSohCpPendKey = (int)(l & 0xFFFu);
++        }
++    } else if (p == 0x71) {
++        sSohCpPendCls = -1;
 +    }
 +#endif
      if (p == 7) {
          g_exec_stack.openDisp(filename, l);
      } else if (p == 8) {
-@@ -5171,6 +5271,20 @@
+@@ -3780,6 +5743,13 @@
+     Interpreter* gfx = mInstance.lock().get();
+     F3DGfx* cmd = *cmd0;
+     F3DGfx* subGFX = (F3DGfx*)gfx->SegAddr(cmd->words.w1);
++#ifdef __IOS__
++    // SOH_IOS (overlay 0044 rev12, VR R16-C step 4): a span bracketed for
++    // a walk this is not. See the 0x62-0x65 sentinels.
++    if (sSoh3DDlSkip && C0(16, 1) == 0) {
++        return false;
++    }
++#endif
+     if (C0(16, 1) == 0) {
+         // Push return address
+         if (subGFX != nullptr) {
+@@ -5154,6 +7124,16 @@
+     mPrevNativeDimensions = mNativeDimensions;
+     if (!ViewportMatchesRendererResolution() || mMsaaLevel > 1) {
+         mRendersToFb = true;
++#ifdef __IOS__
++        // SOH_IOS (overlay 0044 rev8, VR R14): skip the stock mGameFb
++        // resize during a VR eye or mirror pass -- see the E8c note in
++        // scripts/gen-patch-0044.py. mGameFb is the pass's own attachment
++        // and mCurDimensions still holds the PREVIOUS pass's extent, so this
++        // line reallocated the mirror's texture to the eye extent ~210 times
++        // a second, and the VR block below shrank it straight back.
++        if (sSoh3DEye != 0) {
++        } else
++#endif
+         if (!ViewportMatchesRendererResolution()) {
+             mRapi->UpdateFramebufferParameters(mGameFb, mCurDimensions.width, mCurDimensions.height, mMsaaLevel, true,
+                                                true, true, true);
+@@ -5171,6 +7151,101 @@
          mRendersToFb = false;
      }
  
@@ -398,17 +3080,98 @@ so iPhone links resolve (mode stays 0 there); macOS compiles none of it.
 +    if (sSoh3DEye != 0) {
 +        uint32_t sohEw = gSoh3DEyeW > 0 ? (uint32_t)gSoh3DEyeW : 3840u;
 +        uint32_t sohEh = gSoh3DEyeH > 0 ? (uint32_t)gSoh3DEyeH : 2160u;
++        // SOH_IOS (overlay 0044 rev5, VR R11 item 2): THE RENDER-QUALITY
++        // CRASH. Moving the quality slider re-sizes every eye, HUD and
++        // mirror attachment, and UpdateFramebufferParameters RELEASES the
++        // incumbent texture the moment the replacement lands. The
++        // compositor thread holds those pointers raw (gSoh3DEyeTexture and
++        // friends) and dereferences them to bind and to read .width — so a
++        // release that drops the last reference between its load and its
++        // use is an instant crash, which is exactly what the user got taking
++        // Diorama from 55% to 80%. Quiesce FIRST: unpublish, wait for both
++        // producer and consumer to drain, drop the retire ring. Draining
++        // the retire ring is also what keeps the peak at ONE set of
++        // attachments instead of two, which matters at 100% on a headset.
++        // SOH_IOS (overlay 0044 rev7, VR R13 item 1b): THE MIRROR HAD NO
++        // QUIESCE. rev5's trigger read sohEw/sohEh BEFORE the sSoh3DEye == 3
++        // override below reassigns them to the mirror extent, so a change in
++        // gSohVRMirrorW/H alone -- `vr set mirror_res`, or the eye extent
++        // moving and the mirror rounding differently through & ~1 and the
++        // 128 px floors -- resized the mirror framebuffer with NO quiesce at
++        // all, releasing the incumbent mirror texture while gSoh3DMirrorTexture
++        // still names it and the compositor holds it as a raw void*. That is
++        // the dangling-pointer crash the quality slider got fixed for in R11
++        // and the mirror never did. The trigger now reads the extent the pass
++        // will ACTUALLY resize to, and the mirror keeps its own last-seen
++        // pair (the two alternate every frame; one pair would quiesce twice a
++        // frame, forever).
++        {
++            uint32_t sohQw = sohEw, sohQh = sohEh;
++            if (sSoh3DEye == 3) {
++                sohQw = gSohVRMirrorW > 0 ? (uint32_t)gSohVRMirrorW : (sohEw / 2u);
++                sohQh = gSohVRMirrorH > 0 ? (uint32_t)gSohVRMirrorH : (sohEh / 2u);
++            }
++            static uint32_t sSoh3DLastEyeW = 0, sSoh3DLastEyeH = 0;
++            static uint32_t sSoh3DLastMirW = 0, sSoh3DLastMirH = 0;
++            uint32_t* sohLw = (sSoh3DEye == 3) ? &sSoh3DLastMirW : &sSoh3DLastEyeW;
++            uint32_t* sohLh = (sSoh3DEye == 3) ? &sSoh3DLastMirH : &sSoh3DLastEyeH;
++            if (sohQw != *sohLw || sohQh != *sohLh) {
++                *sohLw = sohQw;
++                *sohLh = sohQh;
++                mRapi->Soh3DQuiesceEyeSlots();
++            }
++        }
++        // SOH_IOS (overlay 0044 rev3, VR R3): the rear-view pane renders at
++        // its OWN extent (its own sizing domain, trap D7) and NOTHING else
++        // in the frame may see that size — Soh3DEndEyePass puts the eye
++        // dims back the moment the pass ends, so StartFrame's dims-changed
++        // sweep never re-resizes every game framebuffer twice per frame.
++        if (sSoh3DEye == 3) {
++            mSoh3DEyeDimsW = sohEw;
++            mSoh3DEyeDimsH = sohEh;
++            sohEw = gSohVRMirrorW > 0 ? (uint32_t)gSohVRMirrorW : (sohEw / 2u);
++            sohEh = gSohVRMirrorH > 0 ? (uint32_t)gSohVRMirrorH : (sohEh / 2u);
++            mRendersToFb = true;
++            mCurDimensions.width = sohEw;
++            mCurDimensions.height = sohEh;
++            mCurDimensions.aspect_ratio = (float)sohEw / (float)sohEh;
++            mRapi->UpdateFramebufferParameters(mGameFb, sohEw, sohEh, 0, true, true, true, true);
++            if (mSoh3DMirrorSinkFb < 0) {
++                mSoh3DMirrorSinkFb = mRapi->CreateFramebuffer();
++                mRapi->Soh3DMarkTransparentClear(mSoh3DMirrorSinkFb);
++            }
++            mRapi->UpdateFramebufferParameters(mSoh3DMirrorSinkFb, sohEw, sohEh, 0, true, true, true, true);
++            mFbActive = false;
++            return;
++        }
 +        mRendersToFb = true;
 +        mCurDimensions.width = sohEw;
 +        mCurDimensions.height = sohEh;
 +        mCurDimensions.aspect_ratio = (float)sohEw / (float)sohEh;
-+        mRapi->UpdateFramebufferParameters(mGameFb, sohEw, sohEh, 1, true, true, true, true);
++        // SOH_IOS (overlay 0044 rev2, VR): msaa_level 0 selects the VR
++        // ALPHA-COVERAGE pipeline variant (overlay 0035 rev2 owns slot 0
++        // of the variant table). The eye framebuffers are single-sampled
++        // either way, and every msaa_level > 1 branch treats 0 as 1, so
++        // the only difference is that DESTINATION ALPHA now accumulates
++        // real coverage — which is what the compositor blends on.
++        mRapi->UpdateFramebufferParameters(mGameFb, sohEw, sohEh, 0, true, true, true, true);
++        // SOH_IOS (overlay 0044, VR): the HUD framebuffer shares the eye
++        // extent so texrects — which are built in SCREEN space against
++        // mCurDimensions — land at exactly the coordinates the game meant.
++        if (mSoh3DHudFb[0] < 0) {
++            for (int sohB = 0; sohB < 3; sohB++) {
++                mSoh3DHudFb[sohB] = mRapi->CreateFramebuffer();
++                mRapi->Soh3DMarkTransparentClear(mSoh3DHudFb[sohB]);
++            }
++        }
++        mRapi->UpdateFramebufferParameters(mSoh3DHudFb[mSoh3DPing], sohEw, sohEh, 0, true, true, true,
++                                          true);
 +    }
 +#endif
      mFbActive = false;
  }
  
-@@ -5224,6 +5338,18 @@
+@@ -5224,6 +7299,25 @@
  
      mCurMtxReplacements = &mtx_replacements;
  
@@ -416,6 +3179,13 @@ so iPhone links resolve (mode stays 0 there); macOS compiles none of it.
 +    // SOH_IOS (overlay 0044): defensive per-Run clear of the sky flag,
 +    // and the engine's live 2D window dims for the geometry telemetry.
 +    sSoh3DSkybox = 0;
++    sSoh3DSkySprites = 0;
++    sSohVRSkyProbeDone = 0;
++    sSoh3DSkyFloor = 0;
++    sSoh3DOwnShadow = 0;
++    sSoh3DOwnKartSpan = 0;
++    sSohCpPendCls = -1; // rev15
++    sSoh3DDlSkip = 0;
 +    gSoh3DDbg2DW = (int)mGfxCurrentWindowDimensions.width;
 +    gSoh3DDbg2DH = (int)mGfxCurrentWindowDimensions.height;
 +    gSoh3DDbgCurW = (int)mCurDimensions.width;
@@ -427,7 +3197,26 @@ so iPhone links resolve (mode stays 0 there); macOS compiles none of it.
      mRapi->UpdateFramebufferParameters(0, mGfxCurrentWindowDimensions.width, mGfxCurrentWindowDimensions.height, 1,
                                         false, true, true, !mRendersToFb);
      mRapi->StartFrame();
-@@ -5259,6 +5385,14 @@
+@@ -5233,6 +7327,18 @@
+     mRenderingState.viewport = {};
+     mRenderingState.scissor = {};
+ 
++#ifdef __IOS__
++    // SOH_IOS (overlay 0044, VR): spec D6 — the HUD framebuffer is
++    // wiped to alpha 0 at the head of every eye pass; the draw target
++    // starts on the world and the projection injector redirects it.
++    if (gSohVRWorldActive && sSoh3DEye != 0 &&
++        (sSoh3DEye == 3 ? mSoh3DMirrorSinkFb : mSoh3DHudFb[mSoh3DPing]) >= 0) {
++        Soh3DVRClearHud();
++        Soh3DVRTarget(false);
++    } else {
++        mSoh3DHudActive = false;
++    }
++#endif
+     auto dbg = Ship::Context::GetInstance()->GetGfxDebugger();
+     g_exec_stack.start((F3DGfx*)commands);
+     while (!g_exec_stack.cmd_stack.empty()) {
+@@ -5259,6 +7365,14 @@
      mGfxFrameBuffer = 0;
      currentDir = std::stack<std::string>();
  
@@ -442,11 +3231,10 @@ so iPhone links resolve (mode stays 0 there); macOS compiles none of it.
      if (mRendersToFb) {
          mRapi->StartDrawToFramebuffer(0, 1);
          mRapi->ClearFramebuffer(true, true);
-@@ -5286,8 +5420,100 @@
-     mWapi->SwapBuffersBegin();
+@@ -5287,6 +7401,349 @@
      mRapi->FinishRender();
      mWapi->SwapBuffersEnd();
-+}
+ }
 +
 +#ifdef __IOS__
 +// SOH_IOS (overlay 0044): eye-pass control. SetEye(1|2) swaps mGameFb to the
@@ -463,17 +3251,141 @@ so iPhone links resolve (mode stays 0 there); macOS compiles none of it.
 +            mCurDimensions.aspect_ratio = mSoh3DSavedAspect;
 +        }
 +        sSoh3DEye = 0;
++        mSoh3DHudActive = false;
++        return;
++    }
++    // SOH_IOS (overlay 0044 rev3, VR R3 / spec D12): the rear-view
++    // pane's pass. It shares the frame's ping-pong slot (set by eye 1) and
++    // takes NONE of the stereo machinery below — no pose acquire, no
++    // convergence, no eye offset. Its matrix comes from the game's own
++    // projection inside Soh3DStereoP.
++    if (eye == 3) {
++        if (mSoh3DMirrorFb[0] < 0) {
++            for (int sohB = 0; sohB < 3; sohB++) {
++                mSoh3DMirrorFb[sohB] = mRapi->CreateFramebuffer();
++                mRapi->Soh3DMarkTransparentClear(mSoh3DMirrorFb[sohB]);
++            }
++        }
++        if (sSoh3DEye == 0) {
++            mSoh3DSavedGameFb = mGameFb;
++            mSoh3DSavedW = mCurDimensions.width;
++            mSoh3DSavedH = mCurDimensions.height;
++            mSoh3DSavedAspect = mCurDimensions.aspect_ratio;
++        }
++        // SOH_IOS (overlay 0044 rev5, VR R11 item 1): the rear-view slot's
++        // gate, moved here from Soh3DSetEye(1). Same rule as the eyes — the
++        // gate belongs immediately before the write. It stays conditional on
++        // the pane being drawn: a slot nobody is about to overwrite does not
++        // need a handoff, and gating it unconditionally waited out the whole
++        // 40 ms ceiling every frame (603 starves, 2.6 fps, measured in R9).
++        if (gSohVRWorldActive && gSohVRSlotGate && gSohVRMirrorActive &&
++            mSoh3DMirrorFb[mSoh3DPing] >= 0) {
++            mRapi->Soh3DWaitEyeSlot(mSoh3DMirrorFb[mSoh3DPing], 3);
++        }
++        mGameFb = mSoh3DMirrorFb[mSoh3DPing];
++        sSoh3DEye = 3;
 +        return;
 +    }
 +    if (mSoh3DEyeFb[0][0] < 0) {
 +        for (int sohE = 0; sohE < 2; sohE++) {
-+            for (int sohB = 0; sohB < 2; sohB++) {
++            for (int sohB = 0; sohB < 3; sohB++) {
 +                mSoh3DEyeFb[sohE][sohB] = mRapi->CreateFramebuffer();
++                mRapi->Soh3DMarkTransparentClear(mSoh3DEyeFb[sohE][sohB]);
 +            }
 +        }
 +    }
 +    if (eye == 1) {
-+        mSoh3DPing ^= 1; // ping-pong once per host frame
++        // SOH_IOS (overlay 0044 rev4, VR R9 item 1): THE RAINBOW FIX. Do not
++        // re-enter a ping-pong slot the compositor may still be reading. The
++        // flip is the only place that decides which textures this host frame
++        // will overwrite, so it is the only place the gate can be taken. See
++        // gfx_metal.cpp's Soh3DWaitEyeSlot for the mechanism, and for why it
++        // costs nothing in the steady state.
++        int sohNext = (mSoh3DPing + 1) % 3;
++        // gSohVRSlotGate is the A/B control and the safety valve: 0 restores
++        // the 1.0.0.5 behaviour exactly, so the gate's COST can be measured
++        // against itself in one build (the suite does) and a device that ever
++        // wedges behind it has one bridge command out.
++        if (gSohVRWorldActive && gSohVRSlotGate) {
++            // SOH_IOS (overlay 0044 rev6, VR R12 item 1): CHOOSE A FREE
++            // SLOT, do not merely wait for the next one.
++            //
++            // rev5 always took slot (ping+1) and waited up to 40 ms for it.
++            // Every wait in this port is bounded (trap C1) and this one ends
++            // by WRITING ANYWAY -- which means that whenever the consumer
++            // holds a slot for longer than the ceiling, the producer stomps
++            // it. And the consumer holds eye 0's texture LONGEST: the
++            // compositor claims eye 0 first and releases every claim together
++            // when its command buffer completes, so eye 0's hold spans the
++            // whole of eye 1's latch, the encode, the queue wait and the
++            // execute. Measured in the simulator with the read window widened
++            // to 150 ms: the LEFT eye missed on 100% of its frame checks and
++            // the right on 13%. That is the user's artefact, as an integer.
++            //
++            // Three slots exist precisely so the producer never has to wait.
++            // Probe each candidate WITHOUT blocking and take the first whose
++            // eye pair AND HUD are all free; only if none is (which needs the
++            // consumer to be holding two generations at once) fall back to
++            // rev5's rotate-and-wait.
++            // rev6: Soh3DPickSlot() already probed, in the host frame's own
++            // gate above -- a frame that gets this far HAS a free slot, and
++            // one that did not was skipped entirely. Re-probing here would
++            // ask the question twice and answer it differently.
++            if (mSoh3DPickedSlot >= 0) {
++                sohNext = mSoh3DPickedSlot;
++            }
++            // The reservation is taken by the gate itself; run it on the
++            // chosen slot so the consumer is told which one the engine owns.
++            // rev5's note on placement still stands: EYE 0 ONLY here, because
++            // a gate belongs immediately before the write it guards, and
++            // eye 1's lives at Soh3DSetEye(2).
++            if (mSoh3DEyeFb[0][sohNext] >= 0) {
++                mRapi->Soh3DWaitEyeSlot(mSoh3DEyeFb[0][sohNext], 0);
++            }
++            // The HUD framebuffer is written during BOTH eye passes (it is
++            // wiped at the head of each), so its gate belongs with the
++            // first one.
++            if (mSoh3DHudFb[sohNext] >= 0) {
++                mRapi->Soh3DWaitEyeSlot(mSoh3DHudFb[sohNext], 2);
++            }
++        }
++        mSoh3DPing = sohNext; // rotate once per host frame (three slots)
++        // SOH_IOS (overlay 0044, VR / spec D2+D7): ONE pose per HOST
++        // frame. Both eye passes render against the pair the shell last
++        // published; its frame id rides back out with the eye textures so
++        // the loop can submit the anchor the frame was rendered against
++        // (trap B1: never render one pose and present another).
++        if (gSohVRWorldActive) {
++            float sohVrM[32];
++            float sohVrSky[SOHVR_SKY_SLOTS];
++            // rev10 (R16-A F4): ONE acquire, for the matrices AND the sky
++            // shift. The pair is what makes the two eye passes agree: they
++            // both read this copy, and it is the copy the matrices came
++            // from. (This is the graphics frame, ~114 Hz, not the game
++            // frame at ~28 -- the composed pose must keep the compositor's
++            // rate, so the acquire stays exactly where it was.)
++            Soh3DGhostCommit(); // rev13: commit the walk that just ended
++            Soh3DClassCommit(); // rev15 (R18-A): and the class probe's
++            unsigned int sohVrTag = SohIosVR_AcquireFrame(sohVrM, sohVrSky);
++            if (sohVrTag != 0u) {
++                memcpy(sSohVREyeM, sohVrM, sizeof(sSohVREyeM));
++                memcpy(sSohVRSnapSky, sohVrSky, sizeof(sSohVRSnapSky));
++                Soh3DBaseProbe(); // rev15 (R18-A): every arm, once per walk
++                sSohVRTag = sohVrTag;
++                sSohVRHaveEyes = 1;
++            }
++        } else {
++            sSohVRHaveEyes = 0;
++            sSohVRTag = 0u;
++        }
++    }
++    // SOH_IOS (overlay 0044 rev5, VR R11 item 1): eye 1's gate, taken
++    // immediately before eye 1's own pass rather than a whole eye pass
++    // early. mSoh3DPing already rotated at eye 1, so this is the same slot
++    // index — only the MOMENT the question is asked has changed, which is
++    // the entire point (see Soh3DWaitEyeSlot's rev5 note).
++    if (eye == 2 && gSohVRWorldActive && gSohVRSlotGate && mSoh3DEyeFb[1][mSoh3DPing] >= 0) {
++        mRapi->Soh3DWaitEyeSlot(mSoh3DEyeFb[1][mSoh3DPing], 1);
 +    }
 +    if (sSoh3DEye == 0) {
 +        mSoh3DSavedGameFb = mGameFb;
@@ -517,10 +3429,114 @@ so iPhone links resolve (mode stays 0 there); macOS compiles none of it.
 +    gSoh3DDbgSep = sSoh3DSep;
 +    mGameFb = mSoh3DEyeFb[eye - 1][mSoh3DPing];
 +    sSoh3DEye = eye;
- }
- 
++}
++
++// SOH_IOS (overlay 0044 rev6, VR R12 item 1): THE PRODUCER'S BACKPRESSURE.
++//
++// Every wait in this port is bounded (trap C1) and this one ended by
++// WRITING ANYWAY, so whenever the consumer held a slot for longer than the
++// 40 ms ceiling the producer stomped it -- and the consumer holds EYE 0
++// longest, because the compositor claims eye 0 first and releases every
++// claim together when its command buffer completes. Measured: with the
++// read window widened to 150 ms the LEFT eye missed 100% of its frame
++// checks and the right 13%.
++//
++// The answer is not a longer wait, it is not writing at all. This probes
++// every candidate slot without blocking; if none is free the caller skips
++// the whole host frame's eye work and the compositor keeps showing the
++// publication it already holds -- a repeated frame instead of a torn one,
++// which is what a consumer at 90-100 Hz should see from a 30 Hz producer.
++// D16 called a gate on too few buffers "quantising the producer onto the
++// consumer's period"; with three slots and honest backpressure that is the
++// CORRECT behaviour rather than a bug.
++int Interpreter::Soh3DPickSlot() {
++    mSoh3DPickedSlot = -1;
++    if (mSoh3DEyeFb[0][0] < 0) {
++        return 0; // nothing allocated yet: the first frame creates them
++    }
++    for (int sohK = 1; sohK <= 3; sohK++) {
++        int sohCand = (mSoh3DPing + sohK) % 3;
++        if (mSoh3DEyeFb[0][sohCand] < 0 || mSoh3DEyeFb[1][sohCand] < 0) {
++            continue;
++        }
++        if (mRapi->Soh3DWaitEyeSlot(mSoh3DEyeFb[0][sohCand], 0, 0) &&
++            mRapi->Soh3DWaitEyeSlot(mSoh3DEyeFb[1][sohCand], 1, 0) &&
++            (mSoh3DHudFb[sohCand] < 0 ||
++             mRapi->Soh3DWaitEyeSlot(mSoh3DHudFb[sohCand], 2, 0))) {
++            mSoh3DPickedSlot = sohCand;
++            gSohIosGfxSlotPicks = gSohIosGfxSlotPicks + 1;
++            return sohCand;
++        }
++    }
++    gSohIosGfxSlotPickFails = gSohIosGfxSlotPickFails + 1;
++    return -1;
++}
++
 +int Interpreter::Soh3DGetEyeFb(int eye) {
 +    return (eye >= 1 && eye <= 2) ? mSoh3DEyeFb[eye - 1][mSoh3DPing] : -1;
++}
++
++int Interpreter::Soh3DGetHudFb() {
++    return mSoh3DHudFb[mSoh3DPing];
++}
++
++// SOH_IOS (overlay 0044, VR / spec D6): switch the DRAW TARGET between
++// the eye framebuffer and the HUD framebuffer mid-display-list. Upstream
++// already owns the recipe for a mid-list target switch
++// (gfx_reset_fb_handler_custom): flush the pending batch, re-point the
++// backend, then force viewport and scissor to reapply against the new
++// target — which is also trap B4's rule for passes of differing size.
++// SOH_IOS (overlay 0044 rev3, VR R3): which framebuffer the 2D stretch of
++// the display list goes to. The eye passes use the HUD framebuffer, which
++// the shell composites as a plane; the rear-view pane's pass uses a SINK
++// nobody ever reads — by the time it runs the HUD framebuffer has already
++// been published, and it is sized to the eye extent, so mirror-pass
++// texrects (built in SCREEN space against mCurDimensions) would land in it
++// at the wrong scale.
++int Interpreter::Soh3DGetMirrorFb() {
++    return mSoh3DMirrorFb[mSoh3DPing];
++}
++
++static int Soh3DVRHudFbFor(int sohEye, int sohHudFb, int sohSinkFb) {
++    // SOH_IOS (overlay 0044 rev12, VR R16-C step 5): the own-kart span is
++    // the first diversion that runs in the EYE walks rather than the pane's,
++    // and the eyes' usual sink is the HUD framebuffer -- which is
++    // COMPOSITED. Parking a kart there would draw it over the HUD instead
++    // of hiding it, so that span goes to the mirror sink, which nobody
++    // reads. (The sink only exists while the pane is up, which is also the
++    // only condition under which 0054 rev4 emits the span.)
++    return (sohEye == 3 || Soh3DOwnKartSink()) ? sohSinkFb : sohHudFb;
++}
++
++void Interpreter::Soh3DVRTarget(bool hud) {
++    const int sohHudFb = Soh3DVRHudFbFor(sSoh3DEye, mSoh3DHudFb[mSoh3DPing], mSoh3DMirrorSinkFb);
++    if (!gSohVRWorldActive || sSoh3DEye == 0 || sohHudFb < 0) {
++        return;
++    }
++    if (hud == mSoh3DHudActive) {
++        return;
++    }
++    Flush();
++    mSoh3DHudActive = hud;
++    mRapi->StartDrawToFramebuffer(hud ? sohHudFb : mGameFb,
++                                  (float)mCurDimensions.height / mNativeDimensions.height);
++    mRdp->viewport_or_scissor_changed = true;
++    mRenderingState.viewport = {};
++    mRenderingState.scissor = {};
++}
++
++void Interpreter::Soh3DVRClearHud() {
++    const int sohHudFb = Soh3DVRHudFbFor(sSoh3DEye, mSoh3DHudFb[mSoh3DPing], mSoh3DMirrorSinkFb);
++    if (sohHudFb < 0) {
++        return;
++    }
++    Flush();
++    mSoh3DHudActive = true;
++    mRapi->StartDrawToFramebuffer(sohHudFb, (float)mCurDimensions.height / mNativeDimensions.height);
++    mRapi->ClearFramebuffer(true, true);
++    mRdp->viewport_or_scissor_changed = true;
++    mRenderingState.viewport = {};
++    mRenderingState.scissor = {};
 +}
 +
 +void Interpreter::Soh3DEndEyePass(int eye) {
@@ -530,7 +3546,30 @@ so iPhone links resolve (mode stays 0 there); macOS compiles none of it.
 +    // the final one (which holds the ImGui overlay): game visible, menu
 +    // never. Device-only: the simulator serializes queues.
 +    if (eye >= 1 && eye <= 2 && mSoh3DEyeFb[eye - 1][mSoh3DPing] >= 0) {
-+        mRapi->Soh3DPublishOnComplete(mSoh3DEyeFb[eye - 1][mSoh3DPing], eye - 1);
++        mRapi->Soh3DPublishOnComplete(mSoh3DEyeFb[eye - 1][mSoh3DPing], eye - 1, sSohVRTag);
++    }
++    // SOH_IOS (overlay 0044 rev3, VR R3 / spec D12): the rear-view pane
++    // publishes on the same completion contract, and hands mCurDimensions
++    // back to the EYE extent before anything else can observe the mirror
++    // size (see StartFrame's note — alternating extents would re-resize
++    // every game framebuffer twice per host frame).
++    if (eye == 3) {
++        if (mSoh3DMirrorFb[mSoh3DPing] >= 0) {
++            mRapi->Soh3DPublishMirrorOnComplete(mSoh3DMirrorFb[mSoh3DPing]);
++        }
++        if (mSoh3DEyeDimsW > 0) {
++            mCurDimensions.width = mSoh3DEyeDimsW;
++            mCurDimensions.height = mSoh3DEyeDimsH;
++            mCurDimensions.aspect_ratio = (float)mSoh3DEyeDimsW / (float)mSoh3DEyeDimsH;
++        }
++    }
++    // VR: both eye passes render the same HUD content into the same
++    // framebuffer (it is wiped at the head of each); publish once, after
++    // the second pass, so the plane compositor never samples a half-drawn
++    // HUD (spec D6).
++    if (gSohVRWorldActive && eye == 2 && mSoh3DHudFb[mSoh3DPing] >= 0) {
++        Soh3DVRTarget(false);
++        mRapi->Soh3DPublishHudOnComplete(mSoh3DHudFb[mSoh3DPing]);
 +    }
 +    mRapi->EndFrameOffscreen();
 +    mRapi->FinishRender();
@@ -539,18 +3578,18 @@ so iPhone links resolve (mode stays 0 there); macOS compiles none of it.
 +    }
 +}
 +#endif
-+
+ 
  void gfx_set_target_ucode(UcodeHandlers ucode) {
      ucode_handler_index = ucode;
- }
 --- a/libultraship/src/fast/Fast3dWindow.cpp
 +++ b/libultraship/src/fast/Fast3dWindow.cpp
-@@ -187,6 +187,18 @@
+@@ -187,6 +187,32 @@
      return mWindowManagerApi->IsFrameReady();
  }
  
 +#ifdef __IOS__
 +#include <imgui.h>
++#include <chrono>
 +// SOH_IOS (overlay 0044): shell-owned stereoscopic mode flag (visionOS).
 +// FILE scope with C linkage — block-scope externs namespace-mangle (the
 +// project's recurring linkage trap).
@@ -558,16 +3597,30 @@ so iPhone links resolve (mode stays 0 there); macOS compiles none of it.
 +extern volatile int gSoh3DMode;
 +extern volatile int gSoh3DDbgMenuVis, gSoh3DDbgMenuBuilds, gSoh3DDbgMenuVtx;
 +extern volatile int gSoh3DMenuToggleReq;
++// SOH_IOS (overlay 0044 rev3, VR R3 / spec D12): the rear-view pane's
++// third walk runs only while the shell says the pane is visible.
++extern volatile int gSohVRWorldActive;
++extern volatile int gSohVRMirrorActive;
++// rev6 (R12): the backpressure counter (gfx_metal.cpp) and the two A/B
++// controls (SohIosShell.m) the skip above reads. gSohVREngineOwnFix is
++// there so that 0 is the 1.0.0.8 behaviour END TO END -- no producer
++// reservation, no consumer re-verify, and no backpressure either -- which
++// is what makes the stress evidence a real A/B on ONE binary rather than
++// a comparison against a build nobody still has (trap D20's rule).
++extern volatile unsigned int gSohIosGfxSlotSkips;
++extern volatile int gSohVRSlotGate;
++extern volatile int gSohVREngineOwnFix;
 +}
 +#endif
 +
  bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxReplacements) {
      std::shared_ptr<Window> wnd = Ship::Context::GetInstance()->GetWindow();
  
-@@ -195,6 +207,65 @@
+@@ -194,6 +220,117 @@
+     if (!wnd->IsFrameReady()) {
          return false;
      }
- 
++
 +#ifdef __IOS__
 +    // SOH_IOS (overlay 0044): in 3D, render BOTH eyes each host frame (same
 +    // game time — alternating halves each eye's rate and judders), entirely
@@ -576,6 +3629,45 @@ so iPhone links resolve (mode stays 0 there); macOS compiles none of it.
 +    static bool sohWas3D = false;
 +    if (gSoh3DMode != 0) {
 +        sohWas3D = true;
++        // SOH_IOS (overlay 0044 rev6, VR R12 item 1): PRODUCER BACKPRESSURE.
++        // If every ping-pong slot is either still on the GPU or still
++        // claimed by the compositor, do not render the eyes at all this
++        // host frame. rev5 wrote them anyway after a bounded 40 ms wait,
++        // and because the compositor claims eye 0 FIRST and drops every
++        // claim together when its command buffer completes, eye 0 is
++        // always the one held longest and therefore always the one
++        // stomped: the LEFT eye, in every mode, at a rate that rises with
++        // render quality because a heavier pass keeps the consumer's
++        // buffers queued longer. A repeated frame is invisible; a torn
++        // one is the user's rainbows.
++        //
++        // Bounded, like every wait in this port (trap C1) -- and bounded
++        // in TIME, not in frames, because the host frame rate is four
++        // times the engine's here and a frame count means different
++        // things on the two sides of that. 100 ms is the envelope: the
++        // compositor legitimately holds an eye texture for one or two of
++        // its own 90-100 Hz frames, ~22 ms, so 100 ms is four times any
++        // honest hold and still far short of the frozen-world dwell that
++        // would read as judder. Past it we render anyway, because a
++        // consumer that has stopped consuming must not be able to freeze
++        // the picture forever; `slot_skips` and `starve_eye` say which of
++        // the two happened.
++        static double sohSkipSince = 0.0;
++        double sohNow = std::chrono::duration<double>(
++                            std::chrono::steady_clock::now().time_since_epoch())
++                            .count();
++        if (gSohVRWorldActive != 0 && gSohVRSlotGate != 0 && gSohVREngineOwnFix != 0 &&
++            (sohSkipSince == 0.0 || sohNow - sohSkipSince < 0.100) &&
++            mInterpreter->Soh3DPickSlot() < 0) {
++            if (sohSkipSince == 0.0) {
++                sohSkipSince = sohNow;
++            }
++            gSohIosGfxSlotSkips = gSohIosGfxSlotSkips + 1;
++            mWindowManagerApi->SwapBuffersBegin();
++            mWindowManagerApi->SwapBuffersEnd();
++            return true;
++        }
++        sohSkipSince = 0.0;
 +        // Menu in 3D (0043): build the ImGui frame ONCE per host frame
 +        // (primed against an eye framebuffer — the screen backend NewFrame
 +        // would acquire the hidden window's drawable), composite the same
@@ -609,6 +3701,19 @@ so iPhone links resolve (mode stays 0 there); macOS compiles none of it.
 +            }
 +            mInterpreter->Soh3DEndEyePass(sohEye);
 +        }
++        // SOH_IOS (overlay 0044 rev3, VR R3 / spec D12): the
++        // rear-view pane's THIRD walk — same game time, same command
++        // list, a reversed camera and a small mono target. It runs ONLY
++        // while the shell says the pane is on screen, so the pane costs
++        // exactly nothing when it is not up (D12: "renders only while
++        // the pane is visible"), and it takes no ImGui overlay — a
++        // mirror does not show you the menu.
++        if (gSohVRWorldActive != 0 && gSohVRMirrorActive != 0) {
++            mInterpreter->Soh3DSetEye(3);
++            mInterpreter->StartFrame();
++            mInterpreter->Run(commands, mtxReplacements);
++            mInterpreter->Soh3DEndEyePass(3);
++        }
 +        if (sohMenuData != nullptr) {
 +            sohGui->Soh3DFinishMenuFrame();
 +        }
@@ -626,7 +3731,6 @@ so iPhone links resolve (mode stays 0 there); macOS compiles none of it.
 +        mInterpreter->Soh3DSetEye(0); // restore saved 2D state ONCE
 +    }
 +#endif
-+
+ 
      auto gui = wnd->GetGui();
      // Setup mouse state manager
-     wnd->GetMouseStateManager()->StartFrame();

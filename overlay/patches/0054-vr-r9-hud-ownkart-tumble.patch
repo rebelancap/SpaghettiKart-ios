@@ -1,0 +1,562 @@
+Overlay patch 0054: the VR R9 GAME-SIDE trio — the clipped LAP HUD, the
+player's own kart in first person, and the roll/tumble state "Realistic Spins"
+needs (VR R9 items 7, 5, 6).
+
+Three edits, three files, all __IOS__-guarded and all gated at runtime on VR
+being the thing that is rendering, so the flat game, the 3D panel and the macOS
+oracle are byte-for-byte what they were.
+
+  1. src/render_objects.c — `render_texture_rectangle_wide`, THE LAP CLIP.
+
+     the user, 1.0.0.5: the right edge of the LAP element is cut ("LAP 2/" with
+     the trailing total gone and the P half-eaten) while TIME renders whole.
+     Both elements come out of the SAME helper stack and the same
+     scissor/viewport/matrix scope (`func_80058F78` calls `render_hud_timer`
+     then `draw_simplified_lap_count`), so nothing about the HUD plane or the
+     ortho sentinels is involved. The difference is one branch:
+
+         if ((xl - (width / 2)) < (SCREEN_WIDTH / 2)) {
+             coordX  = OTRGetDimensionFromLeftEdge(xl) << 2;
+             coordX2 = (xh) << 2;                  // <-- NOT transformed
+         } else {
+             coordX  = OTRGetDimensionFromRightEdge(xl) << 2;
+             coordX2 = OTRGetDimensionFromRightEdge(xh) << 2;
+         }
+
+     LAP sits at x≈103 and takes the LEFT branch; TIME sits at x≈228 and takes
+     the RIGHT branch, which transforms BOTH edges and is therefore
+     width-preserving. The left branch moves the left edge by
+     `K = 120*AR - 160` and leaves the right edge alone, so the rectangle's
+     width changes by K while the texel rate (`dsdx = 4 << 10`) does not.
+
+     In the flat game K is POSITIVE (any aspect wider than 4:3) and the
+     rectangle comes out too WIDE — the texture is drawn shifted but whole,
+     which is why this has never been reported. A VR eye is 5087x4081 on
+     device: aspect 1.246, NARROWER than 4:3, so K = -10.4 and the rectangle
+     comes out ten pixels too NARROW. Ten pixels off a 32-pixel HUD tile is
+     precisely the missing "3" and the half-eaten P.
+
+     The fix transforms both edges with the same function, which is what the
+     right branch has always done, and it applies ONLY while a VR world frame
+     is being drawn (`gSohVRWorldActive`) — the flat/panel HUD keeps its
+     existing behaviour to the pixel.
+
+  2. src/render_player.c — `render_kart`, THE OWN KART IN FIRST PERSON.
+
+     the user: his own kart/driver billboard flashes into view, and a 2D
+     cardboard cut-out of yourself hanging in the cockpit is distracting.
+     Suppressed for the LOCAL player only (playerId == PLAYER_ONE, screenId 0),
+     only while `gSohVRHideOwnKart` is set — which the shell raises on world
+     frames in FIRST PERSON and nowhere else. Every other kart, the ghost, the
+     shadow, the particles and every other mode are untouched.
+
+     REV4 (R16-C step 5): the skip now has an ELSE. When the rear-view pane
+     is up the quad is emitted anyway, bracketed by G_NOOP 0x66/0x67, and
+     0044 rev12 diverts it into the mirror SINK during the eye passes. A
+     mirror that cannot show the machine it is bolted to gives the viewer
+     nothing to judge distance against, and this is also falsifier F2: the
+     kart's ROW in the pane is 46% of pane height on the 1.0.0.12 look-at
+     pivot and 65% on the correct one, measured off the framebuffer.
+
+     The skip is at the GEOMETRY, not at `try_rendering_player`: the kart
+     texture arrives by DMA and `render_player`/`load_kart_texture_and_render_
+     kart_particles` do blocking `osRecvMesg(&gDmaMesgQueue, ...)` pairs. Skip
+     the draw, never the queue.
+
+  3. src/player_controller.c — `func_8002934C`, THE TUMBLE STATE.
+
+     "Realistic Spins (intense)" wants the first-person view to follow the kart
+     through a spin-out AND through the airborne hit-somersault. 0051 already
+     exports `gSohVRKartSpin` and `gSohVRKartAirborne`; neither carries an
+     ANGLE, and the somersault's angle is not in `player->rotation` at all
+     (`rotation[0]` and `rotation[2]` are only ever zeroed for a Player).
+
+     What the somersault actually is:
+       * `player->unk_0A8` — the tumble phase, 8.8 fixed, one full revolution
+         over 0..0x2000; it is what indexes `gKartTextureTumbles`.
+       * `player->unk_050[screenId]` — the composed ROLL/lean the kart
+         billboard is drawn with, which during HIT_EFFECT is driven by
+         `player->unk_D9C`, the real tumble angle.
+       * `player->effects & HIT_EFFECT` — "hit an object", the squish/tumble
+         case (deliberately NOT part of gSohVRKartSpin since 0051 rev4, whose
+         header explains why holding the horizon for a wall scrape is wrong).
+
+     Exported as `gSohVRKartRollBam`, `gSohVRKartTumble` and
+     `gSohVRKartHitEffect`. Read by the shell ONLY when the Realistic Spins
+     toggle is on; with it off (the default) the composed matrix is bit-for-bit
+     what R8 shipped.
+
+  4. src/render_player.c — REV5 (R17-A item 2a), THE OTHER TWO EMITTERS OF THE
+     SAME QUAD.
+
+     the user, 1.0.0.13: "when i use a mushroom, i can see faint images and in
+     flashes, of my own character's head shaking." Edit 2 above suppresses the
+     local kart's quad in `render_kart` and NOWHERE ELSE, and `render_kart` is
+     not the only function that draws `gPlayerVtx[playerId]`:
+
+       * `func_80025DE8` (render_player.c) draws the SAME eight vertices again
+         as a translucent tinted copy (ZMODE_XLU, `func_8004B614` colour
+         effect) under `FrameInterpolation_RecordOpenChild("player_boost", ...)`
+         whenever `player->boostPower >= 2.0f`. That is the boost flash, it is
+         drawn only while boosting, it carries MK64's boost shake — and it was
+         completely unguarded. "Faint images, in flashes, of my own character's
+         head shaking" is that function, one clause at a time.
+       * `render_player_ice_reflection` draws them a third time, mirrored, on
+         ICE surfaces (Sherbet Land). With the kart itself hidden, its
+         reflection is a driver with nobody above it.
+       * `render_ghost` is the TIME TRIAL ghost and is deliberately left alone:
+         it is not you, and the game already draws it for a different player
+         record.
+
+     Both get the identical predicate to edit 2
+     (`gSohVRHideOwnKart && playerId == PLAYER_ONE && screenId == 0`) around
+     the GEOMETRY ONLY — the matrix, the display list, the LUT, the colour
+     effect, the render mode and the texture load all still execute, so RSP
+     state and the texture DMA are byte-for-byte what they were (0054's
+     original rule: skip the draw, never the queue). `gSohVROwnBoostSkips` and
+     `gSohVROwnReflSkips` count the suppressions so the suite can assert the
+     predicate is IN THE PATH rather than merely compiled in.
+
+     NOTE the rear-view pane: edit 2 has an else-branch that re-emits the kart
+     for the mirror under sentinels 0x66/0x67. These two do not, so with
+     `rearownkart 1` the pane shows the machine but not its boost flash or its
+     ice reflection. That is deliberate — `rearownkart` ships OFF (STATUS open
+     question, trap D19) and a second pair of bracketed spans buys nothing
+     the user has asked for.
+
+  5. src/render_player.c — REV6 (R18-A), THE CLASS PROBE'S BRACKETS.
+
+     `render_player` wraps the shadow, the kart quad (or the time-trial ghost)
+     and the boost flash in G_NOOP 0x70/0x71 pairs whose low 16 bits are
+     (class << 12) | playerId: 1/6 = own/other SHADOW, 2/5 = own/other KART
+     quad, 3 = own BOOST flash (other karts' boost: 15, not probed). 0044 attributes the FIRST modelview load inside a
+     bracket to that class and measures it against the eye recovered from the
+     composed eye matrix, walk by walk. Emitted ONLY while the dev knob
+     `gSohVRClassProbe` is set (`vr set classprobe 1`); every shipped build and
+     every flat frame emit nothing, so the list is byte-for-byte unchanged.
+
+Every write is inside the existing `(playerId == 0) && (screenId == 0)` guard
+or a new one exactly like it, so a split-screen or CPU kart can never write the
+1P VR state (trap D10).
+
+
+--- a/src/render_objects.c
++++ b/src/render_objects.c
+@@ -1600,6 +1600,20 @@
+  *
+  *
+  */
++#ifdef __IOS__
++// SOH_IOS (overlay 0054, VR R9 item 7): the shell's world-frame flag.
++// File scope with C linkage — block-scope externs namespace-mangle
++// (this project's recurring linkage trap).
++extern volatile int gSohVRWorldActive;
++// The A/B control for the fix below (default 1 = fixed). A screenshot
++// that cannot be made to show the BUG is not evidence that the bug is
++// gone -- trap D11's rule, applied to a pixel assert: `vr set hudwide 0`
++// reinstates the 1.0.0.5 behaviour on purpose so the suite can capture
++// the clipped LAP and the whole one in the same build, at the same
++// aspect, seconds apart.
++extern volatile int gSohVRHudWideSym;
++#endif
++
+ void render_texture_rectangle_wide(s32 x, s32 y, s32 width, s32 height, s32 arg4, s32 arg5, s32 arg6) {
+ 
+     s32 xh = (((x + width) - 1));
+@@ -1623,6 +1637,22 @@
+             case SCREEN_MODE_2P_SPLITSCREEN_HORIZONTAL:
+                 if ((xl - (width / 2)) < (SCREEN_WIDTH / 2)) {
+                     coordX = (s32) OTRGetDimensionFromLeftEdge(xl) << 2;
++#ifdef __IOS__
++                    // SOH_IOS (overlay 0054, VR R9 item 7): transform BOTH
++                    // edges in VR, exactly as the right-edge branch below
++                    // always has. Leaving the right edge untransformed
++                    // changes the rectangle's WIDTH by K = 120*AR - 160
++                    // while the texel rate stays at 4 << 10. In the flat
++                    // game K > 0 and the rect is too wide (the texture is
++                    // merely shifted); a VR eye is 5087x4081 = aspect 1.246,
++                    // narrower than 4:3, so K = -10.4 and the rect is TEN
++                    // PIXELS TOO NARROW — the missing "3" and the half-eaten
++                    // P in the user's LAP element. VR world frames only; the
++                    // flat and 3D-panel HUD keep their existing pixels.
++                    if (gSohVRWorldActive && gSohVRHudWideSym) {
++                        coordX2 = (s32) OTRGetDimensionFromLeftEdge(xh) << 2;
++                    } else
++#endif
+                     coordX2 = (s32) (xh) << 2;
+                 } else {
+                     coordX = (s32) OTRGetDimensionFromRightEdge(xl) << 2;
+--- a/src/render_player.c
++++ b/src/render_player.c
+@@ -13,6 +13,59 @@
+ #include "kart_dma.h"
+ #include "objects.h"
+ #include "render_player.h"
++#ifdef __IOS__
++// SOH_IOS (overlay 0054, VR R9 item 5): raised by the shell on VR world
++// frames in FIRST PERSON only. File scope with C linkage, and at the TOP
++// of the file because rev3 reads it from three functions, the earliest of
++// which (func_8001F9E4) is above render_kart.
++extern volatile int gSohVRHideOwnKart;
++// SOH_IOS (overlay 0054 rev3, VR R11 item 3b): 1 while VR is standing
++// MK64's ANGLE culls down (the shell raises it on VR world frames).
++extern volatile int gSohVRAngleCullOff;
++// Telemetry, so `vr rearview` can prove the override actually changed
++// something rather than merely being compiled in: how many karts the
++// FORWARD cone rejected and VR admitted anyway, and how many times the
++// local kart's shadow was bracketed for the mirror sink.
++extern volatile unsigned int gSohVRCullKartsKept;
++extern volatile unsigned int gSohVROwnShadowTags;
++extern volatile unsigned int gSohVRKartsListed;
++// SOH_IOS (overlay 0054 rev3, VR R11 item 3b): the RED CONTROL for the
++// cone override (spec D11). 1 makes MK64's view-cone test reject
++// everything, so the override is the ONLY thing that can put a kart in
++// the list -- which is how the suite proves the override is in the path
++// in a scene where the cone happens never to reject anybody. Diagnostic
++// only, never persisted, and the dev console bridge is the only writer.
++extern volatile int gSohVRConeFault;
++// SOH_IOS (overlay 0054 rev4, VR R16-C step 5): the local kart, drawn
++// in the REAR-VIEW PANE only. gSohVROwnKartRear is the A/B (and F2's
++// instrument); gSohVRMirrorActive is the gate -- the mirror sink the
++// eyes divert into only exists while the pane is being rendered.
++extern volatile int gSohVROwnKartRear;
++extern volatile int gSohVRMirrorActive;
++extern volatile unsigned int gSohVROwnKartRearTags;
++// SOH_IOS (overlay 0054 rev5, VR R17-A item 2a): the OTHER two
++// emitters of gPlayerVtx -- the boost flash (func_80025DE8) and the
++// ice reflection -- suppressed for the local kart under the same
++// predicate, with a counter each so the suite can see the predicate
++// fire instead of asserting that it did not see something.
++extern volatile unsigned int gSohVROwnBoostSkips;
++extern volatile unsigned int gSohVROwnReflSkips;
++// SOH_IOS (overlay 0054 rev6, VR R18-A): the class probe's brackets (dev
++// only). 0044 rev15 reads l = (class << 12) | key off G_NOOP 0x70 and takes
++// the first modelview load before 0x71 as that class's drawn position.
++// Classes: 1 own shadow, 2 own kart, 3 own boost, 5 kart, 6 shadow.
++extern volatile int gSohVRClassProbe;
++static void sohvr_cp_tag(int sohBegin, int sohCls, int sohKey) {
++    Gfx* sohTag = gDisplayListHead++;
++    sohTag->words.w0 = (uintptr_t) ((G_NOOP << 24) | ((sohBegin ? 0x70 : 0x71) << 16) |
++                                    ((sohCls & 0xF) << 12) | (sohKey & 0xFFF));
++    sohTag->words.w1 = 0;
++}
++#define SOHVR_CP_OPEN(own, other, key) \
++    do { if (gSohVRClassProbe) { sohvr_cp_tag(1, (playerId == 0 && screenId == 0) ? (own) : (other), (key)); } } while (0)
++#define SOHVR_CP_CLOSE() \
++    do { if (gSohVRClassProbe) { sohvr_cp_tag(0, 0, 0); } } while (0)
++#endif
+ #include "code_80057C60.h"
+ #include "effects.h"
+ #include "buffers.h"
+@@ -91,15 +144,39 @@
+     player->unk_002 &= ~(UNK_002_UNKNOWN_0x2 << (screenId * 4));
+     player->unk_002 &= ~(SIDE_OF_KART << (screenId * 4));
+ 
++#ifdef __IOS__
++    // SOH_IOS (overlay 0054 rev3, VR R11 item 3b): see the patch header.
++    // The cone test still RUNS -- the override is counted only when it
++    // actually changed the answer, because an assert on a counter that
++    // ticks whether or not the fix does anything is worth nothing.
++    {
++        int sohVis =
++            (check_player_camera_collision(player, camera, (f32) (D_80165578 + sp30), (f32) (D_8016557A + sp2C)) == 1);
++        if (!sohVis && gSohVRAngleCullOff) {
++            sohVis = 1;
++            gSohVRCullKartsKept = gSohVRCullKartsKept + 1;
++        }
++        if (sohVis) {
++            player->unk_002 |= UNK_002_UNKNOWN_0x2 << (screenId * 4);
++        }
++    }
++#else
+     if (check_player_camera_collision(player, camera, (f32) (D_80165578 + sp30), (f32) (D_8016557A + sp2C)) == 1) {
+         player->unk_002 |= UNK_002_UNKNOWN_0x2 << (screenId * 4);
+     }
++#endif
+     if (check_player_camera_collision(player, camera, (f32) D_80165580, (f32) D_80165582) == 1) {
+         player->unk_002 |= SIDE_OF_KART << (screenId * 4);
+     }
+ }
+ 
+ u16 check_player_camera_collision(Player* player, Camera* camera, f32 arg2, f32 arg3) {
++#ifdef __IOS__
++    // SOH_IOS (overlay 0054 rev3, VR R11 item 3b): D11's red control.
++    if (gSohVRConeFault) {
++        return false;
++    }
++#endif
+     UNUSED f32 pad[6];
+     f32 sp64;
+     f32 sp60;
+@@ -208,7 +285,22 @@
+         func_8001F980(&sp4C, &sp48);
+         temp_v0_2 = CHANGING_ANIMATION << (screenId << 2);
+         if ((temp_v0 == (player->unk_002 & temp_v0)) && (temp_v0_2 == (player->unk_002 & temp_v0_2))) {
++#ifdef __IOS__
++            // SOH_IOS (overlay 0054 rev3, VR R11 item 3b): THE LIST-ADD.
++            // This is the tight cone -- the one whose rejection actually
++            // keeps a kart out of gPlayersToRender and therefore out of
++            // the display list the rear-view walk replays. Counted the
++            // same way as the visibility cone above: only when the
++            // override CHANGED the answer.
++            int sohAdd = ((check_player_camera_collision(player, camera, D_80165570 + sp4C, D_80165572 + sp48) == 1) & 0xFFFF);
++            if (!sohAdd && gSohVRAngleCullOff) {
++                sohAdd = 1;
++                gSohVRCullKartsKept = gSohVRCullKartsKept + 1;
++            }
++            if (sohAdd) {
++#else
+             if ((check_player_camera_collision(player, camera, D_80165570 + sp4C, D_80165572 + sp48) == 1) & 0xFFFF) {
++#endif
+                 gPlayersToRenderPlayerId[gPlayersToRenderCount] = (s16) playerId;
+                 gPlayersToRenderScreenId[gPlayersToRenderCount] = (s16) screenId;
+                 gPlayersToRenderPlayer[gPlayersToRenderCount] = player;
+@@ -362,6 +454,15 @@
+         init_render_player(gPlayerEight, camera, PLAYER_EIGHT, screenIdx);
+     }
+ 
++#ifdef __IOS__
++    // SOH_IOS (overlay 0054 rev3, VR R11 item 3b): how many karts the
++    // display list this frame actually CONTAINS. karts_kept alone cannot
++    // carry the assert -- it counts only the frames on which the cone
++    // rejected somebody, which is a property of where the field happens
++    // to be, not of the fix. This is the number the rear-view walk is
++    // handed, and it is scene-independent enough to assert on.
++    gSohVRKartsListed = (unsigned int) gPlayersToRenderCount;
++#endif
+     // This call moved here to sync kart texture and wheel texture tlut loading/rendering
+     if (gPlayersToRenderCount != 0) {
+         load_kart_texture_and_render_kart_particles(screenIdx);
+@@ -1225,6 +1326,22 @@
+     }
+     convert_to_fixed_point_matrix(GetShadowMatrix(playerId + (screenId * 8)), mtx);
+ 
++#ifdef __IOS__
++    // SOH_IOS (overlay 0054 rev3, VR R11 item 3a): YOUR OWN SHADOW IN THE
++    // MIRROR. With the kart itself hidden in first person, the rear-view
++    // pane looks straight at the local kart's ground shadow and it reads as
++    // a smear of dirt sliding along the road. The EYES must keep it (it is
++    // what grounds the kart under you), so this cannot be a skip: it is a
++    // pair of G_NOOP sentinels, exactly like 0046's sky pair, and 0044 rev5
++    // parks whatever falls between them in the rear-view SINK framebuffer
++    // during the mirror walk and nowhere else.
++    if (gSohVRHideOwnKart && playerId == PLAYER_ONE && screenId == 0) {
++        Gfx* sohTag = gDisplayListHead++;
++        sohTag->words.w0 = (uintptr_t) ((G_NOOP << 24) | (0x5C << 16));
++        sohTag->words.w1 = 0;
++        gSohVROwnShadowTags = gSohVROwnShadowTags + 1;
++    }
++#endif
+     gSPMatrix(gDisplayListHead++, GetShadowMatrix(playerId + (screenId * 8)),
+               G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
+ 
+@@ -1239,6 +1356,14 @@
+ 
+     gSPDisplayList(gDisplayListHead++, common_square_plain_render);
+     gSPTexture(gDisplayListHead++, 1, 1, 0, G_TX_RENDERTILE, G_OFF);
++#ifdef __IOS__
++    // SOH_IOS (overlay 0054 rev3, VR R11 item 3a): own-shadow sentinel END.
++    if (gSohVRHideOwnKart && playerId == PLAYER_ONE && screenId == 0) {
++        Gfx* sohTag = gDisplayListHead++;
++        sohTag->words.w0 = (uintptr_t) ((G_NOOP << 24) | (0x5D << 16));
++        sohTag->words.w1 = 0;
++    }
++#endif
+ 
+     // @port Pop the transform id.
+     FrameInterpolation_RecordCloseChild();
+@@ -1417,9 +1542,44 @@
+     gDPLoadTextureBlock(gDisplayListHead++, sKartTexture, G_IM_FMT_CI, G_IM_SIZ_8b, 64, 64, 0,
+                         G_TX_NOMIRROR | G_TX_CLAMP, G_TX_NOMIRROR | G_TX_CLAMP, G_TX_NOMASK, G_TX_NOMASK, G_TX_NOLOD,
+                         G_TX_NOLOD);
++#ifdef __IOS__
++    // SOH_IOS (overlay 0054, VR R9 item 5): in first person you are IN this
++    // kart, and a camera-facing cardboard cut-out of yourself hanging in the
++    // cockpit is the single most immersion-breaking thing in the seat. Skip
++    // the LOCAL player's quad only — the shadow, the particles, every other
++    // kart and every other mode are untouched, and the texture DMA above
++    // still ran so the blocking osRecvMesg pairs stay balanced.
++    // REV4 (R16-C step 5): ... EXCEPT IN THE REAR-VIEW PANE. A mirror
++    // with no image of the machine it is bolted to has no anchor, which
++    // is half of why the user could not tell how far behind him the road
++    // in the pane was. So when the pane is up the quad is emitted after
++    // all, bracketed by G_NOOP 0x66/0x67, and 0044 rev12 diverts it into
++    // the mirror SINK during the two eye passes -- the same retarget
++    // recipe 0046 uses for the sky and 0054 rev3 uses for this kart's
++    // shadow, and never an edit to the list (trap D32).
++    // It is also falsifier F2: your own kart's ROW in the pane is a
++    // pure pixel fact about where the pane camera is standing (46% of
++    // the pane's height on the 1.0.0.12 pivot, 65% on the correct one)
++    // and it shares nothing with the matrices under test.
++    if (!(gSohVRHideOwnKart && playerId == PLAYER_ONE && screenId == 0)) {
++#endif
+     gSPVertex(gDisplayListHead++, &gPlayerVtx[playerId][flipOffset], 8, 0);
+     gSP2Triangles(gDisplayListHead++, 0, 1, 2, 0, 0, 2, 3, 0);
+     gSP2Triangles(gDisplayListHead++, 4, 5, 6, 4, 4, 6, 7, 4);
++#ifdef __IOS__
++    } else if (gSohVROwnKartRear && gSohVRMirrorActive) {
++        Gfx* sohTag = gDisplayListHead++;
++        sohTag->words.w0 = (uintptr_t) ((G_NOOP << 24) | (0x66 << 16));
++        sohTag->words.w1 = 0;
++        gSPVertex(gDisplayListHead++, &gPlayerVtx[playerId][flipOffset], 8, 0);
++        gSP2Triangles(gDisplayListHead++, 0, 1, 2, 0, 0, 2, 3, 0);
++        gSP2Triangles(gDisplayListHead++, 4, 5, 6, 4, 4, 6, 7, 4);
++        sohTag = gDisplayListHead++;
++        sohTag->words.w0 = (uintptr_t) ((G_NOOP << 24) | (0x67 << 16));
++        sohTag->words.w1 = 0;
++        gSohVROwnKartRearTags = gSohVROwnKartRearTags + 1;
++    }
++#endif
+     gSPTexture(gDisplayListHead++, 1, 1, 0, G_TX_RENDERTILE, G_OFF);
+     gDPSetAlphaCompare(gDisplayListHead++, G_AC_NONE);
+ 
+@@ -1532,9 +1692,24 @@
+     gDPLoadTextureBlock(gDisplayListHead++, sKartTexture, G_IM_FMT_CI, G_IM_SIZ_8b, 64, 64, 0,
+                         G_TX_NOMIRROR | G_TX_CLAMP, G_TX_NOMIRROR | G_TX_CLAMP, G_TX_NOMASK, G_TX_NOMASK, G_TX_NOLOD,
+                         G_TX_NOLOD);
++#ifdef __IOS__
++    // SOH_IOS (overlay 0054 rev5, VR R17-A item 2a): THE BOOST FLASH.
++    // This is the SAME gPlayerVtx quad render_kart draws, re-drawn
++    // translucent and tinted while boostPower >= 2 -- the user's "faint
++    // images, in flashes, of my own character's head shaking" when he
++    // uses a mushroom. rev1 suppressed the kart in render_kart only.
++    // GEOMETRY ONLY: everything above still runs, so the RSP state and
++    // the texture load are byte-for-byte what they were.
++    if (gSohVRHideOwnKart && playerId == PLAYER_ONE && screenId == 0) {
++        gSohVROwnBoostSkips = gSohVROwnBoostSkips + 1;
++    } else {
++#endif
+     gSPVertex(gDisplayListHead++, &gPlayerVtx[playerId][flipOffset], 8, 0);
+     gSP2Triangles(gDisplayListHead++, 0, 1, 2, 0, 0, 2, 3, 0);
+     gSP2Triangles(gDisplayListHead++, 4, 5, 6, 4, 4, 6, 7, 4);
++#ifdef __IOS__
++    }
++#endif
+     gSPTexture(gDisplayListHead++, 1, 1, 0, G_TX_RENDERTILE, G_OFF);
+     gMatrixEffectCount += 1;
+ 
+@@ -1577,9 +1752,21 @@
+     gDPLoadTextureBlock(gDisplayListHead++, sKartTexture, G_IM_FMT_CI, G_IM_SIZ_8b, 64, 64, 0,
+                         G_TX_NOMIRROR | G_TX_CLAMP, G_TX_NOMIRROR | G_TX_CLAMP, G_TX_NOMASK, G_TX_NOMASK, G_TX_NOLOD,
+                         G_TX_NOLOD);
++#ifdef __IOS__
++    // SOH_IOS (overlay 0054 rev5, VR R17-A item 2a): the ICE
++    // REFLECTION, the third emitter of this quad. On Sherbet Land the
++    // reflection of a hidden kart is a driver floating on the ice with
++    // nobody above him. Same predicate, geometry only.
++    if (gSohVRHideOwnKart && playerId == PLAYER_ONE && screenId == 0) {
++        gSohVROwnReflSkips = gSohVROwnReflSkips + 1;
++    } else {
++#endif
+     gSPVertex(gDisplayListHead++, &gPlayerVtx[playerId][flipOffset], 8, 0);
+     gSP2Triangles(gDisplayListHead++, 0, 1, 2, 0, 0, 2, 3, 0);
+     gSP2Triangles(gDisplayListHead++, 4, 5, 6, 4, 4, 6, 7, 4);
++#ifdef __IOS__
++    }
++#endif
+     gSPTexture(gDisplayListHead++, 1, 1, 0, G_TX_RENDERTILE, G_OFF);
+     gMatrixEffectCount += 1;
+ 
+@@ -1603,6 +1790,9 @@
+     temp_t1 = SIDE_OF_KART << (screenId * 4);
+     if ((temp_t1 == (player->unk_002 & temp_t1)) && (player->collision.surfaceDistance[2] <= 50.0f) &&
+         (player->surfaceType != ICE)) {
++#ifdef __IOS__
++        SOHVR_CP_OPEN(1, 6, playerId); // rev6: the shadow
++#endif
+         if ((player->effects & BOO_EFFECT) == BOO_EFFECT) {
+             if (playerId == screenId) {
+                 render_player_shadow(player, playerId, screenId);
+@@ -1610,19 +1800,34 @@
+         } else {
+             render_player_shadow(player, playerId, screenId);
+         }
++#ifdef __IOS__
++        SOHVR_CP_CLOSE();
++#endif
+     }
++#ifdef __IOS__
++    SOHVR_CP_OPEN(2, 5, playerId); // rev6: the kart quad
++#endif
+     if ((player->type & PLAYER_INVISIBLE_OR_BOMB) != PLAYER_INVISIBLE_OR_BOMB) {
+         render_kart(player, playerId, screenId, var_v1);
+     } else {
+         render_ghost(player, playerId, screenId, var_v1);
+     }
++#ifdef __IOS__
++    SOHVR_CP_CLOSE();
++#endif
+     osRecvMesg(&gDmaMesgQueue, (OSMesg*) &sp34, OS_MESG_BLOCK);
+     if ((temp_t1 == (player->unk_002 & temp_t1)) && (player->surfaceType == ICE) && ((player->kartProps & LAKITU_RETRIEVAL) != LAKITU_RETRIEVAL) &&
+         (player->collision.surfaceDistance[2] <= 30.0f)) {
+         render_player_ice_reflection(player, playerId, screenId, var_v1);
+     }
+     if (player->boostPower >= 2.0f) {
++#ifdef __IOS__
++        SOHVR_CP_OPEN(3, 15, playerId); // rev6: the boost flash (15 = not probed)
++#endif
+         func_80025DE8(player, playerId, screenId, var_v1);
++#ifdef __IOS__
++        SOHVR_CP_CLOSE();
++#endif
+     }
+ }
+ 
+--- a/src/player_controller.c
++++ b/src/player_controller.c
+@@ -1,3 +1,16 @@
++#ifdef __IOS__
++// SOH_IOS (overlay 0054, VR R9 item 6): the roll / tumble-phase / hit
++// state behind the "Realistic Spins (intense)" toggle. Declared HERE,
++// at the head of the file, and deliberately not appended to overlay
++// 0051's extern block twenty lines below: a later patch that lands
++// INSIDE an earlier patch's hunk context breaks apply-overlay.sh's
++// reverse-probe idempotence check, and the whole series then refuses to
++// apply. Overlay hygiene: never edit another patch's context window.
++extern volatile int gSohVRKartRollBam;
++extern volatile int gSohVRKartTumble;
++extern volatile int gSohVRKartHitEffect;
++extern volatile int gSohVRKartTumbling; // rev2: the phase is animating
++#endif
+ #include <libultraship.h>
+ #include <macros.h>
+ #include <defines.h>
+@@ -526,6 +539,38 @@
+     temp_a0 = ((player->unk_048[screenId] + player->rotation[1]) + player->unk_0C0);
+     temp_a0 = (s16) player->unk_0D4[screenId] * sins((u16) temp_a0) + player->unk_0CC[screenId] * coss((u16) temp_a0);
+     move_s16_towards(&player->unk_050[screenId], temp_a0, 0.5f);
++#ifdef __IOS__
++    // SOH_IOS (overlay 0054, VR R9 item 6): the state "Realistic Spins"
++    // needs, and the reason it needs a new export at all — the somersault
++    // is NOT in player->rotation (rotation[0] and rotation[2] are only ever
++    // zeroed for a Player). unk_050 is the composed ROLL the kart billboard
++    // is actually drawn with (driven by unk_D9C, the tumble angle, while
++    // HIT_EFFECT is set); unk_0A8 is the tumble PHASE, one full revolution
++    // over 0..0x2000, the thing that indexes gKartTextureTumbles.
++    // Exported unconditionally; the shell reads them only when the toggle
++    // is on, so with it off the composed matrix is unchanged.
++    if ((playerId == 0) && (screenId == 0)) {
++        gSohVRKartRollBam = (int) (s16) player->unk_050[screenId];
++        gSohVRKartTumble = (int) (player->unk_0A8 & 0x1FFF);
++        gSohVRKartHitEffect = ((player->effects & HIT_EFFECT) == HIT_EFFECT) ? 1 : 0;
++        // SOH_IOS (overlay 0054 rev2, VR R10 item 5): THE FLIP NEVER FIRED,
++        // and this is why. rev1 gated the somersault on `airborne &&
++        // gSohVRKartHitEffect`, and HIT_EFFECT (0x4000000) is "hitting an
++        // OBJECT" — a wall scrape. It is not what a shell or a lightning
++        // bolt raises, so the one condition the pitch composition needed was
++        // essentially never true while the kart was actually tumbling.
++        //
++        // unk_0A8 is the honest signal: src/effects.c advances it 0..0x2000
++        // in exactly three places, and each one is a tumble — func_8008C62C
++        // (+0xA0, the LOW tumble, effects 0x400, a green shell),
++        // the 0x1000000 tumble (+0x80) and the HIT_BY_ITEM tumble (+0x90).
++        // Lightning rides LIGHTNING_EFFECT. So `tumbling` is exactly the set
++        // of states in which the phase is animating, which is exactly when a
++        // pitch composed from it means anything.
++        gSohVRKartTumbling =
++            ((player->effects & (0x400 | 0x1000000 | HIT_BY_ITEM_EFFECT | LIGHTNING_EFFECT)) != 0) ? 1 : 0;
++    }
++#endif
+     var_a0 = player->animFrameSelector[screenId];
+     player->unk_002 = player->unk_002 & (~(UNK_002_UNKNOWN_0x4 << (screenId * 4)));
+     if (var_a0 >= 0x101) {

@@ -1,0 +1,51 @@
+Overlay patch 0048: VR culling gate — view-direction culling stands down,
+distance culling stays (VR-spec D5, trap A2).
+
+RaYRoD's MK64-VR changelog is explicit about the shape of this fix and the
+cost of getting it wrong: killing ALL culling (his patch 6) stopped scenery
+vanishing but "every race began over budget & dragged", so patch 7 put the
+distance cull back and relaxed only the direction cull. The headset's FOV is
+much wider than the chase camera's frustum — and in VR the head can look
+anywhere, including behind — so the yaw cone is simply the wrong test; the
+distance test is still exactly right and is what keeps the frame budget.
+
+is_within_render_distance is the single chokepoint: every one of the port's
+~25 cull sites (including the Moo Moo Farm cow site 0033 guards) funnels
+through it, and the distance rejections all happen BEFORE the angle test.
+Widening the cone to a full circle in VR world frames therefore relaxes
+direction and nothing else.
+
+0xB6 * fov * scaleFov is the half-cone in u16 binary angles; 0x7FFF is one
+LSB short of half a revolution, so plus/minus covers the whole circle
+without wrapping onto itself (0x8000 would make the two bounds equal).
+
+Deliberately anchored on the plus/minus angle computation rather than on
+scaleFov: overlay 0032 edits the scaleFov block a dozen lines up, and a
+patch whose context overlaps another patch's inserted text breaks that
+patch's reverse probe in apply-overlay.sh (R0's structural finding).
+Gated on gSohVRWorldActive, so flat and 3D-panel builds are untouched.
+
+
+--- a/src/racing/math_util.c
++++ b/src/racing/math_util.c
+@@ -1152,6 +1152,20 @@
+     }
+ 
+     angleObject = get_angle_between_two_vectors(cameraPos, objectPos);
++#ifdef __IOS__
++    // SOH_IOS (overlay 0048): VR culling gate (VR-spec D5 / trap A2).
++    // In VR world frames the head owns the view and can look anywhere the
++    // chase camera never pointed, so the yaw cone is the wrong test — stand
++    // it down to a full circle. Every distance rejection above this line
++    // still runs, which is the half of the cull that owns the frame budget
++    // (RaYRoD's patch 6 killed both and "every race began over budget").
++    {
++        extern volatile int gSohVRWorldActive;
++        if (gSohVRWorldActive) {
++            extended_fov = 32767.0f; // one LSB short of half a revolution
++        }
++    }
++#endif
+     minus_fov_angle = (s32)orientationY - (s32)extended_fov;
+     plus_fov_angle = (s32)orientationY + (s32)extended_fov;
+ 

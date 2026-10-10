@@ -1,0 +1,77 @@
+Overlay patch 0063 (D16): OPENGL BACKEND GUARD -- never accept a renderer
+this build does not compile.
+
+WHY. LUS's Fast3dWindow constructor advertised FAST3D_SDL_OPENGL
+unconditionally, but the iOS build of libultraship has no ENABLE_OPENGL (the
+`if(IOS)` branch of libultraship/src/CMakeLists.txt omits it; no
+GfxRenderingAPIOGL in the binary). So a saved `Window.Backend.Id` = 2
+("OpenGL") passed the availability check, InitWindowManager fell to
+`default:` with null mWindowManagerApi/mRenderingApi, and Interpreter::Init
+segfaulted before any log line: an unrecoverable launch crash. The game's own
+Settings > Renderer API combobox listed "OpenGL" for the same reason, so one
+tap bricked the app until reinstall. Found in 2ship2harkinian-ios OTA 1.1.1.1
+(2026-10-09). Newer LUS pins (Ghostship, PaperBoat) already wrap the call in
+#ifdef ENABLE_OPENGL; this backports that and adds two belts.
+
+WHAT (src Fast3dWindow.cpp only):
+  1. AddAvailableWindowBackend(FAST3D_SDL_OPENGL) under #ifdef ENABLE_OPENGL
+     (desktop/oracle builds define it and are unchanged).
+  2. InitWindowManager `default:` -- after the upstream SPDLOG_ERROR, Apple
+     builds select and construct the Metal pair instead of leaving nulls.
+  3. One line when the saved backend id is rejected (WARN here -- see the
+     comment in the hunk; Shipwright/Starship use INFO):
+     "Window backend: saved id X is not available in this build; using id Y".
+     The config is then re-saved with the chosen backend (SetWindowBackend),
+     so a poisoned json heals on the first launch.
+
+Idempotent: if the edits are already applied the generator reverses them
+first, so it runs against a vendor tree with or without 0063 applied. Every
+edit asserts exactly one match.
+
+--- a/libultraship/src/fast/Fast3dWindow.cpp
++++ b/libultraship/src/fast/Fast3dWindow.cpp
+@@ -34,7 +34,12 @@
+         AddAvailableWindowBackend(Ship::WindowBackend::FAST3D_SDL_METAL);
+     }
+ #endif
++    // SOH_IOS (overlay 0063): advertise OpenGL only when it is compiled in. The
++    // iOS libultraship has no ENABLE_OPENGL; a saved/selected "OpenGL" used to
++    // leave a null renderer -> launch crash. Newer LUS guards it the same way.
++#ifdef ENABLE_OPENGL
+     AddAvailableWindowBackend(Ship::WindowBackend::FAST3D_SDL_OPENGL);
++#endif
+ }
+ 
+ Fast3dWindow::Fast3dWindow(std::shared_ptr<Ship::Gui> gui)
+@@ -136,7 +141,15 @@
+ }
+ 
+ void Fast3dWindow::InitWindowManager() {
++    // SOH_IOS (overlay 0063): log a rejected saved backend id (saved -> chosen).
++    // WARN, not INFO: Context::Init's InitLogging() runs at release level warn
++    // until Engine.cpp lowers it AFTER InitWindow, so an INFO line here is dropped.
++    const int savedBackendId = Ship::Context::GetInstance()->GetConfig()->GetInt("Window.Backend.Id", -1);
+     SetWindowBackend(Ship::Context::GetInstance()->GetConfig()->GetWindowBackend());
++    if (savedBackendId != -1 && savedBackendId != static_cast<int>(GetWindowBackend())) {
++        SPDLOG_WARN("Window backend: saved id {} is not available in this build; using id {}", savedBackendId,
++                    static_cast<int>(GetWindowBackend()));
++    }
+ 
+     switch (GetWindowBackend()) {
+ #ifdef ENABLE_DX11
+@@ -159,6 +172,15 @@
+ #endif
+         default:
+             SPDLOG_ERROR("Could not load the correct rendering backend");
++#ifdef __APPLE__
++            // SOH_IOS (overlay 0063): never leave the renderer null (Interpreter::Init
++            // would segfault before any log). Apple builds always carry Metal.
++            SPDLOG_ERROR("Window backend id {} has no renderer in this build; falling back to Metal",
++                         static_cast<int>(GetWindowBackend()));
++            SetWindowBackend(Ship::WindowBackend::FAST3D_SDL_METAL);
++            mRenderingApi = new GfxRenderingAPIMetal();
++            mWindowManagerApi = new GfxWindowBackendSDL2();
++#endif
+             break;
+     }
+ }

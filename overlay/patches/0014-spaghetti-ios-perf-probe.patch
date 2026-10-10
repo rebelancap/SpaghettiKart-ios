@@ -11,9 +11,24 @@ push_frame, the engine frame sits between StartAudioFrame/EndAudioFrame,
 so an audio underrun surfaces as engine time. wall≈eng/N (N=interpolation
 factor) healthy; wall>>expected with low eng = CPU outside the render call.
 
+REV2 (VR R17-A item 1) — THE PER-WALK INTERPOLATION FACTOR, EXPORTED.
+ProcessGfxCommands builds N matrix-replacement sets per GAME frame (N = 2 in
+VR, where gMatchRefreshRate pins the interpolation target to the panel rate)
+and RunCommands walks the display list once for each, at
+FrameInterpolation_Interpolate(t) with t running 0.5, 1.0. Every OBJECT the
+walk draws therefore advances in sub-frame steps — but the VR SEAT does not:
+0044 composes its eye matrices from a kart pose exported once per GAME frame,
+so relative to the seat a nearby kart alternates between "on time" and "half a
+game frame ahead" on every present. That is the user's shaking ghost duplicate,
+and the fix needs the walk's own t on the other side of the interface. This
+revision publishes it and nothing else: `gSohVRWalkT` is set immediately before
+each DrawAndRunGraphicsCommands, and the vector it comes from is filled where
+the factors are computed. The non-__IOS__ build is byte-for-byte unchanged —
+the interpolation call still takes the same expression it always did.
+
 --- a/src/port/Engine.cpp
 +++ b/src/port/Engine.cpp
-@@ -421,6 +421,109 @@
+@@ -394,6 +394,148 @@
  //     Instance->context->GetWindow()->MainLoop(run_one_game_iter);
  // }
  
@@ -38,6 +53,17 @@ factor) healthy; wall>>expected with low eng = CPU outside the render call.
 +extern "C" void SohIos_UploadStats(float* ms, unsigned int* count);
 +extern "C" void SohIos_LibWindowStats(float* ms, unsigned int* count);  // 0034 async shaders
 +extern "C" void SohIos_PsoWindowStats(float* ms, unsigned int* count);  // 0034 async shaders
++// SOH_IOS (overlay 0014 rev2, VR R17-A item 1): the WALK's interpolation
++// factor, published for the VR seat. 1.0 is the key frame (the game frame just
++// simulated); anything less is an interpolated sub-frame between the previous
++// game frame and this one. Shell-owned global, like every other export in this
++// port; on a non-VR build nothing reads it.
++extern "C" {
++extern volatile float gSohVRWalkT;
++}
++// Filled in ProcessGfxCommands, consumed in RunCommands, index-aligned with
++// mtx_replacements. Same TU, same thread, one game frame apart at most.
++static std::vector<float> sSohIosWalkT;
 +extern "C" int SohIos_MemFootprintMB(void); // shell D8 (jetsam metric)
 +extern std::atomic<int32_t> sSohIosAudMinBuffered;
 +extern std::atomic<int32_t> sSohIosAudMaxBuffered;
@@ -50,6 +76,12 @@ factor) healthy; wall>>expected with low eng = CPU outside the render call.
 +    uint64_t engFrames = 0;  // engine iterations (30 Hz)
 +    uint32_t hudFrames = 0;  // rolling 1 s window for the shell's perf HUD
 +    float hudFps = 0.0f;
++    // VR harness (spec D11 pacing triple): the 10 s SOH_PERF line is too
++    // coarse for a live dump, so engine_fps/tick_tps also ride a rolling 1 s
++    // window readable at any instant via SohIos_PacingStats.
++    uint64_t pacEng = 0, pacTick = 0;
++    float pacEngFps = 0.0f, pacTickTps = 0.0f;
++    std::chrono::steady_clock::time_point pacWindowStart = std::chrono::steady_clock::now();
 +    std::chrono::steady_clock::time_point hudWindowStart = std::chrono::steady_clock::now();
 +    std::chrono::steady_clock::time_point lastFrame{};
 +    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
@@ -72,6 +104,17 @@ factor) healthy; wall>>expected with low eng = CPU outside the render call.
 +    void OnEngineFrame() {
 +        engFrames++;
 +        auto now = std::chrono::steady_clock::now();
++        // Rolling 1 s pacing window FIRST — it must keep updating even when
++        // the 10 s report below early-returns.
++        pacEng++;
++        double pacEl = std::chrono::duration<double>(now - pacWindowStart).count();
++        if (pacEl >= 1.0) {
++            pacEngFps = (float)(pacEng / pacEl);
++            pacTickTps = (float)(pacTick / pacEl);
++            pacEng = 0;
++            pacTick = 0;
++            pacWindowStart = now;
++        }
 +        double el = std::chrono::duration<double>(now - lastReport).count();
 +        if (el < 10.0 || frameMs.size() < 8 || engMs.size() < 8) {
 +            return;
@@ -113,21 +156,40 @@ factor) healthy; wall>>expected with low eng = CPU outside the render call.
 +} // namespace SohIosPerf
 +extern "C" void SohIosPerf_OnGameTick(void) {
 +    SohIosPerf::gPerfProbe.ticks++;
++    SohIosPerf::gPerfProbe.pacTick++;
 +}
 +// Rolling 1-second fps for the shell's performance HUD (SYNC WAVE 1).
 +extern "C" void SohIos_HudStats(float* fps) {
 +    *fps = SohIosPerf::gPerfProbe.hudFps;
++}
++// VR harness (spec D11): live rolling engine_fps / tick_tps. Two thirds of
++// the pacing triple; the shell's immersive loop owns present cadence.
++extern "C" void SohIos_PacingStats(float* engFps, float* tickTps) {
++    if (engFps != nullptr) {
++        *engFps = SohIosPerf::gPerfProbe.pacEngFps;
++    }
++    if (tickTps != nullptr) {
++        *tickTps = SohIosPerf::gPerfProbe.pacTickTps;
++    }
 +}
 +#endif
 +
  void GameEngine::RunCommands(Gfx* pool, const std::vector<std::unordered_map<Mtx*, MtxF>>& mtx_replacements) {
      auto wnd = std::dynamic_pointer_cast<Fast::Fast3dWindow>(Ship::Context::GetInstance()->GetWindow());
  
-@@ -436,7 +539,14 @@
+@@ -409,7 +551,22 @@
      interpreter->mInterpolationIndex = 0;
  
      for (const auto& mtxStack : mtx_replacements) {
 +#ifdef __IOS__
++        // SOH_IOS (overlay 0014 rev2, VR R17-A item 1): this walk's own
++        // interpolation factor, before the walk. mInterpolationIndex is reset
++        // to 0 above and incremented once per iteration, so it indexes the
++        // vector ProcessGfxCommands filled in the same order.
++        gSohVRWalkT = (interpreter->mInterpolationIndex >= 0 &&
++                       (size_t) interpreter->mInterpolationIndex < sSohIosWalkT.size())
++                          ? sSohIosWalkT[interpreter->mInterpolationIndex]
++                          : 1.0f;
 +        auto sohIosEngT0 = std::chrono::steady_clock::now();
 +#endif
          wnd->DrawAndRunGraphicsCommands(pool, mtxStack);
@@ -138,7 +200,30 @@ factor) healthy; wall>>expected with low eng = CPU outside the render call.
          interpreter->mInterpolationIndex++;
      }
  
-@@ -495,6 +605,9 @@
+@@ -450,11 +607,22 @@
+     int next_original_frame = fps;
+ 
+     // Get matrix replacements for intermediate frames
++#ifdef __IOS__
++    /* SOH_IOS (overlay 0014 rev2, VR R17-A item 1): record each walk's factor
++     * alongside its matrix set. The interpolation call below is untouched. */
++    sSohIosWalkT.clear();
++#endif
+     while (time + original_fps <= next_original_frame) {
+         time += original_fps;
+         if (time != next_original_frame) {
++#ifdef __IOS__
++            sSohIosWalkT.push_back((float) time / next_original_frame);
++#endif
+             mtx_replacements.push_back(FrameInterpolation_Interpolate((float) time / next_original_frame));
+         } else {
++#ifdef __IOS__
++            sSohIosWalkT.push_back(1.0f); /* the key frame: this game frame */
++#endif
+             mtx_replacements.emplace_back(); // No interpolation for key frames
+         }
+     }
+@@ -468,6 +636,9 @@
          wnd->SetMaximumFrameLatency(1);
      }
      RunCommands(pool, mtx_replacements);

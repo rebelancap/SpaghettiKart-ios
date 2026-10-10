@@ -1,0 +1,121 @@
+Overlay patch 0065 (VR R18-A): the class probe's brackets around the
+PARTICLES (src/code_80057C60.c only -- no earlier patch owns this file, so
+this is a new patch rather than a revision; traps D18/D22).
+
+the user, on 1.0.0.16: "when i use a mushroom, there's still distracting smoke
+and gold dust, which seems to follow where my diverging 2nd shadow is." The
+round's first deliverable is a per-object-class table measured walk by walk
+(overlay 0044 rev15): each class's drawn position against the eye recovered
+from the composed eye matrix. 0054 rev6 brackets the shadow, the kart quad and
+the boost flash in render_player; this brackets every per-slot particle draw
+in render_kart_particles' two helpers:
+
+  func_8006D474  pool 0 (smoke_dust), pool 3 (smoke_dust2: boost sparks, wall
+                 bonk stars, ...), pool 1 (smoke_dust3: drift, ground, grass)
+  func_8006DC54  pool 0 type 7
+
+Each draw is wrapped in G_NOOP 0x70/0x71 with l = (class << 12) | key, class 4
+for the local player's particles (playerId 0, screen 0) and 7 for everybody
+else's, key = (playerId << 8) | (pool tag << 4) | slot. 0044 rev15 takes the
+first modelview load inside the bracket (func_800652D4's AddEffectMatrix) as
+that particle's drawn position. A slot with nothing to draw emits an empty
+bracket, which 0044 ignores.
+
+Emitted ONLY while the dev knob gSohVRClassProbe is set; every shipped build
+and every flat frame emit nothing, so the display list is byte-for-byte
+unchanged and the macOS build compiles none of it (__IOS__).
+
+
+--- a/src/code_80057C60.c
++++ b/src/code_80057C60.c
+@@ -12,6 +12,30 @@
+ #include "camera.h"
+ #include "code_80057C60.h"
+ #include "main.h"
++#ifdef __IOS__
++// SOH_IOS (overlay 0065, VR R18-A): the class probe's particle brackets
++// (dev only; see the patch header and overlay 0044 rev15).
++extern volatile int gSohVRClassProbe;
++static void sohvr_cp_part_tag(int sohBegin, int sohCls, int sohKey) {
++    Gfx* sohTag = gDisplayListHead++;
++    sohTag->words.w0 = (uintptr_t) ((G_NOOP << 24) | ((sohBegin ? 0x70 : 0x71) << 16) |
++                                    ((sohCls & 0xF) << 12) | (sohKey & 0xFFF));
++    sohTag->words.w1 = 0;
++}
++#define SOHVR_CP_PART_OPEN(pool, slot)                                                       \
++    do {                                                                                     \
++        if (gSohVRClassProbe) {                                                              \
++            sohvr_cp_part_tag(1, (playerId == 0 && screenId == 0) ? 4 : 7,                   \
++                              (((playerId) & 0xF) << 8) | (((pool) & 0xF) << 4) | ((slot) & 0xF)); \
++        }                                                                                    \
++    } while (0)
++#define SOHVR_CP_PART_CLOSE()                                                                \
++    do {                                                                                     \
++        if (gSohVRClassProbe) {                                                              \
++            sohvr_cp_part_tag(0, 0, 0);                                                      \
++        }                                                                                    \
++    } while (0)
++#endif
+ #include "actors.h"
+ #include "code_800029B0.h"
+ #include "racing/memory.h"
+@@ -6322,6 +6346,9 @@
+     if ((player->unk_002 & (SIDE_OF_KART << (screenId * 4))) == (SIDE_OF_KART << (screenId * 4))) {
+         for (var_s2 = 0; var_s2 < 10; var_s2++) {
+             // @port: Tag the transform.
++#ifdef __IOS__
++            SOHVR_CP_PART_OPEN(0, var_s2);
++#endif
+             FrameInterpolation_RecordOpenChild("smoke_dust", TAG_SMOKE_DUST((playerId << 8) | (screenId << 4) | var_s2));
+             switch (player->particlePool0[var_s2].type) {
+                 case 1:
+@@ -6344,6 +6371,12 @@
+                     break;
+             }
+             FrameInterpolation_RecordCloseChild();
++#ifdef __IOS__
++            SOHVR_CP_PART_CLOSE();
++#endif
++#ifdef __IOS__
++            SOHVR_CP_PART_OPEN(3, var_s2);
++#endif
+             FrameInterpolation_RecordOpenChild("smoke_dust2", TAG_SMOKE_DUST((playerId << 8) | (screenId << 4) | var_s2));
+             switch (player->particlePool3[var_s2].type) {
+                 case 1:
+@@ -6407,6 +6440,12 @@
+                     break;
+             }
+             FrameInterpolation_RecordCloseChild();
++#ifdef __IOS__
++            SOHVR_CP_PART_CLOSE();
++#endif
++#ifdef __IOS__
++            SOHVR_CP_PART_OPEN(1, var_s2);
++#endif
+             FrameInterpolation_RecordOpenChild("smoke_dust3", TAG_SMOKE_DUST((playerId << 8) | (screenId << 4) | var_s2));
+             switch (player->particlePool1[var_s2].type) {
+                 case DRIFT_PARTICLE:
+@@ -6451,6 +6490,9 @@
+             }
+             // @port Pop the transform id.
+             FrameInterpolation_RecordCloseChild();
++#ifdef __IOS__
++            SOHVR_CP_PART_CLOSE();
++#endif
+         }
+     }
+     if ((gModeSelection == BATTLE) && (player->unk_002 & (UNK_002_UNKNOWN_0x2 << (screenId * 4)))) {
+@@ -6466,7 +6508,13 @@
+     if (bitwiseMask == (player->unk_002 & bitwiseMask)) {
+         for (i = 0; i < 10; i++) {
+             if (player->particlePool0[i].type == 7) {
++#ifdef __IOS__
++                SOHVR_CP_PART_OPEN(4, i);
++#endif
+                 func_800658A0(player, playerId, i, screenId);
++#ifdef __IOS__
++                SOHVR_CP_PART_CLOSE();
++#endif
+             }
+         }
+     }

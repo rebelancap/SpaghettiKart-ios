@@ -3,7 +3,9 @@
 Play **Mario Kart 64** on your iPhone and Apple Vision Pro — all the cups and battle
 courses with the SpaghettiKart enhancements menu, HD/4K texture packs, game controllers
 and a tunable touch layout, and on Vision Pro a stereoscopic **3D mode** that puts the
-race on a world-locked panel floating in your room with real depth.
+race on a world-locked panel floating in your room with real depth. New in 1.1.0,
+**VR mode** goes fully immersive: race from the driver's seat (first person), from beside
+your kart (third person), or over a tabletop diorama of the whole track.
 
 Built on [SpaghettiKart](https://github.com/HarbourMasters/SpaghettiKart) (Harbour
 Masters' native Mario Kart 64 port) and
@@ -96,6 +98,11 @@ Turn it back off to compare against vanilla.
   with foveated rendering for full-resolution clarity where you're looking, spatial audio
   anchored to the screen, and live-tunable stereo depth, focus, screen size/distance/height,
   surroundings dimming, and a recenter button
+- **Apple Vision Pro VR mode:** fully immersive racing in first person (the driver's seat),
+  third person (beside your kart), or Diorama (the whole track as a tabletop model) —
+  with rear-view panes (one above the HUD, one on your left hand with a PlayStation VR2
+  Sense controller), live-adjustable HUD height, a world-locked sky, gamepad and Sense
+  controller support, and a recenter / recalculate-height button
 
 ## Requirements
 

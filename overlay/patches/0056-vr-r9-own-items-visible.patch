@@ -1,0 +1,134 @@
+Overlay patch 0056: your OWN items, in first person (VR R9 item 5, the user's
+addendum — "make sure we can see the 3 shells going around ourself").
+
+the user has never once seen his own triple shells in the headset, and compared
+ours unfavourably against RaYRoD's MK64 VR on exactly this. Nothing culls them:
+0048 already stands the angle cull down in VR, `is_within_render_distance`
+passes 0 as the minimum distance so there is no near reject at all, and 0054
+deliberately skips only the local player's kart QUAD. They are drawn. They are
+just drawn in a way that cannot be seen from inside the kart, for two
+independent reasons, and both are fixed here.
+
+  1. THE BILLBOARD MODEL IS WRONG AT COCKPIT RANGE (src/racing/actors.c).
+
+     `sBillBoardMtx` is ONE shared Y rotation, built once per frame for every
+     course billboard, and overlay 0051 re-keyed it to the composed EYE YAW.
+     That makes every quad's normal parallel to the eye's FORWARD vector — it
+     faces the view DIRECTION, not the object→eye direction. For a tree 2000
+     units away those are the same to within a degree. For a shell orbiting
+     EIGHT GAME UNITS from an eye that is sitting inside the kart, the
+     object→eye direction is 60-90 degrees off forward, so the quad is
+     violently foreshortened and goes EXACTLY EDGE-ON (zero width) whenever the
+     shell is at your 3 or 9 o'clock. Worse, the world pass runs with
+     G_CULL_BACK and the actor pass never clears it, so past 90 degrees the
+     quad is not merely thin — it is culled outright.
+
+     Note the asymmetry inside 0051 that this repairs: its item 1 re-keyed the
+     POSITIONAL kart billboards to the eye POSITION
+     (`atan2s(pos - gSohVREyePosGame)`, player_controller.c), while its item 2
+     gave sBillBoardMtx only an eye-YAW re-key. Every sBillBoardMtx consumer
+     therefore got the far-field fix and not the near-field one — and your own
+     items are the only sBillBoardMtx objects that are ever at cockpit range,
+     which is precisely why nothing else ever exposed it.
+
+     `render_actor_shell` builds a PER-OBJECT facing from the eye POSITION when
+     the shell is inside SOH_VR_NEARFIELD units of the eye, into a LOCAL matrix
+     — the caller's `Mat4` is the shared sBillBoardMtx and writing the rotation
+     back into it would poison every actor drawn after this one. Distant shells
+     keep the shared matrix and its cost, exactly as before.
+
+REV 2 (VR R10 item 4) — THE CUSTOM ORBIT IS GONE.
+
+rev1 also widened the local player's triple-shell orbit to 40 units and raised
+it to +6 for VR first person, because MK64's authored orbit (radius 8, ~1.75
+below the kart origin, drawn ~3 lower again) puts the ring under the driver's
+lap when the eye is 12 units up. That was sim-tuned, and the headset's verdict
+on 1.0.0.6 was unambiguous: "way too high off the ground, rotates WAY too fast,
+faint — just make them look normally how they do in the game in regular play."
+
+Both complaints are the same number. `shell->rotAngle` advances by the game's
+own `parent->rotVelocity` either way, so the ANGULAR speed was never changed —
+but a 40-unit radius sweeps five times the arc length of an 8-unit one at the
+same angular rate, and a billboard authored for a chase camera 200 units back
+is enormous at 40. Widening the ring made it look fast and made it look wrong,
+and it also widened the shells' COLLISION radius, which was always the trade.
+
+So rev2 deletes the custom placement outright. MK64's own orbit — position,
+radius, height, angular speed and opacity — renders exactly as it does in flat
+play, and the ONLY thing this patch still does is fix 1 below: face the quad at
+the composed eye when it is close enough for the shared view-direction matrix
+to be visibly wrong. That was the genuine bug; the orbit was a guess.
+
+The held/trailing item is deliberately NOT moved: a held shell sits ~11.75
+units behind the kart, which is behind your head, and behind is where a held
+item belongs. Fix 1 makes it face you properly when you look back or catch it
+in the rear-view pane.
+
+
+--- a/src/racing/actors.c
++++ b/src/racing/actors.c
+@@ -775,10 +775,23 @@
+ 
+ #include "actors/kiwano_fruit/render.inc.c"
+ 
++#ifdef __IOS__
++// SOH_IOS (overlay 0056, VR R9 item 5): how close an item has to be to the
++// eye before the SHARED view-direction billboard stops being a good enough
++// approximation of a position-facing one. 8 units is the triple-shell
++// orbit; 200 covers anything sharing the cockpit with you without paying
++// for a per-object matrix on the hundreds of distant course billboards.
++#define SOH_VR_NEARFIELD 200.0f
++#endif
++
+ void render_actor_shell(Camera* camera, Mat4 matrix, struct ShellActor* shell) {
+     u16 index;
+     char* phi_t3;
+     bool reverseShell = false;
++#ifdef __IOS__
++    Mat4 sohNearMtx;
++    Mat4* sohUseMtx = (Mat4*) &matrix[0];
++#endif
+ 
+     size_t actorIdx = CM_FindActorIndex((struct Actor*)shell);
+     if (-1 == actorIdx) {
+@@ -826,7 +839,40 @@
+     matrix[3][1] = (shell->pos[1] - shell->boundingBoxSize) + 1.0f;
+     matrix[3][2] = shell->pos[2];
+ 
++#ifdef __IOS__
++    // SOH_IOS (overlay 0056, VR R9 item 5): a PER-OBJECT facing for items
++    // sharing the cockpit with you. The caller's matrix is the SHARED
++    // sBillBoardMtx, whose single Y rotation faces the eye's forward
++    // DIRECTION — correct to within a degree for a tree 2000 units away,
++    // and exactly edge-on for a shell orbiting 8 units from your head. So
++    // the near-field case builds its own yaw from the eye POSITION, the
++    // same rule overlay 0051 already applies to the kart billboards, into a
++    // LOCAL copy — writing the rotation back into the shared matrix would
++    // poison every actor drawn after this one.
++    if (gSohVREyeKey) {
++        f32 sohDx = shell->pos[0] - gSohVREyePosGame[0];
++        f32 sohDz = shell->pos[2] - gSohVREyePosGame[2];
++        if ((sohDx * sohDx + sohDz * sohDz) < (SOH_VR_NEARFIELD * SOH_VR_NEARFIELD)) {
++            s16 sohYaw = atan2s(sohDx, sohDz);
++            f32 sohS = sins(sohYaw - 0x8000);
++            f32 sohC = coss(sohYaw - 0x8000);
++            s32 sohR, sohCc;
++            for (sohR = 0; sohR < 4; sohR++) {
++                for (sohCc = 0; sohCc < 4; sohCc++) {
++                    sohNearMtx[sohR][sohCc] = matrix[sohR][sohCc];
++                }
++            }
++            sohNearMtx[0][0] = sohC;
++            sohNearMtx[0][2] = -sohS;
++            sohNearMtx[2][0] = sohS;
++            sohNearMtx[2][2] = sohC;
++            sohUseMtx = &sohNearMtx;
++        }
++    }
++    maxObjectsReached = render_set_position(*sohUseMtx, 0) == 0;
++#else
+     maxObjectsReached = render_set_position(matrix, 0) == 0;
++#endif
+     if (maxObjectsReached) {
+         return;
+     }

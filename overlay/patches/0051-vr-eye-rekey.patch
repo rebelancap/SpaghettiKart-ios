@@ -1,0 +1,1502 @@
+Overlay patch 0051: re-key MK64's camera-facing work to the COMPOSED EYE,
+and stand down the remaining angle culls in VR (VR-spec D5/D6, traps
+A2/A3/A7/D6).
+
+MK64 aims three separate families of things at "the camera", and in VR the
+head owns none of them. The shell exports the composed eye — derived from the
+very A*V*P matrix the eyes render with, which is trap A7's rule (RaYRoD burned
+three sm64 patches on a separately-derived eye-facing that over-rotated until
+sprites went edge-on) — and every site below reads it instead:
+
+  1. POSITIONAL billboards. player_controller.c computes each kart's billboard
+     yaw as atan2s(player->pos - camera->pos): the sprite faces the camera
+     POSITION. In first person the eye is metres away from the chase camera,
+     so the karts beside and behind you face the wrong way. Re-keyed to
+     gSohVREyePosGame (the eye, in GAME units).
+
+  2. YAW-KEYED billboards. render_course_actors builds sBillBoardMtx from
+     camera->rot[1] — one Y-rotation shared by every item box, tree and crowd
+     sprite in the course. Re-keyed to gSohVREyeYawBam.
+
+  3. THE SKY (trap D6). SkyCloud/SkyStar place their screen-space sprites at
+     x = 160 + (1.7578125 / (fov + 40)) * (camera->rot[1] + rotY) — a linear
+     yaw -> screen-x mapping. Turn your head in VR and unhandled clouds smear
+     and swim. Re-keyed to the eye yaw AND rebuilt on the EYE frustum's own
+     horizontal FOV (gSohVREyeFovDeg), which is what the sky is actually being
+     rasterised into. Only in gSohVRSkyMode 1 (first person): the Diorama mode
+     still parks the sky in the HUD framebuffer and wipes it, so its sprites
+     are never drawn at all.
+
+  4. ANGLE CULLS. 0048 already widened the one in is_within_render_distance
+     (the chokepoint ~25 cull sites funnel through). code_80086E70.c carries
+     three MORE angle tests that do not — is_object_visible_on_camera and its
+     two siblings — and they are the reason rear geometry still went missing
+     at 180 degrees. Same rule as 0048, verbatim: view-direction culling
+     stands down in VR, distance culling stays.
+
+R16-B (rev6) replaces the sky's LINEAR placement with the TANGENT one, in the
+same block rev2 owns (a regeneration, never a new patch: traps D18/D22).
+docs/vr-r16-diagnosis/clouds.md is the derivation; the short version is that
+rev2 fixed the RATE at the frame CENTRE and left the MAPPING linear, so a cloud
+carried to the rim of this device's 105-degree eye by a head turn slides ~10
+degrees against the trees under it and a quarter of the frame width. Three
+changes, all inside the `gSohVREyeKey && gSohVRSkyMode` branch:
+
+  * PLACEMENT. mX = 160*(1 + (2*tan(cameraRot) - tanSum)/span), with tanSum and
+    span the shell's published tangents for EYE 0 -- the one reference frustum
+    the single sprite layout is built in. Its value AND slope at cameraRot = 0
+    are rev2's published centre and rate exactly, so this is a strict
+    generalisation of what shipped rather than a replacement for it. Guarded at
+    85 degrees, where tanf explodes and a sprite has no finite projection.
+  * BOUNDS. The fov-derived mUnk208/mUnk210 keep sprites 17 degrees past the
+    edge of a frustum that only reaches +45 (they read +/-77 against an eye
+    that sees -60..+45), which with the linear compression is why clouds crowd
+    the rim and linger there. The VR branch culls on the eye's OWN tangents
+    instead -- the UNION of both eyes plus a sprite half-width, because a sprite
+    culled out of one eye only is a stereo-rivalry bug of its own.
+  * THE POSE IT IS BUILT WITH. rev2 read gSohVREyeYawBam, a global the
+    compositor rewrites at 90-120 Hz, from the GAME update at ~28 Hz -- so the
+    clouds were keyed to a head pose the world's own matrices never used
+    (clouds.md M3: 3-9 degrees of slide WHILE THE HEAD IS MOVING, which is
+    the user's report to the letter). rev6 reads the R16-A frame SNAPSHOT's
+    mirror instead, and records the yaw it built with in gSohVRSkyBuiltYawBam
+    so 0044 rev11 can difference it against the frame it actually draws and
+    fold the remainder into the same per-eye term. `vr set skylatch 0` restores
+    the live read on BOTH sides at once, which is the red control.
+
+gSohVRSkyTan is the A/B: 0 leaves rev2's lines standing untouched, which is the
+1.0.0.12 behaviour the off-centre falsifier must FAIL on. gSohVRSkyRate 0 still
+restores the 1.0.0.11 linear mapping ahead of both.
+
+R17-B (rev7) STOPS CORRECTING THE ORTHO LAYOUT AND REPLACES IT (clouds.md §7's
+H5). the user, on 1.0.0.13 -- the fourth build to correct this sky: "the clouds in
+my vr world still move around as i move my head, they even rotate as i rotate my
+head, meaning i can make a cloud turn on its side. plus they shake in place as i
+look left and right." Three residuals, all structural to CORRECTING a
+screen-space layout rather than replacing it: the rim residual of a first-order
+dtheta term; roll, which the ortho path cannot express per sprite; and the
+30 Hz staircase of a layout rebuilt at GAME rate under a correction applied at
+COMPOSITOR rate.
+
+In gSohVRSkyDome each cloud and star is emitted as a WORLD-SPACE BILLBOARD on a
+dome of radius gSohVRSkyDomeR centred on the eye, through the ordinary matrix
+stack, and DrawSkyActors (overlay 0058 rev5) re-loads the game's own world->clip
+projection for the span -- so the eye pass substitutes the SAME per-eye A*V*P it
+draws the trees with. M1-M5 vanish by construction: no yaw->pixel mapping to get
+wrong, each eye projects its own frustum, roll falls out, and the sprites' world
+positions do not depend on the head at all, so nothing can shake when the head
+moves. The conversion from MK64's authored (rotY, posY, scalePercent) to
+(azimuth, elevation, angular size) is derived in the code comment beside
+soh_ios_sky_dir; the SIGN of the azimuth is the game's own mapping and nothing
+else. `vr set skydome 0` restores every rev6 line above within the same game
+frame, on the same binary, and that is this round's red control (trap D20).
+
+R4 (rev3) adds the PHYSICAL THROW's vote (spec D13). MK64 already makes a
+binary forward/backward decision at item release, reading the stick; the Sense
+gesture layer casts that same vote from the hand's velocity at the instant of
+release. The three decision sites are the SAME three rev2 instruments — which
+is why this is a regeneration and not a new patch — and each keeps its original
+stick test intact: the wrapper only overrides when the shell has actually voted
+(gSohVRThrowDir != 0), so a gesture that declines to vote, a gamepad player, and
+every non-VR build all behave exactly as before.
+
+R3 (rev2) adds one more export, for the rear-view pane's auto-show
+(spec D12): gSohVRRearItemSeq, a monotone counter bumped whenever the
+1P kart puts an item out BEHIND it. MK64 makes the distinction cleanly and
+in exactly three places, all of them a released HELD item:
+
+  * a held green shell released with the stick pulled back past
+    THROW_SHELL_BACKWARDS (-45) is thrown BACKWARD — counted. Released
+    without that, the same shell becomes RELEASED_SHELL and fires FORWARD
+    — not counted, which is the spec's "a forward fire does not".
+  * a dragged banana released without the stick forward is dropped behind
+    — counted. With the stick forward (>30, small X) it is thrown ahead —
+    not counted.
+  * the same test on a banana-bunch banana: drop = counted, forward throw
+    = not.
+
+Red and blue shells have no backward release in MK64 (they always leave
+forward), so there is nothing to instrument there. Player 1 only: the
+pane is the 1P kart's mirror.
+
+The eye-facing gate is gSohVREyeKey, which the loop sets ONLY for VR world
+frames and ONLY while the game is not paused — trap A7's second half (the
+donor's pause screen inherited eye-facing and broke). Flat, 3D-panel and iOS
+builds never set it, so they are byte-identical in behaviour.
+
+All exports are shell-owned globals (SohIosShell.m); extern "C" decls at FILE
+scope in the C++ TUs (block-scope externs namespace-mangle — the project's
+recurring linkage trap). __IOS__-guarded: the macOS build links no shell.
+
+
+--- a/src/player_controller.c
++++ b/src/player_controller.c
+@@ -23,6 +23,44 @@
+ #include "port/Game.h"
+ #include "src/enhancements/moon_jump.h"
+ #include "engine/Matrix.h"
++#ifdef __IOS__
++// SOH_IOS (overlay 0051): the composed VR eye, published by the shell.
++extern volatile int gSohVREyeKey;          // 1 = re-key to the eye
++extern volatile float gSohVREyePosGame[3]; // eye position, GAME units
++extern volatile int gSohVREyeYawBam;       // eye yaw, MK64 binary angles
++extern volatile int gSohVRAngleCullOff;    // 1 = angle culls stand down
++extern volatile int gSohVRKartSpin;        // 1 = the kart is spinning
++extern volatile int gSohVRKartAirborne;    // R7: 1 = wheels off the ground
++extern volatile unsigned int gSohVRSpinEffectMask; // rev5: the spin mask
++// SOH_IOS (overlay 0051 rev5, VR R10 item 5): EVERY spin class, not just
++// the two rev4 knew about. the user, 1.0.0.6: with "Realistic Spins" OFF he
++// STILL got a realistic spin off a banana — because a banana does not raise
++// any of the flags rev4 tested. src/effects.c is explicit about it:
++//   * func_8008CDC0 (HIT_BANANA_TRIGGER) sets effects 0x800 and NOTHING
++//     else — no DRIVING_SPINOUT, no HIT_BY_ITEM_EFFECT.
++//   * func_8008C73C, the generic spin-out entry the banana path and the
++//     erratic-driving path both end in, sets effects 0x40 or 0x80 ("spinning
++//     out, facing right / facing left"). audio/external.c groups 0x40 with
++//     DRIVING_SPINOUT, and code_80057C60.c groups 0x800 with it, so the
++//     game itself treats these as the same state.
++//   * func_8008C528 (LOW_TUMBLE_TRIGGER, a green shell) sets effects 0x400.
++// So three of the five ways to lose control were invisible to the comfort
++// hold. HIT_EFFECT (a wall scrape) and 0x8 (airborne) stay OUT — rev4
++// explains at length why holding the horizon for those is the bug, not the
++// fix.
++#define SOH_VR_SPIN_EFFECTS (0x40 | 0x80 | 0x400 | 0x800 | HIT_BY_ITEM_EFFECT | LIGHTNING_EFFECT)
++extern volatile unsigned int gSohVRRearItemSeq; // ++ on a REARWARD item
++extern volatile int gSohVRThrowDir;        // R4: 0 none, 1 fwd, 2 back
++// SOH_IOS (overlay 0051 rev3, spec D13): the physical throw's vote. The
++// gesture layer sets gSohVRThrowDir on the frame the item hand lets go and
++// clears it immediately after; 0 means MK64's own stick test stands, which
++// is what every non-VR build and every gamepad player gets.
++#define SOHVR_THROW_BACK(expr) (gSohVRThrowDir ? (gSohVRThrowDir == 2) : (expr))
++#define SOHVR_THROW_FWD(expr) (gSohVRThrowDir ? (gSohVRThrowDir == 1) : (expr))
++#else
++#define SOHVR_THROW_BACK(expr) (expr)
++#define SOHVR_THROW_FWD(expr) (expr)
++#endif
+ 
+ extern s32 D_8018D168;
+ 
+@@ -492,6 +530,54 @@
+     s32 var_t0;
+     u16 var_a0;
+ 
++#ifdef __IOS__
++    // SOH_IOS (overlay 0051, trap A6): the player kart's spin/tumble
++    // state, for the shell's fixed-horizon comfort filter. This site
++    // runs once per player per screen every rendered frame, so player 1
++    // on screen 0 is exactly the 1P kart VR is seated in.
++    //
++    // R7 (rev4) — THE COCKPIT-LOCK BUG. rev3 also raised this flag on
++    // `effects & 0x8` and HIT_EFFECT. Neither is a spin:
++    //   * 0x8 is the AIRBORNE bit. player_controller.c sets it every
++    //     frame the kart is off the ground (lines 2045 / 2310 / 4705)
++    //     and clears it the frame surfaceDistance[2] <= 0. Every hop,
++    //     every bump, every drift-hop raised it — and the shell's
++    //     comfort filter answers a raised spin flag by HOLDING the
++    //     world's yaw and easing back over 0.45 s. On a real track that
++    //     is most of the lap, so the composed view yaw never followed
++    //     the kart: the seat rode the kart while the gaze stayed where
++    //     the last landing left it. the user, 1.0.0.3: "i'm still a
++    //     camera around my driver, and i rotate around him rather than
++    //     actually BE him... i start driving into a wall without even
++    //     seeing the wall."
++    //   * HIT_EFFECT (0x4000000) is "hitting an object" — every wall
++    //     scrape. A scrape does not revolve the camera; holding the
++    //     horizon for it is the same disorientation in miniature.
++    // What stays is what actually whips the camera through a
++    // revolution: the spinouts, an item hit, and lightning.
++    if ((playerId == 0) && (screenId == 0)) {
++        gSohVRKartSpin =
++            (((player->kartProps & (DRIVING_SPINOUT | EARLY_SPINOUT_RIGHT | EARLY_SPINOUT_LEFT)) != 0) ||
++             ((player->effects & SOH_VR_SPIN_EFFECTS) != 0))
++                ? 1
++                : 0;
++        gSohVRKartAirborne = ((player->effects & 0x8) != 0) ? 1 : 0;
++        // SOH_IOS (overlay 0051 rev5): publish the MASK ITSELF, so the
++        // suite can assert which spin classes the comfort hold covers
++        // without waiting for a banana. The value comes from the
++        // compiled macro, so the assert cannot pass against a stale
++        // build the way a hand-copied constant could.
++        gSohVRSpinEffectMask = (unsigned int) SOH_VR_SPIN_EFFECTS;
++    }
++    // SOH_IOS (overlay 0051, trap A7): in VR the kart billboards face the
++    // composed EYE, not the chase camera they were authored against. In
++    // first person those are metres apart, which is the difference
++    // between a solid kart and an edge-on sliver.
++    if (gSohVREyeKey) {
++        player->unk_048[screenId] = atan2s(player->pos[0] - gSohVREyePosGame[0],
++                                          player->pos[2] - gSohVREyePosGame[2]);
++    } else
++#endif
+     player->unk_048[screenId] = atan2s(player->pos[0] - camera->pos[0], player->pos[2] - camera->pos[2]);
+     player->animFrameSelector[screenId] =
+         (u16) ((((player->unk_048[screenId]) + player->rotation[1] + player->unk_0C0))) / 128;
+--- a/src/racing/actors.c
++++ b/src/racing/actors.c
+@@ -6,6 +6,44 @@
+ #include <align_asset_macro.h>
+ #include <sounds.h>
+ #include <common_structs.h>
++#ifdef __IOS__
++// SOH_IOS (overlay 0051): the composed VR eye, published by the shell.
++extern volatile int gSohVREyeKey;          // 1 = re-key to the eye
++extern volatile float gSohVREyePosGame[3]; // eye position, GAME units
++extern volatile int gSohVREyeYawBam;       // eye yaw, MK64 binary angles
++extern volatile int gSohVRAngleCullOff;    // 1 = angle culls stand down
++extern volatile int gSohVRKartSpin;        // 1 = the kart is spinning
++extern volatile int gSohVRKartAirborne;    // R7: 1 = wheels off the ground
++extern volatile unsigned int gSohVRSpinEffectMask; // rev5: the spin mask
++// SOH_IOS (overlay 0051 rev5, VR R10 item 5): EVERY spin class, not just
++// the two rev4 knew about. the user, 1.0.0.6: with "Realistic Spins" OFF he
++// STILL got a realistic spin off a banana — because a banana does not raise
++// any of the flags rev4 tested. src/effects.c is explicit about it:
++//   * func_8008CDC0 (HIT_BANANA_TRIGGER) sets effects 0x800 and NOTHING
++//     else — no DRIVING_SPINOUT, no HIT_BY_ITEM_EFFECT.
++//   * func_8008C73C, the generic spin-out entry the banana path and the
++//     erratic-driving path both end in, sets effects 0x40 or 0x80 ("spinning
++//     out, facing right / facing left"). audio/external.c groups 0x40 with
++//     DRIVING_SPINOUT, and code_80057C60.c groups 0x800 with it, so the
++//     game itself treats these as the same state.
++//   * func_8008C528 (LOW_TUMBLE_TRIGGER, a green shell) sets effects 0x400.
++// So three of the five ways to lose control were invisible to the comfort
++// hold. HIT_EFFECT (a wall scrape) and 0x8 (airborne) stay OUT — rev4
++// explains at length why holding the horizon for those is the bug, not the
++// fix.
++#define SOH_VR_SPIN_EFFECTS (0x40 | 0x80 | 0x400 | 0x800 | HIT_BY_ITEM_EFFECT | LIGHTNING_EFFECT)
++extern volatile unsigned int gSohVRRearItemSeq; // ++ on a REARWARD item
++extern volatile int gSohVRThrowDir;        // R4: 0 none, 1 fwd, 2 back
++// SOH_IOS (overlay 0051 rev3, spec D13): the physical throw's vote. The
++// gesture layer sets gSohVRThrowDir on the frame the item hand lets go and
++// clears it immediately after; 0 means MK64's own stick test stands, which
++// is what every non-VR build and every gamepad player gets.
++#define SOHVR_THROW_BACK(expr) (gSohVRThrowDir ? (gSohVRThrowDir == 2) : (expr))
++#define SOHVR_THROW_FWD(expr) (gSohVRThrowDir ? (gSohVRThrowDir == 1) : (expr))
++#else
++#define SOHVR_THROW_BACK(expr) (expr)
++#define SOHVR_THROW_FWD(expr) (expr)
++#endif
+ #include <actor_types.h>
+ #include <defines.h>
+ #include <macros.h>
+@@ -2357,8 +2395,20 @@
+     struct Actor* actor;
+     UNUSED Vec3f sp4C = { 0.0f, 5.0f, 10.0f };
+ 
++#ifdef __IOS__
++    // SOH_IOS (overlay 0051, trap A7): sBillBoardMtx is the single Y
++    // rotation every course billboard (item boxes, trees, crowds) is
++    // built from. Re-key it to the composed eye yaw in VR world frames.
++    s16 sohBbYaw = (s16)camera->rot[1];
++    if (gSohVREyeKey) {
++        sohBbYaw = (s16)gSohVREyeYawBam;
++    }
++    f32 sp48 = sins(sohBbYaw - 0x8000);
++    f32 temp_f0 = coss(sohBbYaw - 0x8000);
++#else
+     f32 sp48 = sins(camera->rot[1] - 0x8000);
+     f32 temp_f0 = coss(camera->rot[1] - 0x8000);
++#endif
+ 
+     sBillBoardMtx[0][0] = temp_f0;
+     sBillBoardMtx[0][2] = -sp48;
+--- a/src/code_80086E70.c
++++ b/src/code_80086E70.c
+@@ -16,6 +16,44 @@
+ #include "code_80057C60.h"
+ #include "defines.h"
+ #include "port/Game.h"
++#ifdef __IOS__
++// SOH_IOS (overlay 0051): the composed VR eye, published by the shell.
++extern volatile int gSohVREyeKey;          // 1 = re-key to the eye
++extern volatile float gSohVREyePosGame[3]; // eye position, GAME units
++extern volatile int gSohVREyeYawBam;       // eye yaw, MK64 binary angles
++extern volatile int gSohVRAngleCullOff;    // 1 = angle culls stand down
++extern volatile int gSohVRKartSpin;        // 1 = the kart is spinning
++extern volatile int gSohVRKartAirborne;    // R7: 1 = wheels off the ground
++extern volatile unsigned int gSohVRSpinEffectMask; // rev5: the spin mask
++// SOH_IOS (overlay 0051 rev5, VR R10 item 5): EVERY spin class, not just
++// the two rev4 knew about. the user, 1.0.0.6: with "Realistic Spins" OFF he
++// STILL got a realistic spin off a banana — because a banana does not raise
++// any of the flags rev4 tested. src/effects.c is explicit about it:
++//   * func_8008CDC0 (HIT_BANANA_TRIGGER) sets effects 0x800 and NOTHING
++//     else — no DRIVING_SPINOUT, no HIT_BY_ITEM_EFFECT.
++//   * func_8008C73C, the generic spin-out entry the banana path and the
++//     erratic-driving path both end in, sets effects 0x40 or 0x80 ("spinning
++//     out, facing right / facing left"). audio/external.c groups 0x40 with
++//     DRIVING_SPINOUT, and code_80057C60.c groups 0x800 with it, so the
++//     game itself treats these as the same state.
++//   * func_8008C528 (LOW_TUMBLE_TRIGGER, a green shell) sets effects 0x400.
++// So three of the five ways to lose control were invisible to the comfort
++// hold. HIT_EFFECT (a wall scrape) and 0x8 (airborne) stay OUT — rev4
++// explains at length why holding the horizon for those is the bug, not the
++// fix.
++#define SOH_VR_SPIN_EFFECTS (0x40 | 0x80 | 0x400 | 0x800 | HIT_BY_ITEM_EFFECT | LIGHTNING_EFFECT)
++extern volatile unsigned int gSohVRRearItemSeq; // ++ on a REARWARD item
++extern volatile int gSohVRThrowDir;        // R4: 0 none, 1 fwd, 2 back
++// SOH_IOS (overlay 0051 rev3, spec D13): the physical throw's vote. The
++// gesture layer sets gSohVRThrowDir on the frame the item hand lets go and
++// clears it immediately after; 0 means MK64's own stick test stands, which
++// is what every non-VR build and every gamepad player gets.
++#define SOHVR_THROW_BACK(expr) (gSohVRThrowDir ? (gSohVRThrowDir == 2) : (expr))
++#define SOHVR_THROW_FWD(expr) (gSohVRThrowDir ? (gSohVRThrowDir == 1) : (expr))
++#else
++#define SOHVR_THROW_BACK(expr) (expr)
++#define SOHVR_THROW_FWD(expr) (expr)
++#endif
+ 
+ void func_80086E70(s32 objectIndex) {
+     gObjectList[objectIndex].unk_0AE = 1; // * 0xE0)) = 1;
+@@ -1257,6 +1295,16 @@
+     u16 temp_t3;
+     s32 var_v1;
+ 
++#ifdef __IOS__
++    // SOH_IOS (overlay 0051, spec D5 / traps A2+A3): 0048 widened the
++    // cone in is_within_render_distance; these three angle tests do NOT
++    // funnel through it, and they are why karts and objects behind you
++    // still vanished at 180 degrees. Same rule: direction stands down in
++    // VR, distance does not (every distance rejection lives elsewhere).
++    if (gSohVRAngleCullOff) {
++        return 1;
++    }
++#endif
+     var_v1 = 0;
+     temp_t3 = (((u16) camera->rot[1] - gObjectList[objectIndex].direction_angle[1]) + (arg2 >> 1));
+ 
+@@ -1273,6 +1321,11 @@
+     f32 z_diff;
+     s32 var_t0;
+ 
++#ifdef __IOS__
++    if (gSohVRAngleCullOff) {
++        return 1;
++    }
++#endif
+     var_t0 = 0;
+     x_diff = gObjectList[objectIndex].pos[0] - player->pos[0];
+     z_diff = gObjectList[objectIndex].pos[2] - player->pos[2];
+@@ -1291,6 +1344,11 @@
+         return true;
+     }
+ 
++#ifdef __IOS__
++    if (gSohVRAngleCullOff) {
++        return true;
++    }
++#endif
+     var_t0 = false;
+     temp_t2 = (get_angle_between_xy(camera->pos[0], gObjectList[objectIndex].pos[0], camera->pos[2],
+                                     gObjectList[objectIndex].pos[2]) +
+--- a/src/engine/sky/SkyCloud.cpp
++++ b/src/engine/sky/SkyCloud.cpp
+@@ -18,6 +18,321 @@
+ #include "render_objects.h"
+ }
+ 
++#ifdef __IOS__
++#include <math.h>
++// SOH_IOS (overlay 0051): FILE-scope extern "C" — block-scope externs
++// namespace-mangle in C++ (the project's recurring linkage trap).
++extern "C" {
++extern volatile int gSohVREyeKey;
++extern volatile int gSohVREyeYawBam;
++extern volatile float gSohVREyeFovDeg;
++extern volatile float gSohVRSkyPxPerBam;
++extern volatile float gSohVRSkyPxCenter;
++extern volatile int gSohVRSkyMode;
++// SOH_IOS (overlay 0051 rev6, VR R16-B): the tangent mapping, the pose it
++// is built with, and the yaw it was built with going back out. All of the
++// Snap* values are the R16-A frame snapshot's mirror -- ONE coherent copy
++// of ONE head pose, latched at the head of the graphics frame -- rather
++// than four live globals sampled at four different instants.
++extern volatile int gSohVRSkyTan;
++extern volatile int gSohVRSkyRate;
++extern volatile int gSohVRSkyLatch;
++extern volatile unsigned int gSohVRSnapId;
++extern volatile int gSohVRSnapEyeYawBam;
++extern volatile float gSohVRSnapSkyTanSum;
++extern volatile float gSohVRSnapSkySpan;
++extern volatile float gSohVRSnapSkyTanLo;
++extern volatile float gSohVRSnapSkyTanHi;
++extern volatile int gSohVRSkyBuiltYawBam;
++extern volatile unsigned int gSohVRSkyBuilds;
++// SOH_IOS (overlay 0051 rev7, VR R17-B): H5 -- the clouds and stars become
++// WORLD-SPACE BILLBOARDS on a dome centred on the eye. See the patch
++// header. gSohVRSkyDome 0 restores every rev6 line above, which is
++// 1.0.0.13's sky end to end and this round's RED CONTROL.
++extern volatile int gSohVRSkyDome;
++extern volatile float gSohVRSkyDomeR;
++extern volatile float gSohVRSkyDomeRUsed;
++// rev8 (R17-C): the bound's own two numbers, and its red/fault pair.
++extern volatile float gSohVRSkyDomeEyeMax;
++extern volatile float gSohVRSkyDomeEyeFault;
++extern volatile int gSohVRSkyDomeFloorFault;
++extern volatile float gSohVREyePosGame[3];
++extern volatile unsigned int gSohVRSkyDomeSprites;
++extern volatile int gSohVRSkyProbeTargetBam;
++extern volatile int gSohVRSkyProbeValid;
++extern volatile int gSohVRSkyProbeOrtho;
++extern volatile float gSohVRSkyProbeDir[3];
++extern volatile float gSohVRSkyProbePos[3];
++extern volatile float gSohVRSkyProbeUp[3];
++extern volatile float gSohVRSkyProbeAzDeg;
++extern volatile float gSohVRSkyProbeElDeg;
++extern volatile float gSohVRSkyProbeHalfDeg;
++}
++#include "engine/Matrix.h"
++// SOH_IOS (overlay 0051 rev7, VR R17-B) -- THE DOME, in one place.
++//
++// MK64 authors a sky sprite as (rotY, posY, scalePercent) and places it at
++//   x_px = pxCentre + (320/fovDeg per degree) * (cameraYaw + rotY)
++//   y_px = arg0 - posY,  with the game's horizon at screen->cameraHeight
++// in a guOrtho(0,320,0,240) screen whose ob y maps to ndc 2*y/240 - 1.
++// Those are ANGLES wearing pixels: the mapping is exactly fovDeg degrees
++// across 320 px, and 320x240 covers a 4:3 screen, so one ortho pixel is
++// the same angle on both axes. The conversion is therefore forced, not
++// invented:
++//   azimuth  = -rotY                          (BAM; see below)
++//   elevation= the angle at which the GAME CAMERA'S OWN PROJECTION puts
++//              ortho row (arg0 - posY), minus the angle it puts the
++//              horizon row (screen->cameraHeight) at
++//   size     = R * (2/240) * tan(fovy/2) world units per ortho pixel
++//
++// AZIMUTH'S SIGN comes from the game's own mapping and nothing else:
++// cameraRot = eyeYaw + rotY and screen x INCREASES with cameraRot, while a
++// world direction at azimuth A sits at an off-heading angle A - eyeYaw. For
++// the two to describe the same sprite, A = -rotY and screen RIGHT is
++// DECREASING azimuth -- which is why the eye-0 falsifier in SohImmersive.m
++// evaluates the sprite mapping at -delta when it projects the world at
++// +delta, and it has been green there since R16-B. Horizontally MK64's
++// authoring is LINEAR in the angle, so the azimuth is the authored number
++// exactly -- there is nothing to invert.
++//
++// ELEVATION IS NOT. Vertically MK64 does not author an angle at all: it
++// places a PIXEL ROW in the screen its own perspective camera rasterises
++// into, so the angle is whatever that camera's projection makes of the row,
++// and recovering it is an inversion of guPerspective and nothing more:
++//   ndc_y(ob) = 1 - 2*ob/240        (MEASURED -- see below)
++//   theta(ob) = atan(ndc_y(ob) * tan(fovy/2)),  fovy = camera->fieldOfView
++//   elevation = theta(arg0 - posY) - theta(cameraHeight)
++// so the sprite keeps the elevation ABOVE THE HORIZON the flat game gives
++// it, which is the one property a dome-on/dome-off screenshot pair can
++// settle. The SIGN of that ndc mapping was measured, not assumed: with the
++// dome off, the probe reported the ortho vertex (160, 39) landing at
++// ndc y = +0.4584, and `vr mode` reported sky_ndc_cur = 0.217 for
++// cameraHeight = 146. 1 - 2*39/240 = +0.675, minus R14's -0.217 world-lock
++// shift = +0.458 exactly; 2*39/240 - 1 would have read -0.892. MK64's sky
++// ortho row 0 is the TOP of the screen. (0044 rev8's own comment says the
++// raster flip cancels in the DIFFERENCE it computes, which is why the
++// world-lock shift never had to know this and the dome does.)
++#define SOH_IOS_SKY_DOME_MAXEL 1.4835f  /* 85 degrees: past it, nothing */
++#define SOH_IOS_SKY_DOME_HALFPX 32.0f   /* the 64x32 sprite's half width */
++/* rev8 (R17-C): the s15.16 bound the dome translation must stay inside,
++   and the smallest radius worth emitting one at. */
++#define SOH_IOS_SKY_DOME_MINR 500.0f
++#define SOH_IOS_SKY_DOME_FIXLIM 32000.0f
++static float soh_ios_sky_dome_radius(void);
++static int soh_ios_sky_dome_on(void) {
++    // rev8 (R17-C, from the R17-B code review): the fixed-point headroom is
++    // part of the ARM, not only of the radius. When the eye has less than
++    // SOH_IOS_SKY_DOME_MINR of room left inside the s15.16 range there is no
++    // renderable dome at this eye at all, and the frame falls back to the
++    // ortho sky rather than emitting a translation that wraps.
++    return gSohVREyeKey && gSohVRSkyMode && gSohVRSkyDome && (gSohVRSkyDomeR > 1.0f) &&
++           (soh_ios_sky_dome_radius() >= SOH_IOS_SKY_DOME_MINR);
++}
++// THE RADIUS THE FRAME CAN ACTUALLY CARRY. Fast3D matrices are s15.16
++// FIXED POINT -- interpreter.cpp:2890 unpacks the integer half out of a
++// 16-bit field, and even FrameInterpolation's float replacement path
++// quantises through `(int)(v * 65536.0f)` -- so a translation component
++// past +/-32767 WRAPS. The dome's translation is the eye plus R along a
++// unit vector, so R must leave room for wherever on the course the kart
++// is. Luigi Raceway's eye sits at (-159, -41, -31) and 30000 is safe
++// there; a track that parks the player 20000 units from the origin would
++// have sent every cloud to the other side of the world for one frame, and
++// the failure would have looked like a rendering bug rather than an
++// arithmetic one. Degrade the radius instead: the parallax budget is
++// linear in 1/R and 8000 units is still 0.13 degrees per metre of head
++// translation. gSohVRSkyDomeRUsed is what was actually used, so the
++// telemetry says when the clamp bit.
++// REV8 (R17-C, from the R17-B code review). rev7 applied the 500-unit FLOOR
++// AFTER the headroom CAP, so the floor overrode it: at |eye| > 31500 the cap
++// asked for less than 500 and the floor put 500 back, and at |eye| > 32267
++// the translation `eye + R` left the s15.16 range -- the exact wraparound the
++// cap exists to prevent, produced BY the clamp. The cap is now absolute and
++// the floor is subordinate to it, so `|eye_i| + R <= 32000 < 32767` holds for
++// EVERY eye by construction; below the floor there is no renderable dome and
++// soh_ios_sky_dome_on() drops the arm. gSohVRSkyDomeEyeMax publishes the very
++// |eye| this bound was evaluated at, so the assert is arithmetic on the
++// function's own two published outputs and not on a re-derivation of it.
++// gSohVRSkyDomeEyeFault injects that |eye| (0 = off, every shipped build) --
++// nothing in the port can park a kart 32000 units from the origin, and an
++// assert that can only NOT see something is worthless (trap D11).
++// gSohVRSkyDomeFloorFault 1 restores rev7's order and is the RED CONTROL.
++static float soh_ios_sky_dome_radius(void) {
++    float sohA = fabsf(gSohVREyePosGame[0]);
++    const float sohB = fabsf(gSohVREyePosGame[1]);
++    const float sohC = fabsf(gSohVREyePosGame[2]);
++    if (sohB > sohA) { sohA = sohB; }
++    if (sohC > sohA) { sohA = sohC; }
++    if (gSohVRSkyDomeEyeFault > 0.0f) { sohA = gSohVRSkyDomeEyeFault; }
++    gSohVRSkyDomeEyeMax = sohA;
++    float sohLim = SOH_IOS_SKY_DOME_FIXLIM - sohA;
++    if (sohLim < 0.0f) { sohLim = 0.0f; }
++    float sohR = gSohVRSkyDomeR;
++    if (gSohVRSkyDomeFloorFault) {
++        /* rev7, verbatim: the floor wins over the cap and the bound breaks */
++        if (sohR > sohLim) { sohR = sohLim; }
++        if (sohR < SOH_IOS_SKY_DOME_MINR) { sohR = SOH_IOS_SKY_DOME_MINR; }
++    } else {
++        if (sohR > sohLim) { sohR = sohLim; } /* the cap is ABSOLUTE */
++        if (sohR < SOH_IOS_SKY_DOME_MINR && sohLim >= SOH_IOS_SKY_DOME_MINR) {
++            sohR = SOH_IOS_SKY_DOME_MINR;     /* the floor, never past the cap */
++        }
++    }
++    gSohVRSkyDomeRUsed = sohR;
++    return sohR;
++}
++// The probe sprite is the one nearest the eye's forward THIS frame, chosen
++// by the smallest |cameraRot| -- a quantity both arms compute identically,
++// so the falsifier looks at the same cloud whichever sky is drawn.
++static int sSohIosSkyProbeBest = 0x7FFFFFFF;
++static unsigned int sSohIosSkyProbeGen = 0u;
++// Returns 1 and fills sohDir/sohAz/sohEl when the sprite has a finite
++// direction; 0 when its authored elevation is past the guard (MK64's own
++// tables carry posY values of 0xFFF6 and 0xFFF9, which a u16 field turns
++// into 65526 and 65529 -- sprites the flat game also never shows, because
++// its warp guard skips them off the bottom of the screen).
++static int soh_ios_sky_dir(s32 sohRotY, s32 sohMY, s32 sohArg0, s32 sohCamH, f32 sohFovDeg,
++                           float sohDir[3], float* sohAzOut, float* sohElOut, float* sohTanOut) {
++    float sohFovY = sohFovDeg;
++    if (!(sohFovY > 5.0f && sohFovY < 170.0f)) {
++        sohFovY = 60.0f;
++    }
++    const float sohTanH = tanf(sohFovY * (float)(M_PI / 360.0));
++    const float sohNdcC = 1.0f - (2.0f * (float)(sohArg0 - sohMY)) / 240.0f;
++    const float sohNdcH = 1.0f - (2.0f * (float)sohCamH) / 240.0f;
++    const float sohEl = atanf(sohNdcC * sohTanH) - atanf(sohNdcH * sohTanH);
++    const short sohAzBam = (short)(-(int)(short)(unsigned short)sohRotY);
++    const float sohAz = (float)sohAzBam * (float)(M_PI / 32768.0);
++    if (!(fabsf(sohEl) < SOH_IOS_SKY_DOME_MAXEL) || !isfinite(sohEl)) {
++        return 0;
++    }
++    const float sohCe = cosf(sohEl), sohSe = sinf(sohEl);
++    const float sohCa = cosf(sohAz), sohSa = sinf(sohAz);
++    sohDir[0] = sohSa * sohCe;
++    sohDir[1] = sohSe;
++    sohDir[2] = sohCa * sohCe;
++    if (sohAzOut) { *sohAzOut = sohAz; }
++    if (sohElOut) { *sohElOut = sohEl; }
++    if (sohTanOut) { *sohTanOut = sohTanH; }
++    return 1;
++}
++// The object->world matrix, and the probe publication. Row-vector, exactly
++// like mtxf_translation_x_y_rotate_z_scale_x_y: row 0 is where local +x
++// goes, row 1 local +y, row 3 the translation. Local units ARE ortho pixels
++// (the ortho path multiplies them by mScale and translates in pixels), so
++// one local unit is R*tan(k) world units at the dome.
++//
++// FACING: the quad faces the dome CENTRE with WORLD up, per sprite, in a
++// LOCAL matrix -- never the shared billboard matrix (trap D19). Every
++// sprite faces the centre exactly, so a rolled head sees an upright cloud:
++// that is the user's "i can make a cloud turn on its side" fixed by
++// construction rather than by a correction.
++static int soh_ios_sky_dome_mtx(Mat4 sohM, s32 sohRotY, s32 sohMY, s32 sohArg0, s32 sohCamH,
++                                f32 sohFovDeg, f32 sohScale, s32 sohOrthoX, s32 sohOrthoY,
++                                int sohOrthoArm) {
++    float sohDir[3], sohAz = 0.0f, sohEl = 0.0f, sohK = 0.0f;
++    if (!soh_ios_sky_dir(sohRotY, sohMY, sohArg0, sohCamH, sohFovDeg, sohDir, &sohAz, &sohEl,
++                         &sohK)) {
++        // No finite direction: a ZERO-AREA quad at the eye. It must not
++        // fall back to the ortho placement, because the projection in force
++        // for this span is now the world's -- an ortho vertex would be a
++        // sprite parked near the world origin.
++        for (int sohI = 0; sohI < 4; sohI++) {
++            for (int sohJ = 0; sohJ < 4; sohJ++) {
++                sohM[sohI][sohJ] = 0.0f;
++            }
++        }
++        sohM[3][0] = gSohVREyePosGame[0];
++        sohM[3][1] = gSohVREyePosGame[1];
++        sohM[3][2] = gSohVREyePosGame[2];
++        sohM[3][3] = 1.0f;
++        return 0;
++    }
++    const float sohCa = cosf(sohAz), sohSa = sinf(sohAz);
++    const float sohCe = cosf(sohEl), sohSe = sinf(sohEl);
++    /* screen RIGHT is DECREASING azimuth (see the note above) */
++    const float sohRight[3] = { -sohCa, 0.0f, sohSa };
++    /* right x dir: world up, tilted into the quad's plane. Local +y is
++       ortho +y, and MK64's sky ortho row 0 is the TOP of the screen (the
++       measurement in the note above), so local +y is screen DOWN and row 1
++       is the NEGATIVE of world up. Getting this backwards does not merely
++       mirror the sprite: it reverses the quad's winding, and the first cut
++       of this patch drew eleven billboards a frame that G_CULL_BACK removed
++       -- dome_sprites counted them and not one pixel changed. */
++    const float sohUp[3] = { -sohSa * sohSe, sohCe, -sohCa * sohSe };
++    const float sohR = soh_ios_sky_dome_radius();
++    const float sohS = sohScale * sohR * (2.0f / 240.0f) * sohK;
++    const float sohC[3] = { gSohVREyePosGame[0], gSohVREyePosGame[1], gSohVREyePosGame[2] };
++    const float sohP[3] = { sohC[0] + sohR * sohDir[0], sohC[1] + sohR * sohDir[1],
++                            sohC[2] + sohR * sohDir[2] };
++    for (int sohI = 0; sohI < 3; sohI++) {
++        sohM[0][sohI] = sohRight[sohI] * sohS;
++        sohM[1][sohI] = -sohUp[sohI] * sohS;
++        sohM[2][sohI] = -sohDir[sohI] * sohS;
++        sohM[3][sohI] = sohP[sohI];
++    }
++    sohM[0][3] = 0.0f;
++    sohM[1][3] = 0.0f;
++    sohM[2][3] = 0.0f;
++    sohM[3][3] = 1.0f;
++    (void)sohOrthoX;
++    (void)sohOrthoY;
++    (void)sohOrthoArm;
++    return 1;
++}
++// Publish the probe if this sprite is nearer the eye forward than any other
++// drawn this frame. Runs in BOTH arms and computes the DIRECTION the same
++// way in both, so the truth side of the falsifier never depends on the fix
++// (trap D48). Pos/Up are what the PASS will actually project: the dome
++// point in the dome arm, the ortho vertex in the ortho arm.
++static void soh_ios_sky_probe(s32 sohRotY, s32 sohMY, s32 sohArg0, s32 sohCamH, f32 sohFovDeg,
++                              f32 sohScale, s32 sohOrthoX, s32 sohOrthoY, int sohDomeArm) {
++    if (sSohIosSkyProbeGen != gSohVRSkyBuilds) {
++        sSohIosSkyProbeGen = gSohVRSkyBuilds;
++        sSohIosSkyProbeBest = 0x7FFFFFFF;
++    }
++    const int sohCr = (int)(short)((unsigned short)gSohVRSkyBuiltYawBam + (unsigned short)sohRotY);
++    const int sohOff = sohCr - gSohVRSkyProbeTargetBam;
++    const int sohAbs = (sohOff < 0) ? -sohOff : sohOff;
++    if (sohAbs >= sSohIosSkyProbeBest) {
++        return;
++    }
++    float sohDir[3], sohAz = 0.0f, sohEl = 0.0f, sohK = 0.0f;
++    if (!soh_ios_sky_dir(sohRotY, sohMY, sohArg0, sohCamH, sohFovDeg, sohDir, &sohAz, &sohEl,
++                         &sohK)) {
++        return;
++    }
++    sSohIosSkyProbeBest = sohAbs;
++    const float sohCa = cosf(sohAz), sohSa = sinf(sohAz);
++    const float sohCe = cosf(sohEl), sohSe = sinf(sohEl);
++    const float sohUp[3] = { -sohSa * sohSe, sohCe, -sohCa * sohSe };
++    gSohVRSkyProbeDir[0] = sohDir[0];
++    gSohVRSkyProbeDir[1] = sohDir[1];
++    gSohVRSkyProbeDir[2] = sohDir[2];
++    gSohVRSkyProbeAzDeg = sohAz * (float)(180.0 / M_PI);
++    gSohVRSkyProbeElDeg = sohEl * (float)(180.0 / M_PI);
++    gSohVRSkyProbeHalfDeg = atanf(SOH_IOS_SKY_DOME_HALFPX * sohScale * (2.0f / 240.0f) * sohK) *
++                            (float)(180.0 / M_PI);
++    if (sohDomeArm) {
++        const float sohR = soh_ios_sky_dome_radius();
++        const float sohS = sohScale * sohR * (2.0f / 240.0f) * sohK;
++        for (int sohI = 0; sohI < 3; sohI++) {
++            const float sohPt = gSohVREyePosGame[sohI] + sohR * sohDir[sohI];
++            gSohVRSkyProbePos[sohI] = sohPt;
++            gSohVRSkyProbeUp[sohI] = sohPt + sohUp[sohI] * (sohS * 16.0f);
++        }
++        gSohVRSkyProbeOrtho = 0;
++    } else {
++        gSohVRSkyProbePos[0] = (float)sohOrthoX;
++        gSohVRSkyProbePos[1] = (float)sohOrthoY;
++        gSohVRSkyProbePos[2] = 0.0f;
++        gSohVRSkyProbeUp[0] = (float)sohOrthoX;
++        gSohVRSkyProbeUp[1] = (float)sohOrthoY - 16.0f * sohScale;  /* ortho y is DOWN */
++        gSohVRSkyProbeUp[2] = 0.0f;
++        gSohVRSkyProbeOrtho = 1;
++    }
++    gSohVRSkyProbeValid = 1;
++}
++#endif
+ size_t SkyCloud::_count = 0;
+ 
+ SkyCloud::SkyCloud(ScreenContext* screen, u16 cloudVariant, u16 posY, u16 rotY, u16 scalePercent) : SkyActor(screen) {
+@@ -66,11 +381,131 @@
+     const float cullingFactor = OTRGetAspectRatio();
+ 
+     // Calculate the cloud's rotation relative to the camera
++#ifdef __IOS__
++    // SOH_IOS (overlay 0051 rev6, VR R16-B): armed only when the shell has
++    // published a frustum to build the layout in. Declared out here because
++    // the PLACEMENT below is a second block.
++    int sohSkyVR = 0;
++    // SOH_IOS (overlay 0051, trap D6): in VR first-person the sky is drawn
++    // into the eye framebuffer at infinity, so its yaw -> screen-x mapping
++    // must be the EYE's: the eye yaw in place of the game camera's, and the
++    // eye frustum's own horizontal FOV in place of (fieldOfView + 40).
++    // Without both halves the clouds hold still relative to the kart
++    // instead of relative to the world, which is the swim trap D6 names.
++    {
++        s16 sohSkyYaw = (s16)mScreen->camera->rot[1];
++        if (gSohVREyeKey && gSohVRSkyMode) {
++            sohSkyYaw = (s16)gSohVREyeYawBam;
++            if (gSohVREyeFovDeg > 20.0f && gSohVREyeFovDeg < 200.0f) {
++                mUnk200 = (s16)gSohVREyeFovDeg;
++                mUnk208 = ((mUnk200 / 2) * 0xB6) + 0x71C;
++                mUnk210 = (-(mUnk200 / 2) * 0xB6) - 0x71C;
++                mUnk1E8 = 1.7578125 / mUnk200;
++            }
++            // SOH_IOS (overlay 0051 rev2, VR R15 item 7): the RATE, which
++            // the fov substitution above never fixed. MK64's mapping is
++            // LINEAR -- 1.7578125/fovDeg px per BAM is exactly 320/fovDeg
++            // px per degree, i.e. the whole 320-px screen spans fovDeg --
++            // and the world projects through a TANGENT, so at a 100-degree
++            // eye the sprites slide about 36 percent faster than the
++            // scenery under head yaw. The shell publishes the eye frustum's
++            // own rate (and the screen x a zero-yaw direction lands on,
++            // which is not 160 on an asymmetric frustum); the bounds above
++            // stay keyed to the fov because visibility is angular.
++            if (gSohVRSkyPxPerBam > 0.0f) {
++                mUnk1E8 = gSohVRSkyPxPerBam;
++                mUnk218 = (s16)gSohVRSkyPxCenter;
++            }
++            // SOH_IOS (overlay 0051 rev6, VR R16-B / clouds.md M3): THE
++            // POSE THIS LAYOUT IS BUILT WITH. rev2 read gSohVREyeYawBam --
++            // a global the compositor rewrites at 90-120 Hz -- from the
++            // GAME update at ~28 Hz, so the clouds were keyed to a head
++            // pose no consumer of the eye matrices ever agreed with. The
++            // R16-A snapshot mirror is ONE coherent copy of ONE pose, and
++            // 0044 rev11 differences the yaw recorded below against the
++            // frame it actually draws to close what is left. skylatch 0
++            // restores the live read on BOTH sides, as the red control.
++            if (gSohVRSkyLatch && gSohVRSnapId != 0u) {
++                sohSkyYaw = (s16)gSohVRSnapEyeYawBam;
++            }
++            // SOH_IOS (overlay 0051 rev6): the tangent mapping is armed
++            // only when the shell has published a frustum for it. When it
++            // is not, every rev2 line above stands exactly as it shipped,
++            // which is what makes `skytan 0` a faithful red control.
++            if (gSohVRSkyTan && gSohVRSkyRate && (gSohVRSnapId != 0u) &&
++                (gSohVRSnapSkySpan > 1.0e-4f)) {
++                sohSkyVR = 1;
++            }
++            gSohVRSkyBuiltYawBam = (int)sohSkyYaw;
++            gSohVRSkyBuilds = gSohVRSkyBuilds + 1;
++        }
++        cameraRot = (u16)sohSkyYaw + (u16)mRotY;
++    }
++#else
+     cameraRot = (u16)mScreen->camera->rot[1] + (u16)mRotY;
++#endif
+     // Adjust bounds based on the culling factor
+     s16 adjustedLowerBound = (s16) (mUnk210 * cullingFactor);
+     s16 adjustedUpperBound = (s16) (mUnk208 * cullingFactor);
+ 
++#ifdef __IOS__
++    // SOH_IOS (overlay 0051 rev6, VR R16-B / clouds.md M1 + M4): TANGENT
++    // PLACEMENT, and bounds taken from the eye instead of from the fov.
++    //
++    // MK64 maps yaw to screen x LINEARLY. The world projects through a
++    // TANGENT. rev2 matched the two RATES at the frame CENTRE and stopped
++    // there, which leaves an error of (320/span)*(tan(th) - th) pixels:
++    // 0.2 px at 10 degrees off centre, 6 px at 30, 25 px at 45 and 80 px --
++    // a QUARTER OF THE FRAME, 9.8 degrees of visual angle -- at 60, which
++    // this device's eye 0 reaches. A cloud carried from the centre to the
++    // rim by a head turn slides that far against the trees under it, and
++    // because the error grows with the angle it ACCELERATES outward, which
++    // is the part the eye reads as swimming. In 2D the same error is a
++    // static distortion nobody can see, because the game camera and the sky
++    // share one yaw -- which is exactly why the user reports it only in VR.
++    //
++    // ndc = (2*tan(cameraRot) - tanSum)/span, x_px = 160*(1 + ndc), with
++    // tanSum/span the shell's published tangents for EYE 0. At cameraRot = 0
++    // this is exactly rev2's published centre, and its slope there is
++    // exactly rev2's published rate: nothing that was right stops being
++    // right, and the fix is only what rev2 left linear. The other eye is a
++    // constant NDC offset from this one and is applied by 0044 rev11 in the
++    // eye pass, because there is only ONE layout and two eyes to draw it in.
++    //
++    // BOUNDS. mUnk208/mUnk210 above are +/-((fov/2)*0xB6 + 0x71C)*aspect =
++    // +/-77 degrees on a frustum that reaches -60..+45, so a cloud that
++    // should have left the frame is placed at the very edge and lingers
++    // there. The eye's own tangents are the honest test, taken as the UNION
++    // of both eyes (culling to one would drop a sprite out of one eye only,
++    // which is a stereo-rivalry bug of its own) plus a sprite half-width.
++    if (soh_ios_sky_dome_on()) {
++        // SOH_IOS (overlay 0051 rev7, VR R17-B): THE DOME ARM. There is no
++        // longer a screen-space layout to bound: the sprite is world
++        // geometry and the eye's own FRUSTUM clips it, per eye, exactly.
++        // rev6's tangent-union test existed to keep one eye from culling a
++        // sprite the other could see, which is a question the projection
++        // now answers for itself. mX is left where rev6 put it so
++        // `vr set skydome 0` restores 1.0.0.13 within the same game frame.
++        mVisible = true;
++    } else if (sohSkyVR) {
++        const float sohTh = (float)cameraRot * (float)(M_PI / 32768.0);
++        // Past ~85 degrees there is no finite projection and tanf explodes;
++        // without this guard one frame of mX = +/-INT_MAX is a Fast3D vertex
++        // explosion (clouds.md section 7).
++        if (fabsf(sohTh) < 1.48f) {
++            const float sohT = tanf(sohTh);
++            if ((sohT >= gSohVRSnapSkyTanLo) && (sohT <= gSohVRSnapSkyTanHi)) {
++                mX = (int32_t)lrintf(160.0f * (1.0f + ((2.0f * sohT) - gSohVRSnapSkyTanSum) /
++                                                          gSohVRSnapSkySpan));
++                mVisible = true;
++            } else {
++                mVisible = false;
++            }
++        } else {
++            mVisible = false;
++        }
++    } else
++#endif
+     // Check if the object is within the adjusted bounds
+     if ((cameraRot >= adjustedLowerBound) && (adjustedUpperBound >= cameraRot)) {
+         // Calculate and update the object's X position
+@@ -91,7 +526,17 @@
+     s32 posY = arg0 - mY;
+     func_8004B6C4(255, 255, 255);
+     // Skip drawing the object this frame if it warped to the other side of the screen
++#ifdef __IOS__
++    // SOH_IOS (overlay 0051 rev7, VR R17-B): the warp guard is a property of
++    // the ORTHO layout -- it drops a frame when a sprite jumps half a screen,
++    // which the tangent placement can do near its 85-degree guard. On the dome
++    // there is no mX to jump, and skipping a frame of a world-space billboard
++    // is a hole in the sky, so the guard stands down with the layout it guards.
++    if (!soh_ios_sky_dome_on() &&
++        ((fabs(mX - mOldX) > SCREEN_WIDTH / 2) || (fabs(posY - mOldY) > SCREEN_HEIGHT / 2))) {
++#else
+     if ((fabs(mX - mOldX) > SCREEN_WIDTH / 2) || (fabs(posY - mOldY) > SCREEN_HEIGHT / 2)) {
++#endif
+         mOldX = mX;
+         mOldY = posY;
+         return;
+@@ -103,7 +548,33 @@
+             D_8018D228 = mCloudVariant;
+             func_80044DA0(mTexture, mTextureWidth, mTextureHeight);
+         }
++#ifdef __IOS__
++        // SOH_IOS (overlay 0051 rev7, VR R17-B): H5. In the dome arm the sprite
++        // is emitted as WORLD GEOMETRY through the ordinary matrix stack -- an
++        // object->world matrix here, and the game's own world->clip projection
++        // re-loaded for the whole span by DrawSkyActors (overlay 0058 rev5) --
++        // so the eye pass substitutes the SAME per-eye A*V*P it draws the trees
++        // with (trap A7), and M1-M5 have nowhere left to live. The probe is
++        // published in BOTH arms, from the authored numbers alone (trap D48).
++        {
++            const int sohDome = soh_ios_sky_dome_on();
++            soh_ios_sky_probe((s32)mRotY, (s32)mY, arg0, (s32)screen->cameraHeight,
++                              screen->camera->fieldOfView, mScale, mX, posY, sohDome);
++            if (sohDome) {
++                Mat4 sohM;
++                if (soh_ios_sky_dome_mtx(sohM, (s32)mRotY, (s32)mY, arg0,
++                                         (s32)screen->cameraHeight, screen->camera->fieldOfView,
++                                         mScale, mX, posY, 0)) {
++                    gSohVRSkyDomeSprites = gSohVRSkyDomeSprites + 1;
++                }
++                AddHudMatrix(sohM, G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
++            } else {
++                func_80042330_unchanged(mX, posY, 0, mScale);
++            }
++        }
++#else
+         func_80042330_unchanged(mX, posY, 0, mScale);
++#endif
+         gSPVertex(gDisplayListHead++, (uintptr_t)mVtx, 4, 0);
+         gSPDisplayList(gDisplayListHead++, (Gfx*)common_rectangle_display);
+ 
+--- a/src/engine/sky/SkyStar.cpp
++++ b/src/engine/sky/SkyStar.cpp
+@@ -19,6 +19,321 @@
+ #include "render_objects.h"
+ }
+ 
++#ifdef __IOS__
++#include <math.h>
++// SOH_IOS (overlay 0051): FILE-scope extern "C" — block-scope externs
++// namespace-mangle in C++ (the project's recurring linkage trap).
++extern "C" {
++extern volatile int gSohVREyeKey;
++extern volatile int gSohVREyeYawBam;
++extern volatile float gSohVREyeFovDeg;
++extern volatile float gSohVRSkyPxPerBam;
++extern volatile float gSohVRSkyPxCenter;
++extern volatile int gSohVRSkyMode;
++// SOH_IOS (overlay 0051 rev6, VR R16-B): the tangent mapping, the pose it
++// is built with, and the yaw it was built with going back out. All of the
++// Snap* values are the R16-A frame snapshot's mirror -- ONE coherent copy
++// of ONE head pose, latched at the head of the graphics frame -- rather
++// than four live globals sampled at four different instants.
++extern volatile int gSohVRSkyTan;
++extern volatile int gSohVRSkyRate;
++extern volatile int gSohVRSkyLatch;
++extern volatile unsigned int gSohVRSnapId;
++extern volatile int gSohVRSnapEyeYawBam;
++extern volatile float gSohVRSnapSkyTanSum;
++extern volatile float gSohVRSnapSkySpan;
++extern volatile float gSohVRSnapSkyTanLo;
++extern volatile float gSohVRSnapSkyTanHi;
++extern volatile int gSohVRSkyBuiltYawBam;
++extern volatile unsigned int gSohVRSkyBuilds;
++// SOH_IOS (overlay 0051 rev7, VR R17-B): H5 -- the clouds and stars become
++// WORLD-SPACE BILLBOARDS on a dome centred on the eye. See the patch
++// header. gSohVRSkyDome 0 restores every rev6 line above, which is
++// 1.0.0.13's sky end to end and this round's RED CONTROL.
++extern volatile int gSohVRSkyDome;
++extern volatile float gSohVRSkyDomeR;
++extern volatile float gSohVRSkyDomeRUsed;
++// rev8 (R17-C): the bound's own two numbers, and its red/fault pair.
++extern volatile float gSohVRSkyDomeEyeMax;
++extern volatile float gSohVRSkyDomeEyeFault;
++extern volatile int gSohVRSkyDomeFloorFault;
++extern volatile float gSohVREyePosGame[3];
++extern volatile unsigned int gSohVRSkyDomeSprites;
++extern volatile int gSohVRSkyProbeTargetBam;
++extern volatile int gSohVRSkyProbeValid;
++extern volatile int gSohVRSkyProbeOrtho;
++extern volatile float gSohVRSkyProbeDir[3];
++extern volatile float gSohVRSkyProbePos[3];
++extern volatile float gSohVRSkyProbeUp[3];
++extern volatile float gSohVRSkyProbeAzDeg;
++extern volatile float gSohVRSkyProbeElDeg;
++extern volatile float gSohVRSkyProbeHalfDeg;
++}
++#include "engine/Matrix.h"
++// SOH_IOS (overlay 0051 rev7, VR R17-B) -- THE DOME, in one place.
++//
++// MK64 authors a sky sprite as (rotY, posY, scalePercent) and places it at
++//   x_px = pxCentre + (320/fovDeg per degree) * (cameraYaw + rotY)
++//   y_px = arg0 - posY,  with the game's horizon at screen->cameraHeight
++// in a guOrtho(0,320,0,240) screen whose ob y maps to ndc 2*y/240 - 1.
++// Those are ANGLES wearing pixels: the mapping is exactly fovDeg degrees
++// across 320 px, and 320x240 covers a 4:3 screen, so one ortho pixel is
++// the same angle on both axes. The conversion is therefore forced, not
++// invented:
++//   azimuth  = -rotY                          (BAM; see below)
++//   elevation= the angle at which the GAME CAMERA'S OWN PROJECTION puts
++//              ortho row (arg0 - posY), minus the angle it puts the
++//              horizon row (screen->cameraHeight) at
++//   size     = R * (2/240) * tan(fovy/2) world units per ortho pixel
++//
++// AZIMUTH'S SIGN comes from the game's own mapping and nothing else:
++// cameraRot = eyeYaw + rotY and screen x INCREASES with cameraRot, while a
++// world direction at azimuth A sits at an off-heading angle A - eyeYaw. For
++// the two to describe the same sprite, A = -rotY and screen RIGHT is
++// DECREASING azimuth -- which is why the eye-0 falsifier in SohImmersive.m
++// evaluates the sprite mapping at -delta when it projects the world at
++// +delta, and it has been green there since R16-B. Horizontally MK64's
++// authoring is LINEAR in the angle, so the azimuth is the authored number
++// exactly -- there is nothing to invert.
++//
++// ELEVATION IS NOT. Vertically MK64 does not author an angle at all: it
++// places a PIXEL ROW in the screen its own perspective camera rasterises
++// into, so the angle is whatever that camera's projection makes of the row,
++// and recovering it is an inversion of guPerspective and nothing more:
++//   ndc_y(ob) = 1 - 2*ob/240        (MEASURED -- see below)
++//   theta(ob) = atan(ndc_y(ob) * tan(fovy/2)),  fovy = camera->fieldOfView
++//   elevation = theta(arg0 - posY) - theta(cameraHeight)
++// so the sprite keeps the elevation ABOVE THE HORIZON the flat game gives
++// it, which is the one property a dome-on/dome-off screenshot pair can
++// settle. The SIGN of that ndc mapping was measured, not assumed: with the
++// dome off, the probe reported the ortho vertex (160, 39) landing at
++// ndc y = +0.4584, and `vr mode` reported sky_ndc_cur = 0.217 for
++// cameraHeight = 146. 1 - 2*39/240 = +0.675, minus R14's -0.217 world-lock
++// shift = +0.458 exactly; 2*39/240 - 1 would have read -0.892. MK64's sky
++// ortho row 0 is the TOP of the screen. (0044 rev8's own comment says the
++// raster flip cancels in the DIFFERENCE it computes, which is why the
++// world-lock shift never had to know this and the dome does.)
++#define SOH_IOS_SKY_DOME_MAXEL 1.4835f  /* 85 degrees: past it, nothing */
++#define SOH_IOS_SKY_DOME_HALFPX 32.0f   /* the 64x32 sprite's half width */
++/* rev8 (R17-C): the s15.16 bound the dome translation must stay inside,
++   and the smallest radius worth emitting one at. */
++#define SOH_IOS_SKY_DOME_MINR 500.0f
++#define SOH_IOS_SKY_DOME_FIXLIM 32000.0f
++static float soh_ios_sky_dome_radius(void);
++static int soh_ios_sky_dome_on(void) {
++    // rev8 (R17-C, from the R17-B code review): the fixed-point headroom is
++    // part of the ARM, not only of the radius. When the eye has less than
++    // SOH_IOS_SKY_DOME_MINR of room left inside the s15.16 range there is no
++    // renderable dome at this eye at all, and the frame falls back to the
++    // ortho sky rather than emitting a translation that wraps.
++    return gSohVREyeKey && gSohVRSkyMode && gSohVRSkyDome && (gSohVRSkyDomeR > 1.0f) &&
++           (soh_ios_sky_dome_radius() >= SOH_IOS_SKY_DOME_MINR);
++}
++// THE RADIUS THE FRAME CAN ACTUALLY CARRY. Fast3D matrices are s15.16
++// FIXED POINT -- interpreter.cpp:2890 unpacks the integer half out of a
++// 16-bit field, and even FrameInterpolation's float replacement path
++// quantises through `(int)(v * 65536.0f)` -- so a translation component
++// past +/-32767 WRAPS. The dome's translation is the eye plus R along a
++// unit vector, so R must leave room for wherever on the course the kart
++// is. Luigi Raceway's eye sits at (-159, -41, -31) and 30000 is safe
++// there; a track that parks the player 20000 units from the origin would
++// have sent every cloud to the other side of the world for one frame, and
++// the failure would have looked like a rendering bug rather than an
++// arithmetic one. Degrade the radius instead: the parallax budget is
++// linear in 1/R and 8000 units is still 0.13 degrees per metre of head
++// translation. gSohVRSkyDomeRUsed is what was actually used, so the
++// telemetry says when the clamp bit.
++// REV8 (R17-C, from the R17-B code review). rev7 applied the 500-unit FLOOR
++// AFTER the headroom CAP, so the floor overrode it: at |eye| > 31500 the cap
++// asked for less than 500 and the floor put 500 back, and at |eye| > 32267
++// the translation `eye + R` left the s15.16 range -- the exact wraparound the
++// cap exists to prevent, produced BY the clamp. The cap is now absolute and
++// the floor is subordinate to it, so `|eye_i| + R <= 32000 < 32767` holds for
++// EVERY eye by construction; below the floor there is no renderable dome and
++// soh_ios_sky_dome_on() drops the arm. gSohVRSkyDomeEyeMax publishes the very
++// |eye| this bound was evaluated at, so the assert is arithmetic on the
++// function's own two published outputs and not on a re-derivation of it.
++// gSohVRSkyDomeEyeFault injects that |eye| (0 = off, every shipped build) --
++// nothing in the port can park a kart 32000 units from the origin, and an
++// assert that can only NOT see something is worthless (trap D11).
++// gSohVRSkyDomeFloorFault 1 restores rev7's order and is the RED CONTROL.
++static float soh_ios_sky_dome_radius(void) {
++    float sohA = fabsf(gSohVREyePosGame[0]);
++    const float sohB = fabsf(gSohVREyePosGame[1]);
++    const float sohC = fabsf(gSohVREyePosGame[2]);
++    if (sohB > sohA) { sohA = sohB; }
++    if (sohC > sohA) { sohA = sohC; }
++    if (gSohVRSkyDomeEyeFault > 0.0f) { sohA = gSohVRSkyDomeEyeFault; }
++    gSohVRSkyDomeEyeMax = sohA;
++    float sohLim = SOH_IOS_SKY_DOME_FIXLIM - sohA;
++    if (sohLim < 0.0f) { sohLim = 0.0f; }
++    float sohR = gSohVRSkyDomeR;
++    if (gSohVRSkyDomeFloorFault) {
++        /* rev7, verbatim: the floor wins over the cap and the bound breaks */
++        if (sohR > sohLim) { sohR = sohLim; }
++        if (sohR < SOH_IOS_SKY_DOME_MINR) { sohR = SOH_IOS_SKY_DOME_MINR; }
++    } else {
++        if (sohR > sohLim) { sohR = sohLim; } /* the cap is ABSOLUTE */
++        if (sohR < SOH_IOS_SKY_DOME_MINR && sohLim >= SOH_IOS_SKY_DOME_MINR) {
++            sohR = SOH_IOS_SKY_DOME_MINR;     /* the floor, never past the cap */
++        }
++    }
++    gSohVRSkyDomeRUsed = sohR;
++    return sohR;
++}
++// The probe sprite is the one nearest the eye's forward THIS frame, chosen
++// by the smallest |cameraRot| -- a quantity both arms compute identically,
++// so the falsifier looks at the same cloud whichever sky is drawn.
++static int sSohIosSkyProbeBest = 0x7FFFFFFF;
++static unsigned int sSohIosSkyProbeGen = 0u;
++// Returns 1 and fills sohDir/sohAz/sohEl when the sprite has a finite
++// direction; 0 when its authored elevation is past the guard (MK64's own
++// tables carry posY values of 0xFFF6 and 0xFFF9, which a u16 field turns
++// into 65526 and 65529 -- sprites the flat game also never shows, because
++// its warp guard skips them off the bottom of the screen).
++static int soh_ios_sky_dir(s32 sohRotY, s32 sohMY, s32 sohArg0, s32 sohCamH, f32 sohFovDeg,
++                           float sohDir[3], float* sohAzOut, float* sohElOut, float* sohTanOut) {
++    float sohFovY = sohFovDeg;
++    if (!(sohFovY > 5.0f && sohFovY < 170.0f)) {
++        sohFovY = 60.0f;
++    }
++    const float sohTanH = tanf(sohFovY * (float)(M_PI / 360.0));
++    const float sohNdcC = 1.0f - (2.0f * (float)(sohArg0 - sohMY)) / 240.0f;
++    const float sohNdcH = 1.0f - (2.0f * (float)sohCamH) / 240.0f;
++    const float sohEl = atanf(sohNdcC * sohTanH) - atanf(sohNdcH * sohTanH);
++    const short sohAzBam = (short)(-(int)(short)(unsigned short)sohRotY);
++    const float sohAz = (float)sohAzBam * (float)(M_PI / 32768.0);
++    if (!(fabsf(sohEl) < SOH_IOS_SKY_DOME_MAXEL) || !isfinite(sohEl)) {
++        return 0;
++    }
++    const float sohCe = cosf(sohEl), sohSe = sinf(sohEl);
++    const float sohCa = cosf(sohAz), sohSa = sinf(sohAz);
++    sohDir[0] = sohSa * sohCe;
++    sohDir[1] = sohSe;
++    sohDir[2] = sohCa * sohCe;
++    if (sohAzOut) { *sohAzOut = sohAz; }
++    if (sohElOut) { *sohElOut = sohEl; }
++    if (sohTanOut) { *sohTanOut = sohTanH; }
++    return 1;
++}
++// The object->world matrix, and the probe publication. Row-vector, exactly
++// like mtxf_translation_x_y_rotate_z_scale_x_y: row 0 is where local +x
++// goes, row 1 local +y, row 3 the translation. Local units ARE ortho pixels
++// (the ortho path multiplies them by mScale and translates in pixels), so
++// one local unit is R*tan(k) world units at the dome.
++//
++// FACING: the quad faces the dome CENTRE with WORLD up, per sprite, in a
++// LOCAL matrix -- never the shared billboard matrix (trap D19). Every
++// sprite faces the centre exactly, so a rolled head sees an upright cloud:
++// that is the user's "i can make a cloud turn on its side" fixed by
++// construction rather than by a correction.
++static int soh_ios_sky_dome_mtx(Mat4 sohM, s32 sohRotY, s32 sohMY, s32 sohArg0, s32 sohCamH,
++                                f32 sohFovDeg, f32 sohScale, s32 sohOrthoX, s32 sohOrthoY,
++                                int sohOrthoArm) {
++    float sohDir[3], sohAz = 0.0f, sohEl = 0.0f, sohK = 0.0f;
++    if (!soh_ios_sky_dir(sohRotY, sohMY, sohArg0, sohCamH, sohFovDeg, sohDir, &sohAz, &sohEl,
++                         &sohK)) {
++        // No finite direction: a ZERO-AREA quad at the eye. It must not
++        // fall back to the ortho placement, because the projection in force
++        // for this span is now the world's -- an ortho vertex would be a
++        // sprite parked near the world origin.
++        for (int sohI = 0; sohI < 4; sohI++) {
++            for (int sohJ = 0; sohJ < 4; sohJ++) {
++                sohM[sohI][sohJ] = 0.0f;
++            }
++        }
++        sohM[3][0] = gSohVREyePosGame[0];
++        sohM[3][1] = gSohVREyePosGame[1];
++        sohM[3][2] = gSohVREyePosGame[2];
++        sohM[3][3] = 1.0f;
++        return 0;
++    }
++    const float sohCa = cosf(sohAz), sohSa = sinf(sohAz);
++    const float sohCe = cosf(sohEl), sohSe = sinf(sohEl);
++    /* screen RIGHT is DECREASING azimuth (see the note above) */
++    const float sohRight[3] = { -sohCa, 0.0f, sohSa };
++    /* right x dir: world up, tilted into the quad's plane. Local +y is
++       ortho +y, and MK64's sky ortho row 0 is the TOP of the screen (the
++       measurement in the note above), so local +y is screen DOWN and row 1
++       is the NEGATIVE of world up. Getting this backwards does not merely
++       mirror the sprite: it reverses the quad's winding, and the first cut
++       of this patch drew eleven billboards a frame that G_CULL_BACK removed
++       -- dome_sprites counted them and not one pixel changed. */
++    const float sohUp[3] = { -sohSa * sohSe, sohCe, -sohCa * sohSe };
++    const float sohR = soh_ios_sky_dome_radius();
++    const float sohS = sohScale * sohR * (2.0f / 240.0f) * sohK;
++    const float sohC[3] = { gSohVREyePosGame[0], gSohVREyePosGame[1], gSohVREyePosGame[2] };
++    const float sohP[3] = { sohC[0] + sohR * sohDir[0], sohC[1] + sohR * sohDir[1],
++                            sohC[2] + sohR * sohDir[2] };
++    for (int sohI = 0; sohI < 3; sohI++) {
++        sohM[0][sohI] = sohRight[sohI] * sohS;
++        sohM[1][sohI] = -sohUp[sohI] * sohS;
++        sohM[2][sohI] = -sohDir[sohI] * sohS;
++        sohM[3][sohI] = sohP[sohI];
++    }
++    sohM[0][3] = 0.0f;
++    sohM[1][3] = 0.0f;
++    sohM[2][3] = 0.0f;
++    sohM[3][3] = 1.0f;
++    (void)sohOrthoX;
++    (void)sohOrthoY;
++    (void)sohOrthoArm;
++    return 1;
++}
++// Publish the probe if this sprite is nearer the eye forward than any other
++// drawn this frame. Runs in BOTH arms and computes the DIRECTION the same
++// way in both, so the truth side of the falsifier never depends on the fix
++// (trap D48). Pos/Up are what the PASS will actually project: the dome
++// point in the dome arm, the ortho vertex in the ortho arm.
++static void soh_ios_sky_probe(s32 sohRotY, s32 sohMY, s32 sohArg0, s32 sohCamH, f32 sohFovDeg,
++                              f32 sohScale, s32 sohOrthoX, s32 sohOrthoY, int sohDomeArm) {
++    if (sSohIosSkyProbeGen != gSohVRSkyBuilds) {
++        sSohIosSkyProbeGen = gSohVRSkyBuilds;
++        sSohIosSkyProbeBest = 0x7FFFFFFF;
++    }
++    const int sohCr = (int)(short)((unsigned short)gSohVRSkyBuiltYawBam + (unsigned short)sohRotY);
++    const int sohOff = sohCr - gSohVRSkyProbeTargetBam;
++    const int sohAbs = (sohOff < 0) ? -sohOff : sohOff;
++    if (sohAbs >= sSohIosSkyProbeBest) {
++        return;
++    }
++    float sohDir[3], sohAz = 0.0f, sohEl = 0.0f, sohK = 0.0f;
++    if (!soh_ios_sky_dir(sohRotY, sohMY, sohArg0, sohCamH, sohFovDeg, sohDir, &sohAz, &sohEl,
++                         &sohK)) {
++        return;
++    }
++    sSohIosSkyProbeBest = sohAbs;
++    const float sohCa = cosf(sohAz), sohSa = sinf(sohAz);
++    const float sohCe = cosf(sohEl), sohSe = sinf(sohEl);
++    const float sohUp[3] = { -sohSa * sohSe, sohCe, -sohCa * sohSe };
++    gSohVRSkyProbeDir[0] = sohDir[0];
++    gSohVRSkyProbeDir[1] = sohDir[1];
++    gSohVRSkyProbeDir[2] = sohDir[2];
++    gSohVRSkyProbeAzDeg = sohAz * (float)(180.0 / M_PI);
++    gSohVRSkyProbeElDeg = sohEl * (float)(180.0 / M_PI);
++    gSohVRSkyProbeHalfDeg = atanf(SOH_IOS_SKY_DOME_HALFPX * sohScale * (2.0f / 240.0f) * sohK) *
++                            (float)(180.0 / M_PI);
++    if (sohDomeArm) {
++        const float sohR = soh_ios_sky_dome_radius();
++        const float sohS = sohScale * sohR * (2.0f / 240.0f) * sohK;
++        for (int sohI = 0; sohI < 3; sohI++) {
++            const float sohPt = gSohVREyePosGame[sohI] + sohR * sohDir[sohI];
++            gSohVRSkyProbePos[sohI] = sohPt;
++            gSohVRSkyProbeUp[sohI] = sohPt + sohUp[sohI] * (sohS * 16.0f);
++        }
++        gSohVRSkyProbeOrtho = 0;
++    } else {
++        gSohVRSkyProbePos[0] = (float)sohOrthoX;
++        gSohVRSkyProbePos[1] = (float)sohOrthoY;
++        gSohVRSkyProbePos[2] = 0.0f;
++        gSohVRSkyProbeUp[0] = (float)sohOrthoX;
++        gSohVRSkyProbeUp[1] = (float)sohOrthoY - 16.0f * sohScale;  /* ortho y is DOWN */
++        gSohVRSkyProbeUp[2] = 0.0f;
++        gSohVRSkyProbeOrtho = 1;
++    }
++    gSohVRSkyProbeValid = 1;
++}
++#endif
+ size_t SkyStar::_count = 0;
+ 
+ SkyStar::SkyStar(ScreenContext* screen, u16 cloudVariant, u16 posY, u16 rotY, u16 scalePercent) : SkyActor(screen) {
+@@ -66,11 +381,131 @@
+     const float cullingFactor = OTRGetAspectRatio();
+ 
+     // Calculate the cloud's rotation relative to the camera
++#ifdef __IOS__
++    // SOH_IOS (overlay 0051 rev6, VR R16-B): armed only when the shell has
++    // published a frustum to build the layout in. Declared out here because
++    // the PLACEMENT below is a second block.
++    int sohSkyVR = 0;
++    // SOH_IOS (overlay 0051, trap D6): in VR first-person the sky is drawn
++    // into the eye framebuffer at infinity, so its yaw -> screen-x mapping
++    // must be the EYE's: the eye yaw in place of the game camera's, and the
++    // eye frustum's own horizontal FOV in place of (fieldOfView + 40).
++    // Without both halves the clouds hold still relative to the kart
++    // instead of relative to the world, which is the swim trap D6 names.
++    {
++        s16 sohSkyYaw = (s16)mScreen->camera->rot[1];
++        if (gSohVREyeKey && gSohVRSkyMode) {
++            sohSkyYaw = (s16)gSohVREyeYawBam;
++            if (gSohVREyeFovDeg > 20.0f && gSohVREyeFovDeg < 200.0f) {
++                mUnk200 = (s16)gSohVREyeFovDeg;
++                mUnk208 = ((mUnk200 / 2) * 0xB6) + 0x71C;
++                mUnk210 = (-(mUnk200 / 2) * 0xB6) - 0x71C;
++                mUnk1E8 = 1.7578125 / mUnk200;
++            }
++            // SOH_IOS (overlay 0051 rev2, VR R15 item 7): the RATE, which
++            // the fov substitution above never fixed. MK64's mapping is
++            // LINEAR -- 1.7578125/fovDeg px per BAM is exactly 320/fovDeg
++            // px per degree, i.e. the whole 320-px screen spans fovDeg --
++            // and the world projects through a TANGENT, so at a 100-degree
++            // eye the sprites slide about 36 percent faster than the
++            // scenery under head yaw. The shell publishes the eye frustum's
++            // own rate (and the screen x a zero-yaw direction lands on,
++            // which is not 160 on an asymmetric frustum); the bounds above
++            // stay keyed to the fov because visibility is angular.
++            if (gSohVRSkyPxPerBam > 0.0f) {
++                mUnk1E8 = gSohVRSkyPxPerBam;
++                mUnk218 = (s16)gSohVRSkyPxCenter;
++            }
++            // SOH_IOS (overlay 0051 rev6, VR R16-B / clouds.md M3): THE
++            // POSE THIS LAYOUT IS BUILT WITH. rev2 read gSohVREyeYawBam --
++            // a global the compositor rewrites at 90-120 Hz -- from the
++            // GAME update at ~28 Hz, so the clouds were keyed to a head
++            // pose no consumer of the eye matrices ever agreed with. The
++            // R16-A snapshot mirror is ONE coherent copy of ONE pose, and
++            // 0044 rev11 differences the yaw recorded below against the
++            // frame it actually draws to close what is left. skylatch 0
++            // restores the live read on BOTH sides, as the red control.
++            if (gSohVRSkyLatch && gSohVRSnapId != 0u) {
++                sohSkyYaw = (s16)gSohVRSnapEyeYawBam;
++            }
++            // SOH_IOS (overlay 0051 rev6): the tangent mapping is armed
++            // only when the shell has published a frustum for it. When it
++            // is not, every rev2 line above stands exactly as it shipped,
++            // which is what makes `skytan 0` a faithful red control.
++            if (gSohVRSkyTan && gSohVRSkyRate && (gSohVRSnapId != 0u) &&
++                (gSohVRSnapSkySpan > 1.0e-4f)) {
++                sohSkyVR = 1;
++            }
++            gSohVRSkyBuiltYawBam = (int)sohSkyYaw;
++            gSohVRSkyBuilds = gSohVRSkyBuilds + 1;
++        }
++        cameraRot = (u16)sohSkyYaw + (u16)mRotY;
++    }
++#else
+     cameraRot = (u16)mScreen->camera->rot[1] + (u16)mRotY;
++#endif
+     // Adjust bounds based on the culling factor
+     s16 adjustedLowerBound = (s16) (mUnk210 * cullingFactor);
+     s16 adjustedUpperBound = (s16) (mUnk208 * cullingFactor);
+ 
++#ifdef __IOS__
++    // SOH_IOS (overlay 0051 rev6, VR R16-B / clouds.md M1 + M4): TANGENT
++    // PLACEMENT, and bounds taken from the eye instead of from the fov.
++    //
++    // MK64 maps yaw to screen x LINEARLY. The world projects through a
++    // TANGENT. rev2 matched the two RATES at the frame CENTRE and stopped
++    // there, which leaves an error of (320/span)*(tan(th) - th) pixels:
++    // 0.2 px at 10 degrees off centre, 6 px at 30, 25 px at 45 and 80 px --
++    // a QUARTER OF THE FRAME, 9.8 degrees of visual angle -- at 60, which
++    // this device's eye 0 reaches. A cloud carried from the centre to the
++    // rim by a head turn slides that far against the trees under it, and
++    // because the error grows with the angle it ACCELERATES outward, which
++    // is the part the eye reads as swimming. In 2D the same error is a
++    // static distortion nobody can see, because the game camera and the sky
++    // share one yaw -- which is exactly why the user reports it only in VR.
++    //
++    // ndc = (2*tan(cameraRot) - tanSum)/span, x_px = 160*(1 + ndc), with
++    // tanSum/span the shell's published tangents for EYE 0. At cameraRot = 0
++    // this is exactly rev2's published centre, and its slope there is
++    // exactly rev2's published rate: nothing that was right stops being
++    // right, and the fix is only what rev2 left linear. The other eye is a
++    // constant NDC offset from this one and is applied by 0044 rev11 in the
++    // eye pass, because there is only ONE layout and two eyes to draw it in.
++    //
++    // BOUNDS. mUnk208/mUnk210 above are +/-((fov/2)*0xB6 + 0x71C)*aspect =
++    // +/-77 degrees on a frustum that reaches -60..+45, so a cloud that
++    // should have left the frame is placed at the very edge and lingers
++    // there. The eye's own tangents are the honest test, taken as the UNION
++    // of both eyes (culling to one would drop a sprite out of one eye only,
++    // which is a stereo-rivalry bug of its own) plus a sprite half-width.
++    if (soh_ios_sky_dome_on()) {
++        // SOH_IOS (overlay 0051 rev7, VR R17-B): THE DOME ARM. There is no
++        // longer a screen-space layout to bound: the sprite is world
++        // geometry and the eye's own FRUSTUM clips it, per eye, exactly.
++        // rev6's tangent-union test existed to keep one eye from culling a
++        // sprite the other could see, which is a question the projection
++        // now answers for itself. mX is left where rev6 put it so
++        // `vr set skydome 0` restores 1.0.0.13 within the same game frame.
++        mVisible = true;
++    } else if (sohSkyVR) {
++        const float sohTh = (float)cameraRot * (float)(M_PI / 32768.0);
++        // Past ~85 degrees there is no finite projection and tanf explodes;
++        // without this guard one frame of mX = +/-INT_MAX is a Fast3D vertex
++        // explosion (clouds.md section 7).
++        if (fabsf(sohTh) < 1.48f) {
++            const float sohT = tanf(sohTh);
++            if ((sohT >= gSohVRSnapSkyTanLo) && (sohT <= gSohVRSnapSkyTanHi)) {
++                mX = (int32_t)lrintf(160.0f * (1.0f + ((2.0f * sohT) - gSohVRSnapSkyTanSum) /
++                                                          gSohVRSnapSkySpan));
++                mVisible = true;
++            } else {
++                mVisible = false;
++            }
++        } else {
++            mVisible = false;
++        }
++    } else
++#endif
+     // Check if the object is within the adjusted bounds
+     if ((cameraRot >= adjustedLowerBound) && (adjustedUpperBound >= cameraRot)) {
+         // Calculate and update the object's position
+@@ -112,7 +547,33 @@
+         func_80044DA0((u8*)mTexture, mTextureWidth, mTextureHeight);
+ 
+         func_8004B138(0xFF, 0xFF, 0xFF, mPrimAlpha);
++#ifdef __IOS__
++        // SOH_IOS (overlay 0051 rev7, VR R17-B): H5. In the dome arm the sprite
++        // is emitted as WORLD GEOMETRY through the ordinary matrix stack -- an
++        // object->world matrix here, and the game's own world->clip projection
++        // re-loaded for the whole span by DrawSkyActors (overlay 0058 rev5) --
++        // so the eye pass substitutes the SAME per-eye A*V*P it draws the trees
++        // with (trap A7), and M1-M5 have nowhere left to live. The probe is
++        // published in BOTH arms, from the authored numbers alone (trap D48).
++        {
++            const int sohDome = soh_ios_sky_dome_on();
++            soh_ios_sky_probe((s32)mRotY, (s32)mY, arg0, (s32)screen->cameraHeight,
++                              screen->camera->fieldOfView, mScale, mX, posY, sohDome);
++            if (sohDome) {
++                Mat4 sohM;
++                if (soh_ios_sky_dome_mtx(sohM, (s32)mRotY, (s32)mY, arg0,
++                                         (s32)screen->cameraHeight, screen->camera->fieldOfView,
++                                         mScale, mX, posY, 0)) {
++                    gSohVRSkyDomeSprites = gSohVRSkyDomeSprites + 1;
++                }
++                AddHudMatrix(sohM, G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
++            } else {
++                func_80042330_unchanged(mX, posY, 0, mScale);
++            }
++        }
++#else
+         func_80042330_unchanged(mX, posY, 0, mScale);
++#endif
+         gSPVertex(gDisplayListHead++, (uintptr_t)mVtx, 4, 0);
+         gSPDisplayList(gDisplayListHead++, (Gfx*)common_rectangle_display);
+         FrameInterpolation_RecordCloseChild();
+--- a/src/racing/actors_extended.c
++++ b/src/racing/actors_extended.c
+@@ -16,6 +16,44 @@
+ #include "effects.h"
+ #include "sounds.h"
+ #include "port/Game.h"
++#ifdef __IOS__
++// SOH_IOS (overlay 0051): the composed VR eye, published by the shell.
++extern volatile int gSohVREyeKey;          // 1 = re-key to the eye
++extern volatile float gSohVREyePosGame[3]; // eye position, GAME units
++extern volatile int gSohVREyeYawBam;       // eye yaw, MK64 binary angles
++extern volatile int gSohVRAngleCullOff;    // 1 = angle culls stand down
++extern volatile int gSohVRKartSpin;        // 1 = the kart is spinning
++extern volatile int gSohVRKartAirborne;    // R7: 1 = wheels off the ground
++extern volatile unsigned int gSohVRSpinEffectMask; // rev5: the spin mask
++// SOH_IOS (overlay 0051 rev5, VR R10 item 5): EVERY spin class, not just
++// the two rev4 knew about. the user, 1.0.0.6: with "Realistic Spins" OFF he
++// STILL got a realistic spin off a banana — because a banana does not raise
++// any of the flags rev4 tested. src/effects.c is explicit about it:
++//   * func_8008CDC0 (HIT_BANANA_TRIGGER) sets effects 0x800 and NOTHING
++//     else — no DRIVING_SPINOUT, no HIT_BY_ITEM_EFFECT.
++//   * func_8008C73C, the generic spin-out entry the banana path and the
++//     erratic-driving path both end in, sets effects 0x40 or 0x80 ("spinning
++//     out, facing right / facing left"). audio/external.c groups 0x40 with
++//     DRIVING_SPINOUT, and code_80057C60.c groups 0x800 with it, so the
++//     game itself treats these as the same state.
++//   * func_8008C528 (LOW_TUMBLE_TRIGGER, a green shell) sets effects 0x400.
++// So three of the five ways to lose control were invisible to the comfort
++// hold. HIT_EFFECT (a wall scrape) and 0x8 (airborne) stay OUT — rev4
++// explains at length why holding the horizon for those is the bug, not the
++// fix.
++#define SOH_VR_SPIN_EFFECTS (0x40 | 0x80 | 0x400 | 0x800 | HIT_BY_ITEM_EFFECT | LIGHTNING_EFFECT)
++extern volatile unsigned int gSohVRRearItemSeq; // ++ on a REARWARD item
++extern volatile int gSohVRThrowDir;        // R4: 0 none, 1 fwd, 2 back
++// SOH_IOS (overlay 0051 rev3, spec D13): the physical throw's vote. The
++// gesture layer sets gSohVRThrowDir on the frame the item hand lets go and
++// clears it immediately after; 0 means MK64's own stick test stands, which
++// is what every non-VR build and every gamepad player gets.
++#define SOHVR_THROW_BACK(expr) (gSohVRThrowDir ? (gSohVRThrowDir == 2) : (expr))
++#define SOHVR_THROW_FWD(expr) (gSohVRThrowDir ? (gSohVRThrowDir == 1) : (expr))
++#else
++#define SOHVR_THROW_BACK(expr) (expr)
++#define SOHVR_THROW_FWD(expr) (expr)
++#endif
+ 
+ void copy_collision(Collision* src, Collision* dest) {
+     dest->unk30 = src->unk30;
+@@ -300,10 +338,19 @@
+                 if ((controller->buttonPressed & Z_TRIG) != 0) {
+                     controller->buttonPressed &= ~Z_TRIG;
+                     func_800C9060(owner - gPlayerOne, SOUND_ARG_LOAD(0x19, 0x00, 0x80, 0x12));
+-                    if ((controller->rawStickY >= 0x1F) &&
+-                        ((controller->rawStickX < 0x28) && (controller->rawStickX >= -0x27))) {
++                    if (SOHVR_THROW_FWD((controller->rawStickY >= 0x1F) &&
++                                        ((controller->rawStickX < 0x28) &&
++                                         (controller->rawStickX >= -0x27)))) {
+                         func_802B0788(controller->rawStickY, banana_bunch, owner);
+                     } else {
++#ifdef __IOS__
++                    // SOH_IOS (overlay 0051 rev2, spec D12): the 1P kart
++                    // just put an item out BEHIND it. The shell's rear-view
++                    // pane edge-detects this counter and shows itself for 3 s.
++                    if (banana_bunch->playerId == 0) {
++                        gSohVRRearItemSeq = gSohVRRearItemSeq + 1;
++                    }
++#endif
+                         drop_banana_in_banana_bunch(banana_bunch);
+                     }
+                 }
+--- a/src/actors/green_shell/update.inc.c
++++ b/src/actors/green_shell/update.inc.c
+@@ -59,7 +59,15 @@
+                 controller = &gControllers[shell->playerId];
+                 if ((controller->buttonDepressed & Z_TRIG) != 0) {
+                     controller->buttonDepressed &= ~Z_TRIG;
+-                    if (controller->rawStickY < THROW_SHELL_BACKWARDS) {
++                    if (SOHVR_THROW_BACK(controller->rawStickY < THROW_SHELL_BACKWARDS)) {
++#ifdef __IOS__
++                    // SOH_IOS (overlay 0051 rev2, spec D12): the 1P kart
++                    // just put an item out BEHIND it. The shell's rear-view
++                    // pane edge-detects this counter and shows itself for 3 s.
++                    if (shell->playerId == 0) {
++                        gSohVRRearItemSeq = gSohVRRearItemSeq + 1;
++                    }
++#endif
+                         var_f2 = 8.0f;
+                         if (player->speed > 8.0f) {
+                             var_f2 = player->speed * 1.2f;
+--- a/src/actors/banana/update.inc.c
++++ b/src/actors/banana/update.inc.c
+@@ -63,7 +63,8 @@
+                     player->triggers &= ~DRAG_ITEM_EFFECT;
+                     func_800C9060(player - gPlayerOne, SOUND_ARG_LOAD(0x19, 0x00, 0x80, 0x12));
+                     pad3 = controller->rawStickY;
+-                    if ((pad3 > 30.0f) && (controller->rawStickX < 10) && (controller->rawStickX >= -9)) {
++                    if (SOHVR_THROW_FWD((pad3 > 30.0f) && (controller->rawStickX < 10) &&
++                                        (controller->rawStickX >= -9))) {
+                         pad3 = pad3 - ((f32) 30);
+                         pad3 = (pad3 / 20.0f) + 0.5f;
+                         if (player->speed < 2.0f) {
+@@ -77,6 +78,14 @@
+                         banana->velocity[1] = someVelocity[1];
+                         banana->velocity[2] = someVelocity[2];
+                     } else {
++#ifdef __IOS__
++                    // SOH_IOS (overlay 0051 rev2, spec D12): the 1P kart
++                    // just put an item out BEHIND it. The shell's rear-view
++                    // pane edge-detects this counter and shows itself for 3 s.
++                    if (banana->playerId == 0) {
++                        gSohVRRearItemSeq = gSohVRRearItemSeq + 1;
++                    }
++#endif
+                         banana->velocity[0] = 0;
+                         banana->velocity[1] = 1.5f;
+                         banana->velocity[2] = 0;

@@ -1,0 +1,755 @@
+Overlay patch 0064 (D17): ASYNCHRONOUS JUMBOTRON FRAMEBUFFER READBACK
+(`fbrd`; the MK64 analogue of Shipwright 0067 / 2ship 0049, D-086/D-059).
+
+WHY. race_logic_loop (src/main.c) ends EVERY race display list with
+FB_WriteFramebufferSliceToCPU (src/racing/framebuffer_effects.c): the frame is
+scaled into the 320x240 gN64ResFrameBuffer and `gDPReadFB` copies it to
+gPortFramebuffers[sRenderingFramebuffer] as RGBA16 -- the feed of the Luigi
+Raceway / Wario Stadium jumbotrons (they draw gPortFramebuffers[prevFrame]).
+The interpreter (gfx_read_fb_handler_custom) calls
+GfxRenderingAPIMetal::ReadFramebufferToCPU on that custom framebuffer once per
+DISPLAY frame (each interpolated replay of the list included). Upstream's
+custom-FB branch allocates a fresh MTL::Buffer, encodes the RGBA5551 compute
+conversion, commits and waitUntilCompleted()s -- a synchronous GPU round-trip
+on the game thread every frame. The 0062 probe put it at 586-591 calls and
+0.56-1.6 s per 10 s on the sim (1-2.7 ms per frame), the largest game-thread
+category, and it scales with whatever the GPU still has in flight.
+
+WHAT (gSohIos.AsyncFbRead, default 1; 0 = upstream synchronous path).
+Same shape as the Ship of Harkinian port async depth readback: submit without waiting,
+answer from the newest FINISHED readback, cache the state it rebuilt.
+  1. SUBMIT: the conversion dispatch is encoded exactly as upstream, into one
+     of three persistent shared result buffers (no per-frame newBuffer), and
+     committed; the command buffer is retained in the slot, never waited on.
+  2. HARVEST (same call, before serving): every slot whose command buffer has
+     completed is retired; the newest completed one is copied into a per-FB
+     CPU cache and its slot freed.
+  3. SERVE: the cache is copied into the caller's buffer (the interpreter
+     byte-swaps it afterwards, unchanged). So the jumbotron shows the frame
+     rendered one display frame earlier (two at worst) -- at 60 Hz with 30 Hz
+     game frames that is invisible; the game itself already shows the
+     PREVIOUS game frame's buffer on the screen.
+  - No free slot (GPU three readbacks behind): wait on the oldest one -- a
+    bounded stall, counted (`wait`), instead of unbounded growth.
+  - The very first call per FB stays on upstream's path (its command buffer
+    is on the main queue then; upstream returns zeros and moves the FB to the
+    readback queue). Until a readback completes the cache is zeros (black),
+    same as upstream's first frame.
+  - The ConvertToRgb5a1 PSO was already created once and cached by upstream;
+    unchanged. The per-frame MTL::Buffer allocation is what goes away.
+  - Screen FB (fb 0) path untouched (already deferred upstream; MK64 does not
+    use it).
+
+COUNTERS. SOH_FBASYNC every 10 s: submit, fresh (served the previous call's
+readback), old (served an older one: GPU more than a frame behind), wait
+(forced oldest-slot waits), empty (nothing finished yet: zeros), inflight
+(slots still on the GPU at submit time). The 0062 `fbrd` seam still wraps the
+whole call, so fbrd now measures encode + commit + memcpy.
+
+Platform: __IOS__ covers the iPhone and visionOS builds; the macOS build is
+unchanged.
+
+Idempotent: if the edits are already applied the generator reverses them
+first, so it runs against a vendor tree (0001..0063 applied) with or without
+0064. Every edit asserts exactly one match.
+
+REV2 (VR R19 item 4, 2026-10-09): ONE READBACK PER GAME FRAME IN VR.
+the user on 1.0.0.17: with the Top rear-view pane on, the Luigi Raceway
+jumbotron shows the rear view in its top-left corner; with it off it
+"sometimes flickers a REAR view". In VR every interpolated host frame walks
+the display list THREE times -- eye 1, eye 2, and (while a pane is shown) the
+rear-view pane walk into its own small mirror target (0044 rev3) -- and each
+walk ends with the game's G_READFB. rev1 submitted a readback on EVERY walk
+(measured on 1.0.0.17's code in a VR Luigi race: ~355 submits/s at ~30 game
+frames/s = ~12 per game frame, 2-11 forced waits per 10 s) and served "the
+newest finished" one -- which is the pane walk's whenever it finished last: a
+REVERSED camera rendered into a target about half the eye's extent, i.e. a
+small rear view in the top-left of the 320x240 slice.
+Fix: the G_READFB handler (interpreter.cpp, this patch's second file) stamps
+the walk identity into gSohFbrdWalk (0044's sSoh3DEye: 0 flat, 1/2 the eyes,
+3 the pane; bit 4 = the walk is the game frame's KEY walk, gSohVRWalkT == 1,
+0014 rev2). In a VR world frame (gSohVRWorldActive) only eye 1 of the key walk
+submits: t = 1 is the game's own state at its own tick -- the exact frame a
+flat build's last walk reads -- and eye 1 is the first pass of that walk, so
+the readback has the whole rest of the host frame to finish. Every other walk
+(eye 2, the pane, the interpolated walks) commits its command buffer exactly
+as before and SERVES THE CACHE, so the bytes the game copies (and the
+interpreter's in-place byte swap) are unchanged on those walks. A frame
+ratio with no key walk cannot freeze the jumbotron: after 8 eye-1 walks
+without a submit, eye 1 submits anyway (`fallback`). `gSohVRFbrdGate`
+(bridge `vr set fbrdgate 0|1`, ships 1) is the same-binary red control:
+0 = rev1 exactly. Flat and 3D-panel frames (gSohVRWorldActive == 0) take
+the rev1 path byte for byte.
+THE SECOND HALF, found by the instrument, not the brief: with the gate alone
+the jumbotron STILL showed the rear view in its top-left corner, now in EYE-1
+readbacks (`vr fbrd save` dumps the served bytes). The pane walk's
+G_COPYFB copies its mirror target into gReusableFrameBuffer with a dst rect
+of its own (smaller) extent -- the top-left -- and the slice's render pass on
+the readback queue has no dependency on the main-queue copies, so the next
+eye readback samples that corner. So the copy handler (interpreter.cpp) also
+runs only on the chosen walk in VR world frames (gReusableFrameBuffer is used
+by the jumbotron slice and nothing else); `copy_skips` counts the rest.
+Instrument: per-slot walk kind; the cache remembers which walk produced it;
+`vr fbrd` (SohIos_FbrdDump) reports cumulative submits and SERVES by
+producing walk kind (flat/eye1/eye2/pane/empty), serve-only skips, forced
+waits and fallbacks; `vr fbrd reset` zeroes them. SOH_FBASYNC gains
+`skip=` and `pane_srv=`.
+
+REV3 (VR R20 item 1, 2026-10-09): THE LEFT-EYE RAINBOW FLASH. the user on
+1.0.0.18: "the rainbow flash only happens in my left eye ... several in 40
+seconds". Question (a) answered from the code and a ledger: G_READFB commits
+the 320x240 slice framebuffer's OWN command buffer (on the readback queue),
+never the eye framebuffer's, so no eye pass is split and no publish can fire
+early (`eye_cb_splits` counts readbacks aimed at the walk's eye framebuffer:
+0). What 0064 DID change is the CPU's lead over the GPU: upstream's readback
+waited for the GPU every walk (waitUntilCompleted), which in VR -- no drawable
+to throttle on -- was the only thing stopping the game thread from running
+whole host frames ahead. The Metal backend writes each walk's vertices into a
+pool of THREE shared buffers that rotates once per walk (2-3 walks per host
+frame in VR) and never asks whether the GPU is done with one. With the wait
+gone (rev1) and then the forced waits gone too (rev2: one submit per game
+frame, 0 waits), a walk can memcpy over vertices an earlier queued walk has
+not drawn yet. Fix: SohVboNote/SohVboStartWalk (helper block, StartFrame,
+DrawTriangles) -- every reader command buffer is retained against its pool
+buffer and a walk that would begin writing a buffer with a live reader swaps
+in a free one (grown on demand, bounded at 12, bounded wait past that).
+`gSohVRVboFix` (bridge `vr set vbofix 0|1`, ships 1) is the same-binary red
+control; `vr vbo` the ledger. 3D sessions only (gSoh3DMode): the flat path,
+which the drawable throttles, is untouched.
+Also rev3: the device A/B arm. `gSohVRJumboFeed` (the shell's persisted
+"Jumbotron live feed" row, default On): Off = in a VR world frame the game
+emits no jumbotron slice at all (src/racing/framebuffer_effects.c, this
+patch's third file) and the jumbotron holds its last image.
+
+--- a/libultraship/src/fast/backends/gfx_metal.cpp
++++ b/libultraship/src/fast/backends/gfx_metal.cpp
+@@ -40,6 +40,413 @@
+ 
+ #define ARRAY_COUNT(arr) (int32_t)(sizeof(arr) / sizeof(arr[0]))
+ 
++#ifdef __IOS__
++// SOH_IOS (overlay 0064, D17): asynchronous custom-framebuffer readback (the
++// MK64 jumbotron feed, read every display frame). Submit without waiting,
++// serve the newest finished readback from a CPU cache. See
++// scripts/gen-patch-0064.py.
++#include <chrono>
++namespace {
++constexpr int kSohFbrdSlots = 3;
++struct SohFbrdSlot {
++    MTL::CommandBuffer* cb = nullptr; // retained while in flight
++    MTL::Buffer* buf = nullptr;       // persistent shared result buffer
++    size_t bytes = 0;
++    int fbId = -1;
++    unsigned long long seq = 0;
++    int kind = 0; // rev2: the walk that submitted it (0 flat, 1/2 eyes, 3 pane)
++};
++SohFbrdSlot sSohFbrd[kSohFbrdSlots];
++unsigned long long sSohFbrdSeq = 0;
++std::unordered_map<int, std::vector<uint16_t>> sSohFbrdCache;
++std::unordered_map<int, unsigned long long> sSohFbrdCacheSeq;
++std::unordered_map<int, unsigned long long> sSohFbrdLastSubmit;
++unsigned sSohFbrdStat[8]; // submit fresh old wait empty inflight skip pane_srv
++std::chrono::steady_clock::time_point sSohFbrdWin;
++// rev2 (VR R19 item 4): which walk produced the cached bytes, and cumulative
++// counters for `vr fbrd` (never reset by the 10 s log).
++std::unordered_map<int, int> sSohFbrdCacheKind;
++unsigned long long sSohFbrdKSubmit[4]; // by submitting walk: flat eye1 eye2 pane
++unsigned long long sSohFbrdKServe[5];  // by PRODUCING walk: flat eye1 eye2 pane empty
++unsigned long long sSohFbrdTot[4];     // skip wait fallback calls
++int sSohFbrdEyeSince = 0;              // eye-1 walks since the last VR submit
++unsigned int sSohFbrdWaitsAll = 0;     // forced waits, never reset (SOH_VRGLITCH)
++
++void SohFbrdRetire(SohFbrdSlot& s) {
++    if (s.cb == nullptr) {
++        return;
++    }
++    MTL::CommandBufferStatus st = s.cb->status();
++    if (st == MTL::CommandBufferStatusCompleted) {
++        if (s.seq > sSohFbrdCacheSeq[s.fbId]) {
++            std::vector<uint16_t>& c = sSohFbrdCache[s.fbId];
++            c.resize(s.bytes / sizeof(uint16_t));
++            memcpy(c.data(), s.buf->contents(), s.bytes);
++            sSohFbrdCacheSeq[s.fbId] = s.seq;
++            sSohFbrdCacheKind[s.fbId] = s.kind;
++        }
++        s.cb->release();
++        s.cb = nullptr;
++    } else if (st == MTL::CommandBufferStatusError) {
++        s.cb->release();
++        s.cb = nullptr;
++    }
++}
++
++void SohFbrdLog() {
++    auto now = std::chrono::steady_clock::now();
++    if (sSohFbrdWin.time_since_epoch().count() == 0) {
++        sSohFbrdWin = now;
++        return;
++    }
++    double el = std::chrono::duration<double>(now - sSohFbrdWin).count();
++    if (el < 10.0) {
++        return;
++    }
++    SPDLOG_INFO("SOH_FBASYNC el={:.1f} submit={} fresh={} old={} wait={} empty={} inflight={} skip={} pane_srv={}",
++                el, sSohFbrdStat[0], sSohFbrdStat[1], sSohFbrdStat[2], sSohFbrdStat[3], sSohFbrdStat[4],
++                sSohFbrdStat[5], sSohFbrdStat[6], sSohFbrdStat[7]);
++    memset(sSohFbrdStat, 0, sizeof(sSohFbrdStat));
++    sSohFbrdWin = now;
++}
++
++// Harvest finished slots and return a free one sized for `bytes` (waits on
++// the oldest in-flight slot only when all are busy).
++SohFbrdSlot* SohFbrdAcquire(MTL::Device* dev, int fbId, size_t bytes) {
++    SohFbrdLog();
++    SohFbrdSlot* oldest = nullptr;
++    for (auto& s : sSohFbrd) {
++        SohFbrdRetire(s);
++        if (s.cb != nullptr) {
++            sSohFbrdStat[5]++;
++            if (oldest == nullptr || s.seq < oldest->seq) {
++                oldest = &s;
++            }
++        }
++    }
++    SohFbrdSlot* slot = nullptr;
++    for (auto& s : sSohFbrd) {
++        if (s.cb == nullptr) {
++            slot = &s;
++            break;
++        }
++    }
++    if (slot == nullptr) {
++        sSohFbrdStat[3]++;
++        sSohFbrdTot[1]++;
++        sSohFbrdWaitsAll++;
++        oldest->cb->waitUntilCompleted();
++        SohFbrdRetire(*oldest);
++        if (oldest->cb != nullptr) { // still not retired (unexpected status): drop it
++            oldest->cb->release();
++            oldest->cb = nullptr;
++        }
++        slot = oldest;
++    }
++    if (slot->buf == nullptr || slot->buf->length() < bytes) {
++        if (slot->buf != nullptr) {
++            slot->buf->release();
++        }
++        slot->buf = dev->newBuffer(bytes, MTL::ResourceStorageModeShared);
++    }
++    slot->bytes = bytes;
++    slot->fbId = fbId;
++    return slot;
++}
++
++// rev2: retire every finished slot without taking one (the serve-only walks).
++void SohFbrdHarvest() {
++    SohFbrdLog();
++    for (auto& s : sSohFbrd) {
++        SohFbrdRetire(s);
++    }
++}
++
++void SohFbrdServe(int fbId, uint16_t* out, size_t count, unsigned long long prevSubmit) {
++    std::vector<uint16_t>& c = sSohFbrdCache[fbId];
++    if (c.size() != count) {
++        sSohFbrdStat[4]++;
++        sSohFbrdKServe[4]++;
++        memset(out, 0, count * sizeof(uint16_t));
++        return;
++    }
++    {
++        const int k = sSohFbrdCacheKind[fbId];
++        sSohFbrdKServe[(k >= 0 && k <= 3) ? k : 0]++;
++        if (k == 3) {
++            sSohFbrdStat[7]++;
++        }
++    }
++    // fresh = the readback submitted by the previous call for this FB
++    sSohFbrdStat[sSohFbrdCacheSeq[fbId] >= prevSubmit ? 1 : 2]++;
++    memcpy(out, c.data(), count * sizeof(uint16_t));
++}
++
++// rev3 (VR R20 item 1): THE VERTEX POOL'S GPU LIFETIME. DrawTriangles memcpy's
++// every walk's vertices into mVertexBufferPool[idx] (three shared buffers,
++// upstream), and the index advances once per EndFrame / EndFrameOffscreen --
++// i.e. once per WALK in VR (eye 1, eye 2, the pane). Upstream relies on the
++// drawable (three in flight) to stop the CPU from rewriting a buffer the GPU
++// is still reading; the VR path never acquires a drawable, and the eye-slot
++// gate lets two whole host frames (4-6 walks) be in flight against a pool of
++// three. So a walk can memcpy over vertices an earlier, still-queued walk is
++// about to draw: garbage triangles in THAT walk's eye. Every reader command
++// buffer is retained against the buffer it read (SohVboNote, per draw,
++// deduplicated) and a walk that would start writing a buffer with a reader
++// not yet COMPLETED swaps in a free buffer instead (growing the set, bounded),
++// so the write never lands under the GPU. Measured in every arm (trap D48):
++// `busy` = the walk's pool buffer still had a live reader when the walk began;
++// `write_busy` = the walk wrote into one anyway (the hazard; 0 is green).
++constexpr int kSohVboMax = 12; // buffers ever tracked (3 upstream + spares)
++constexpr int kSohVboCbs = 32; // live readers per buffer
++struct SohVboTrack {
++    MTL::Buffer* buf = nullptr;
++    MTL::CommandBuffer* cbs[kSohVboCbs] = {};
++    int kind[kSohVboCbs] = {}; // the walk kind that encoded each reader
++    int ncb = 0;
++};
++SohVboTrack sSohVbo[kSohVboMax];
++int sSohVboN = 0;
++unsigned long long sSohVboWalks[4];     // by walk kind: flat/panel, eye 1, eye 2, pane
++unsigned long long sSohVboBusy[4];      // pool buffer still read by the GPU at walk start
++unsigned long long sSohVboWriteBusy[4]; // ... and the walk wrote into it anyway
++unsigned long long sSohVboSwaps = 0, sSohVboAllocs = 0, sSohVboWaits = 0, sSohVboOverflow = 0;
++unsigned long long sSohVboWriteBusyAll = 0; // never reset (SOH_VRGLITCH)
++unsigned long long sSohVboBusyAll = 0;      // never reset (SOH_VRGLITCH)
++unsigned long long sSohVboVictim[4];        // live readers under a write, by THEIR walk kind
++
++SohVboTrack* SohVboFind(MTL::Buffer* b, bool add) {
++    for (int i = 0; i < sSohVboN; i++) {
++        if (sSohVbo[i].buf == b) {
++            return &sSohVbo[i];
++        }
++    }
++    if (!add || b == nullptr || sSohVboN >= kSohVboMax) {
++        return nullptr;
++    }
++    sSohVbo[sSohVboN].buf = b;
++    return &sSohVbo[sSohVboN++];
++}
++
++// Drop the readers the GPU has finished with; true while one may still read
++// the buffer. A reader that was never committed reads as busy (conservative).
++bool SohVboBusy(SohVboTrack* t) {
++    int k = 0;
++    for (int i = 0; i < t->ncb; i++) {
++        MTL::CommandBufferStatus st = t->cbs[i]->status();
++        if (st == MTL::CommandBufferStatusCompleted || st == MTL::CommandBufferStatusError) {
++            t->cbs[i]->release();
++        } else {
++            t->kind[k] = t->kind[i];
++            t->cbs[k++] = t->cbs[i];
++        }
++    }
++    for (int i = k; i < t->ncb; i++) {
++        t->cbs[i] = nullptr;
++    }
++    t->ncb = k;
++    return k > 0;
++}
++} // namespace
++
++extern "C" {
++extern volatile int gSoh3DMode;
++volatile int gSohVRVboFix = 1; // rev3: 1 = ship; 0 = 1.0.0.18 (bridge `vr set vbofix`)
++int SohIos_WalkEye(void);      // interpreter.cpp (rev3): 0044's sSoh3DEye
++}
++
++namespace {
++// Per draw, 3D sessions only: `cb` reads `b`.
++void SohVboNote(MTL::Buffer* b, MTL::CommandBuffer* cb) {
++    if (gSoh3DMode == 0 || cb == nullptr) {
++        return;
++    }
++    SohVboTrack* t = SohVboFind(b, true);
++    if (t == nullptr) {
++        sSohVboOverflow++;
++        return;
++    }
++    for (int i = t->ncb - 1; i >= 0; i--) {
++        if (t->cbs[i] == cb) {
++            return;
++        }
++    }
++    if (t->ncb >= kSohVboCbs) {
++        SohVboBusy(t);
++        if (t->ncb >= kSohVboCbs) {
++            sSohVboOverflow++;
++            return;
++        }
++    }
++    const int sohEye = SohIos_WalkEye();
++    t->kind[t->ncb] = (sohEye >= 0 && sohEye <= 3) ? sohEye : 0;
++    t->cbs[t->ncb++] = cb->retain();
++}
++
++// The head of every walk (backend StartFrame, offset already 0): the walk is
++// about to write pool[idx] from byte 0.
++void SohVboStartWalk(MTL::Device* dev, MTL::Buffer** pool, int idx, int poolN) {
++    if (gSoh3DMode == 0) {
++        return;
++    }
++    const int sohEye = SohIos_WalkEye();
++    const int ek = (sohEye >= 0 && sohEye <= 3) ? sohEye : 0;
++    sSohVboWalks[ek]++;
++    SohVboTrack* t = SohVboFind(pool[idx], true);
++    const bool busy = t != nullptr && SohVboBusy(t);
++    if (busy) {
++        sSohVboBusy[ek]++;
++        sSohVboBusyAll++;
++    }
++    if (busy && gSohVRVboFix != 0) {
++        SohVboTrack* pick = nullptr;
++        for (int i = 0; i < sSohVboN && pick == nullptr; i++) {
++            SohVboTrack* c = &sSohVbo[i];
++            bool inPool = false;
++            for (int j = 0; j < poolN; j++) {
++                inPool = inPool || pool[j] == c->buf;
++            }
++            if (!inPool && !SohVboBusy(c)) {
++                pick = c;
++            }
++        }
++        if (pick == nullptr && sSohVboN < kSohVboMax) {
++            MTL::Buffer* nb = dev->newBuffer(pool[idx]->length(), MTL::ResourceStorageModeShared);
++            if (nb != nullptr) {
++                pick = SohVboFind(nb, true);
++                sSohVboAllocs++;
++            }
++        }
++        if (pick != nullptr) {
++            pool[idx] = pick->buf;
++            sSohVboSwaps++;
++        } else {
++            // every spare is in flight too: wait for this one, bounded (trap C1)
++            sSohVboWaits++;
++            for (int s = 0; s < 100 && SohVboBusy(t); s++) {
++                struct timespec sohNap = { 0, 500000 };
++                nanosleep(&sohNap, nullptr);
++            }
++        }
++    }
++    SohVboTrack* f = SohVboFind(pool[idx], false);
++    if (f != nullptr && SohVboBusy(f)) {
++        sSohVboWriteBusy[ek]++;
++        sSohVboWriteBusyAll++;
++        for (int i = 0; i < f->ncb; i++) {
++            sSohVboVictim[f->kind[i]]++; // whose vertices this walk is about to overwrite
++        }
++    }
++}
++} // namespace
++
++// rev2 (VR R19 item 4): the walk identity, stamped by the G_READFB handler
++// (interpreter.cpp): 0044's sSoh3DEye in bits 0-3, 0x10 = the key walk (t = 1).
++// gSohVRFbrdGate: 1 = in a VR world frame only eye 1 of the key walk submits;
++// 0 = rev1 exactly (every walk submits) -- the same-binary red control.
++extern "C" {
++volatile int gSohFbrdWalk = 0;
++volatile int gSohVRFbrdGate = 1;
++volatile unsigned int gSohVRFbrdCopySkips = 0; // copies skipped (interpreter.cpp)
++extern volatile int gSohVRWorldActive;
++
++static char sSohFbrdLine[512];
++const char* SohIos_FbrdDump(void) {
++    snprintf(sSohFbrdLine, sizeof(sSohFbrdLine),
++             "fbrdgate=%d calls=%llu submit_flat=%llu submit_eye1=%llu submit_eye2=%llu submit_pane=%llu "
++             "serve_flat=%llu serve_eye1=%llu serve_eye2=%llu serve_pane=%llu serve_empty=%llu "
++             "skip=%llu wait=%llu fallback=%llu copy_skips=%u",
++             gSohVRFbrdGate, sSohFbrdTot[3], sSohFbrdKSubmit[0], sSohFbrdKSubmit[1], sSohFbrdKSubmit[2],
++             sSohFbrdKSubmit[3], sSohFbrdKServe[0], sSohFbrdKServe[1], sSohFbrdKServe[2], sSohFbrdKServe[3],
++             sSohFbrdKServe[4], sSohFbrdTot[0], sSohFbrdTot[1], sSohFbrdTot[2], gSohVRFbrdCopySkips);
++    return sSohFbrdLine;
++}
++// rev2: write the cached readback (the bytes the jumbotron is served, RGBA5551,
++// native order, before the interpreter's byte swap) to `path`; returns the
++// producing walk kind (0 flat, 1/2 eyes, 3 pane) or -1. Bridge `vr fbrd save`.
++int SohIos_FbrdSave(const char* path, int* w_out) {
++    for (auto& e : sSohFbrdCache) {
++        if (e.second.empty()) {
++            continue;
++        }
++        FILE* f = fopen(path, "wb");
++        if (f == nullptr) {
++            return -1;
++        }
++        fwrite(e.second.data(), sizeof(uint16_t), e.second.size(), f);
++        fclose(f);
++        if (w_out != nullptr) {
++            *w_out = (int)e.second.size();
++        }
++        return sSohFbrdCacheKind[e.first];
++    }
++    return -1;
++}
++// rev2 (R19 item 5): the device glitch line's two hooks -- the never-reset
++// forced-wait count, and SohIos_SpdLogLine (NOT the shell's SohIos_LogLine,
++// which is the crash blackbox) for the Objective-C shell to write one line
++// into the same spdlog file SOH_PERF / SOH_FBASYNC go to (Documents/logs).
++unsigned int SohIos_FbrdWaitsAll(void) {
++    return sSohFbrdWaitsAll;
++}
++void SohIos_SpdLogLine(const char* line) {
++    SPDLOG_INFO("{}", line);
++}
++void SohIos_FbrdReset(void) {
++    memset(sSohFbrdKSubmit, 0, sizeof(sSohFbrdKSubmit));
++    memset(sSohFbrdKServe, 0, sizeof(sSohFbrdKServe));
++    memset(sSohFbrdTot, 0, sizeof(sSohFbrdTot));
++    gSohVRFbrdCopySkips = 0;
++}
++// rev3 (VR R20 item 1): the "Jumbotron live feed" row (shell-persisted
++// gSohVR.JumbotronFeed). 0 = in a VR world frame the game skips the whole
++// jumbotron slice -- no G_COPYFB, no slice draw, no G_READFB -- and holds the
++// last image (src/racing/framebuffer_effects.c). the user's device A/B arm.
++volatile int gSohVRJumboFeed = 1;
++volatile unsigned int gSohVRJumboHeld = 0; // slices skipped by the Off arm
++// rev3: question (a)'s ledger, stamped by the G_READFB handler: readbacks
++// inside each walk kind, and how many targeted the walk's OWN eye framebuffer
++// (the only way the readback's mid-walk commit could split an eye pass).
++volatile unsigned int gSohVRReadFbWalk[4] = { 0, 0, 0, 0 };
++volatile unsigned int gSohVREyeCbSplits = 0;
++static char sSohVboLine[640];
++const char* SohIos_VboDump(void) {
++    snprintf(sSohVboLine, sizeof(sSohVboLine),
++             "vbofix=%d feed=%d bufs=%d walks=%llu/%llu/%llu/%llu busy=%llu/%llu/%llu/%llu "
++             "write_busy=%llu/%llu/%llu/%llu swaps=%llu allocs=%llu waits=%llu overflow=%llu "
++             "write_busy_all=%llu victims=%llu/%llu/%llu/%llu readfb_walk=%u/%u/%u/%u eye_cb_splits=%u "
++             "jumbo_held=%u",
++             gSohVRVboFix, gSohVRJumboFeed, sSohVboN, sSohVboWalks[0], sSohVboWalks[1], sSohVboWalks[2],
++             sSohVboWalks[3], sSohVboBusy[0], sSohVboBusy[1], sSohVboBusy[2], sSohVboBusy[3],
++             sSohVboWriteBusy[0], sSohVboWriteBusy[1], sSohVboWriteBusy[2], sSohVboWriteBusy[3], sSohVboSwaps,
++             sSohVboAllocs, sSohVboWaits, sSohVboOverflow, sSohVboWriteBusyAll, sSohVboVictim[0],
++             sSohVboVictim[1], sSohVboVictim[2], sSohVboVictim[3], gSohVRReadFbWalk[0],
++             gSohVRReadFbWalk[1], gSohVRReadFbWalk[2], gSohVRReadFbWalk[3], gSohVREyeCbSplits, gSohVRJumboHeld);
++    return sSohVboLine;
++}
++void SohIos_VboReset(void) {
++    memset(sSohVboWalks, 0, sizeof(sSohVboWalks));
++    memset(sSohVboBusy, 0, sizeof(sSohVboBusy));
++    memset(sSohVboWriteBusy, 0, sizeof(sSohVboWriteBusy));
++    memset(sSohVboVictim, 0, sizeof(sSohVboVictim));
++    sSohVboSwaps = sSohVboAllocs = sSohVboWaits = sSohVboOverflow = 0;
++    for (int i = 0; i < 4; i++) {
++        gSohVRReadFbWalk[i] = 0;
++    }
++    gSohVREyeCbSplits = 0;
++    gSohVRJumboHeld = 0;
++}
++// SOH_VRGLITCH (never reset): walks that WROTE into a vertex buffer the GPU
++// was still reading, and walks whose buffer was busy when they began.
++unsigned int SohIos_VboWriteBusyAll(void) {
++    return (unsigned int)sSohVboWriteBusyAll;
++}
++unsigned int SohIos_VboBusyAll(void) {
++    return (unsigned int)sSohVboBusyAll;
++}
++}
++#endif
++
+ // MARK: - Helpers
+ namespace Fast {
+ 
+@@ -503,6 +910,9 @@
+     }
+ 
+     current_framebuffer.mCommandEncoder->setVertexBufferOffset(mCurrentVertexBufferOffset, 0);
++#ifdef __IOS__
++    SohVboNote(vertex_buffer, current_framebuffer.mCommandBuffer); // overlay 0064 rev3
++#endif
+ 
+     if (!current_framebuffer.mHasBoundFragShader) {
+         current_framebuffer.mCommandEncoder->setFragmentBuffer(mFrameUniformBuffer, 0, 0);
+@@ -568,6 +978,10 @@
+     }
+ 
+     mCurrentVertexBufferOffset = 0;
++#ifdef __IOS__
++    // overlay 0064 rev3 (VR R20): the pool buffer this walk will write.
++    SohVboStartWalk(mDevice, mVertexBufferPool, mCurrentVertexBufferPoolIndex, (int)kMaxVertexBufferPoolSize);
++#endif
+ 
+     mFrameAutoreleasePool = NS::AutoreleasePool::alloc()->init();
+ }
+@@ -1220,6 +1634,81 @@
+             mConvertToRgb5a1PipelineState = mDevice->newComputePipelineState(mConvertToRgb5a1Function, &pso_error);
+         }
+ 
++#ifdef __IOS__
++        // SOH_IOS (overlay 0064, D17): submit without waiting, serve the newest
++        // finished readback (one display frame late). First call per FB (main
++        // queue) keeps upstream's path below.
++        if (framebuffer.mUseReadbackQueue && framebuffer.mCommandBuffer != nullptr &&
++            mConvertToRgb5a1PipelineState != nullptr &&
++            Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger("gSohIos.AsyncFbRead", 1)) {
++            const size_t sohBytes = sizeof(uint16_t) * width * height;
++            // rev2 (VR R19 item 4): in a VR world frame only eye 1 of the key
++            // walk submits; every other walk commits and serves the cache.
++            const int sohWalk = gSohFbrdWalk;
++            const int sohKind = ((sohWalk & 0xF) <= 3) ? (sohWalk & 0xF) : 0;
++            sSohFbrdTot[3]++;
++            bool sohSubmit = true;
++            if (gSohVRWorldActive != 0 && gSohVRFbrdGate != 0 && sohKind != 0) {
++                if (sohKind == 1) {
++                    if ((sohWalk & 0x10) != 0) {
++                        sohSubmit = true;
++                    } else if (++sSohFbrdEyeSince >= 8) {
++                        sohSubmit = true; // no key walk for 8 eye-1 walks: do not freeze
++                        sSohFbrdTot[2]++;
++                    } else {
++                        sohSubmit = false;
++                    }
++                } else {
++                    sohSubmit = false;
++                }
++                if (sohSubmit) {
++                    sSohFbrdEyeSince = 0;
++                }
++            }
++            if (!sohSubmit) {
++                SohFbrdHarvest();
++                framebuffer.mCommandBuffer->commit();
++                sSohFbrdStat[6]++;
++                sSohFbrdTot[0]++;
++                SohFbrdServe(fb_id, rgba16_buf, (size_t)width * height, sSohFbrdLastSubmit[fb_id]);
++                framebuffer.mCommandBuffer = nullptr;
++                framebuffer.mCommandEncoder = nullptr;
++                framebuffer.mHasEndedEncoding = false;
++                mDrawnFramebuffers.erase(fb_id);
++                return;
++            }
++            SohFbrdSlot* sohSlot = SohFbrdAcquire(mDevice, fb_id, sohBytes);
++            // what the previous call submitted is what "fresh" means for this serve
++            const unsigned long long sohPrevSubmit = sSohFbrdLastSubmit[fb_id];
++
++            MTL::ComputeCommandEncoder* sohEnc = framebuffer.mCommandBuffer->computeCommandEncoder();
++            sohEnc->setComputePipelineState(mConvertToRgb5a1PipelineState);
++            sohEnc->setTexture(texture, 0);
++            sohEnc->setBuffer(sohSlot->buf, 0, 0);
++            MTL::Size sohTg = MTL::Size::Make(8, 8, 1);
++            if (mNonUniformThreadgroupSupported) {
++                sohEnc->dispatchThreads(MTL::Size::Make(width, height, 1), sohTg);
++            } else {
++                sohEnc->dispatchThreadgroups(MTL::Size::Make((width + 7) / 8, (height + 7) / 8, 1), sohTg);
++            }
++            sohEnc->endEncoding();
++            framebuffer.mCommandBuffer->commit();
++            sohSlot->cb = framebuffer.mCommandBuffer->retain();
++            sohSlot->seq = ++sSohFbrdSeq;
++            sohSlot->kind = sohKind;
++            sSohFbrdKSubmit[sohKind]++;
++            sSohFbrdStat[0]++;
++
++            SohFbrdServe(fb_id, rgba16_buf, (size_t)width * height, sohPrevSubmit);
++            sSohFbrdLastSubmit[fb_id] = sohSlot->seq;
++
++            framebuffer.mCommandBuffer = nullptr;
++            framebuffer.mCommandEncoder = nullptr;
++            framebuffer.mHasEndedEncoding = false;
++            mDrawnFramebuffers.erase(fb_id);
++            return;
++        }
++#endif
+         MTL::Buffer* output_buffer =
+             mDevice->newBuffer(sizeof(uint16_t) * width * height, MTL::ResourceStorageModeShared);
+ 
+--- a/libultraship/src/fast/interpreter.cpp
++++ b/libultraship/src/fast/interpreter.cpp
+@@ -4022,16 +4022,51 @@
+     return false;
+ }
+ 
++#ifdef __IOS__
++// SOH_IOS (overlay 0064 rev2, VR R19 item 4): see gfx_read_fb_handler_custom.
++extern "C" volatile int gSohVRFbrdGate;
++extern "C" volatile unsigned int gSohVRFbrdCopySkips;
++static int sSohFbrdCopySince = 0; // eye-1 walks since the last VR copy
++#endif
+ bool gfx_copy_fb_handler_custom(F3DGfx** cmd0) {
+     Interpreter* gfx = mInstance.lock().get();
+     F3DGfx* cmd = *cmd0;
+     bool* hasCopiedPtr = (bool*)cmd->words.w1;
+ 
++#ifdef __IOS__
++    // overlay 0064 rev2: VR world frame -> copy only on eye 1 of the key walk
++    // (or after 8 eye-1 walks without one, so a ratio with no key walk cannot
++    // freeze the jumbotron). Skipped walks leave the buffer as it is.
++    if (gSohVRWorldActive && gSohVRFbrdGate && sSoh3DEye != 0) {
++        bool sohCopy = false;
++        if (sSoh3DEye == 1) {
++            sohCopy = gSohVRWalkT >= 0.999f || ++sSohFbrdCopySince >= 8;
++        }
++        if (!sohCopy) {
++            gSohVRFbrdCopySkips = gSohVRFbrdCopySkips + 1;
++            return false;
++        }
++        sSohFbrdCopySince = 0;
++    }
++#endif
+     gfx->Flush();
+     gfx->CopyFrameBuffer(C0(11, 11), C0(0, 11), (bool)C0(22, 1), hasCopiedPtr);
+     return false;
+ }
+ 
++#ifdef __IOS__
++// SOH_IOS (overlay 0064 rev2, VR R19 item 4): the walk identity for the async
++// readback (gfx_metal.cpp): sSoh3DEye (0 flat, 1/2 eyes, 3 rear pane) | 0x10
++// on the game frame's key walk (gSohVRWalkT == 1, overlay 0014 rev2).
++extern "C" volatile int gSohFbrdWalk;
++// rev3 (VR R20 item 1): the walk kind for the backend's vertex-pool ledger
++// (gfx_metal.cpp SohVboStartWalk), and question (a)'s readback ledger.
++extern "C" int SohIos_WalkEye(void) {
++    return sSoh3DEye;
++}
++extern "C" volatile unsigned int gSohVRReadFbWalk[4];
++extern "C" volatile unsigned int gSohVREyeCbSplits;
++#endif
+ bool gfx_read_fb_handler_custom(F3DGfx** cmd0) {
+     Interpreter* gfx = mInstance.lock().get();
+     F3DGfx* cmd = *cmd0;
+@@ -4050,6 +4085,15 @@
+     height = C1(16, 16);
+ 
+     gfx->Flush();
++#ifdef __IOS__
++    gSohFbrdWalk = sSoh3DEye | (gSohVRWalkT >= 0.999f ? 0x10 : 0); // overlay 0064 rev2
++    if (sSoh3DEye >= 0 && sSoh3DEye <= 3) { // rev3: question (a)
++        gSohVRReadFbWalk[sSoh3DEye] = gSohVRReadFbWalk[sSoh3DEye] + 1;
++        if (sSoh3DEye != 0 && fbId == gfx->mGameFb) {
++            gSohVREyeCbSplits = gSohVREyeCbSplits + 1;
++        }
++    }
++#endif
+     gfx->mRapi->ReadFramebufferToCPU(fbId, width, height, rgba16Buffer);
+ 
+ #ifndef IS_BIGENDIAN
+--- a/src/racing/framebuffer_effects.c
++++ b/src/racing/framebuffer_effects.c
+@@ -68,7 +68,40 @@
+  * Specify the byteswap flag to force the buffer data to be written as BigEndian, which is
+  * required if the buffer is being used as a texture in F3D.
+  */
++#ifdef __IOS__
++// SOH_IOS (overlay 0064 rev3, VR R20 item 1): the "Jumbotron live feed" row.
++// Off (gSohVRJumboFeed 0, gfx_metal.cpp) in a VR world frame: emit NOTHING --
++// no copy of the eye framebuffer, no slice draw, no readback -- and freeze the
++// jumbotron on the last image by copying it into all three CPU buffers once
++// (the jumbotron reads the PREVIOUS frame's buffer, so leaving them alone
++// would cycle three stale frames). A clean arm: it removes the jumbotron's
++// GPU work from every walk and touches nothing else.
++extern volatile int gSohVRWorldActive;
++extern volatile int gSohVRJumboFeed;
++extern volatile unsigned int gSohVRJumboHeld;
++extern u16 gPortFramebuffers[3][SCREEN_WIDTH * SCREEN_HEIGHT];
++static void* sSohJumboLast = NULL;
++static int sSohJumboFrozen = 0;
++#endif
+ void FB_WriteFramebufferSliceToCPU(Gfx** gfxP, void* buffer, u8 byteSwap) {
++#ifdef __IOS__
++    if (gSohVRWorldActive && !gSohVRJumboFeed) {
++        if (!sSohJumboFrozen) {
++            for (int sohI = 0; sohI < 3; sohI++) {
++                if (sSohJumboLast == NULL) {
++                    memset(gPortFramebuffers[sohI], 0, sizeof(gPortFramebuffers[sohI]));
++                } else if ((void*)gPortFramebuffers[sohI] != sSohJumboLast) {
++                    memcpy(gPortFramebuffers[sohI], sSohJumboLast, sizeof(gPortFramebuffers[sohI]));
++                }
++            }
++            sSohJumboFrozen = 1;
++        }
++        gSohVRJumboHeld = gSohVRJumboHeld + 1;
++        return;
++    }
++    sSohJumboFrozen = 0;
++    sSohJumboLast = buffer;
++#endif
+     Gfx* gfx = *gfxP;
+     FB_CopyToFramebuffer(&gfx, 0, gReusableFrameBuffer, false, NULL);
+     
