@@ -12,11 +12,18 @@ CONSOLE="${SOH_REMOTE_CONSOLE:-ON}"
 [[ -f "$PREFIX/lib/libvorbisfile.a" ]] || SOH_IOS_SDK=visionsim "$ROOT/scripts/build-audio-deps-ios.sh"
 [[ -f "$SHIP_O2R" ]] || { echo "FATAL: no spaghetti.o2r — run build-oracle.sh + extract-mk64-o2r.sh" >&2; exit 1; }
 
+PMAP="-ffile-prefix-map=$ROOT=. -ffile-prefix-map=$ROOT/vendor/SpaghettiKart=src"
+mkdir -p "$BUILD"
+printf 'add_compile_options(%s)\n' "$PMAP" > "$BUILD/prefix-map-torch.cmake"
+
 cmake --no-warn-unused-cli -S "$ROOT/vendor/SpaghettiKart" -B "$BUILD" -GXcode \
     -DCMAKE_XCODE_ATTRIBUTE_STRIP_INSTALLED_PRODUCT=NO \
     -DCMAKE_SYSTEM_NAME=visionOS -DPLATFORM=SIMULATOR_VISIONOS \
     -DCMAKE_OSX_SYSROOT=xrsimulator \
     -DCMAKE_OSX_DEPLOYMENT_TARGET=2.0 -DDEPLOYMENT_TARGET=2.0 \
+    "-DCMAKE_C_FLAGS=$PMAP" "-DCMAKE_CXX_FLAGS=$PMAP" \
+    "-DCMAKE_OBJC_FLAGS=$PMAP" "-DCMAKE_OBJCXX_FLAGS=$PMAP" \
+    "-DCMAKE_PROJECT_torch_INCLUDE=$BUILD/prefix-map-torch.cmake" \
     -DCMAKE_BUILD_TYPE:STRING=Release \
     -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
     -DCMAKE_IGNORE_PREFIX_PATH="$HOME/Miniforge3" \
